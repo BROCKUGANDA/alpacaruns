@@ -43,6 +43,13 @@ type autoLoop struct {
 	journal    *pnl.Journal
 	client     *tools.Client
 	dryRun bool
+	// pauseFlagPath is the path to the JSON pause flag file (defaults
+	// to data/paused). Kept on the struct so tests can point it at a
+	// temp dir without reaching for an env var.
+	pauseFlagPath string
+	// pausedLogged remembers whether we already printed the
+	// "[control] paused" line; we don't spam it on every tick.
+	pausedLogged bool
 	// ensemble is non-nil only when ENSEMBLE_ENABLED=true; nil keeps the
 	// original single-expert tick path bit-for-bit.
 	ensemble   *ensemble.Runner
@@ -206,7 +213,8 @@ func buildAutoLoop(ctx context.Context, cfg *config.Config, set strategy.Setting
 	loop := &autoLoop{
 		cfg: cfg, set: set, engine: engine, windows: windows, exec: exec,
 		monitor: monitor, optPlanner: planner, journal: j, client: client,
-		dryRun: dryRun,
+		dryRun:        dryRun,
+		pauseFlagPath: defaultPauseFlagPath(cfg.TradeLog),
 	}
 
 	// Per-symbol win/loss ledger. Load existing data; rebuild from the
@@ -312,6 +320,25 @@ func ensembleStatePath(tradeLogPath string) string {
 // tick runs one deterministic pass: drawdown halts first, then score ->
 // decide -> window-gate -> size -> risk-gate -> execute (or log).
 func (l *autoLoop) tick(ctx context.Context) error {
+	// Pause flag check FIRST (before any Alpaca call). When the operator
+	// toggles "Pause new trades" in the dashboard (POST /api/control/pause),
+	// data/paused is written with content "true". The bot reads the file
+	// here, logs once per engagement change, and skips entry planning.
+	// The monitor loop (positions, drawdown halts, TP/SL exits, EOD
+	// flatten, profit targets) keeps running — pause only blocks NEW
+	// entries. The file is allowed to be missing or non-"true"; that
+	// means running.
+	if pauseFlagEngaged(l.pauseFlagPath) {
+		if !l.pausedLogged {
+			log.Printf("[control] paused: data/paused=true; new entries skipped, monitor loop alive")
+			l.pausedLogged = true
+		}
+		return nil
+	}
+	if l.pausedLogged {
+		log.Printf("[control] resumed: data/paused cleared; entries re-enabled")
+		l.pausedLogged = false
+	}
 	acct, err := l.client.GetAccount(ctx)
 	if err != nil {
 		return fmt.Errorf("account: %w", err)
@@ -1120,4 +1147,59 @@ func (l *autoLoop) persistStartingEquity(equity float64) {
 	if out, err := json.MarshalIndent(existing, "", "  "); err == nil {
 		_ = os.WriteFile(path, out, 0o644)
 }
+}
+
+
+// ---- pause flag ----
+
+// pauseFlagEngaged returns true when path exists and its trimmed
+// contents equal "true". Missing file, read error, or any other
+// content (including "false") is treated as "not paused".
+func pauseFlagEngaged(path string) bool {
+	if path == "" {
+		return false
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	// Trim spaces, CR, LF, tab; reject anything but the literal "true".
+	start, end := 0, len(b)
+	for start < end {
+		switch b[start] {
+		case ' ', '\n', '\r', '\t':
+			start++
+		default:
+			goto done_left
+		}
+	}
+done_left:
+	for end > start {
+		switch b[end-1] {
+		case ' ', '\n', '\r', '\t':
+			end--
+		default:
+			goto done_right
+		}
+	}
+done_right:
+	if end-start != 4 {
+		return false
+	}
+	return string(b[start:end]) == "true"
+}
+
+// defaultPauseFlagPath derives the pause flag file path from the
+// trade-log path: data/trades.jsonl -> data/paused. Falling back to
+// "data/paused" when no path is configured keeps the dashboard's
+// default file location working out of the box.
+func defaultPauseFlagPath(tradeLog string) string {
+	if tradeLog == "" {
+		return "data/paused"
+	}
+	dir := filepath.Dir(tradeLog)
+	if dir == "" || dir == "." {
+		return "data/paused"
+	}
+	return filepath.Join(dir, "paused")
 }

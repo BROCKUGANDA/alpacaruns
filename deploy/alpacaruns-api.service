@@ -1,0 +1,40 @@
+# /etc/systemd/system/alpacaruns-api.service
+# Install:  sudo cp alpacaruns-api.service /etc/systemd/system/ && sudo systemctl daemon-reload
+# Enable:   sudo systemctl enable --now alpacaruns-api
+# Logs:     journalctl -u alpacaruns-api -f
+#
+# This unit runs the dashboard HTTP API on port 8080. It reads the
+# same data/ directory the bot writes to; the two processes never
+# share state directly. Pause / resume writes an atomic flag file
+# (data/paused) that the bot picks up at the top of its next tick.
+#
+# CORS origin defaults to "*" for bring-up; in production set
+# --cors-origin to the showcase URL (e.g. https://alpacaruns.example.com).
+
+[Unit]
+Description=Alpacaruns dashboard HTTP API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=alpacaruns
+Group=alpacaruns
+WorkingDirectory=/opt/alpacaruns
+EnvironmentFile=/opt/alpacaruns/.env
+ExecStart=/usr/local/bin/alpacaruns serve --port 8080
+Restart=always
+RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+# Same hardening posture as the bot unit: read-only system, write only
+# to the data directory, no home, no new privileges, private /tmp.
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/alpacaruns/data
+PrivateTmp=true
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

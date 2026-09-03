@@ -114,6 +114,13 @@ type Account struct {
 	PortfolioValue   string `json:"portfolio_value"`
 	Status           string `json:"status"`
 	PatternDayTrader bool   `json:"pattern_day_trader"`
+	// Additional fields surfaced for the dashboard API. Alpaca's
+	// /v2/account returns them all; the dashboard reads only the
+	// ones it needs.
+	AccountNumber string    `json:"account_number"`
+	Multiplier    string    `json:"multiplier"`
+	CreatedAt     time.Time `json:"created_at"`
+	LastEquity    string    `json:"last_equity"`
 }
 
 type Position struct {
@@ -129,6 +136,8 @@ type Position struct {
 	// consistent with the rest of the Position fields.
 	UnrealizedPL   string  `json:"unrealized_pl"`
 	UnrealizedPLPC string  `json:"unrealized_plpc"`
+	// Dashboard API fields (newer; Alpaca added them to /positions).
+	ChangeToday    string  `json:"change_today"`
 }
 
 func (c *Client) GetAccount(ctx context.Context) (*Account, error) {
@@ -139,6 +148,25 @@ func (c *Client) GetAccount(ctx context.Context) (*Account, error) {
 	return &a, nil
 }
 
+// GetAccountRawField returns one extra field on the /v2/account
+// response (e.g. last_equity). Used by the dashboard API to compute
+// day P/L. Returns "" + nil when the field is absent; callers fall
+// back to a zero value.
+func (c *Client) GetAccountRawField(ctx context.Context, field string) (string, error) {
+	var raw map[string]any
+	if err := c.do(ctx, http.MethodGet, c.BaseURL+"/account", nil, nil, &raw); err != nil {
+		return "", err
+	}
+	if v, ok := raw[field]; ok {
+		switch x := v.(type) {
+		case string:
+			return x, nil
+		case float64:
+			return strconv.FormatFloat(x, 'f', -1, 64), nil
+		}
+	}
+	return "", nil
+}
 func (c *Client) GetPositions(ctx context.Context) ([]Position, error) {
 	var ps []Position
 	err := c.do(ctx, http.MethodGet, c.BaseURL+"/positions", nil, nil, &ps)

@@ -30,6 +30,10 @@ func main() {
 }
 
 const usage = `usage: alpacaruns <command> [flags]
+  serve    [--port 8080] [--cors-origin https://showcase.example.com] [--env .env]
+           dashboard HTTP API; reads data/trades.jsonl + data/strategy-state.json;
+           exposes /api/health, /api/status, /api/account, /api/pnl, /api/trades,
+           /api/decisions, /api/positions, /api/control/{pause,resume,step}
   cycle    [--symbols AAPL,MSFT,NVDA] [--provider llamacpp|oxlo|gemini] [--env .env]
   monitor  [--interval SECONDS] [--symbols ...] [--provider llamacpp|oxlo|gemini] [--env .env]
            start the continuous monitoring loop (Ctrl+C = graceful stop)
@@ -79,6 +83,11 @@ func run(argv []string) int {
 		// `auto` is fully deterministic: no LLM, no MCP server. It loads
 		// its own config and strategy settings.
 		return cmdAuto(rest)
+	case "serve":
+		// `serve` is the dashboard HTTP API. Reads the same data/
+		// directory the bot writes; never places orders. Documented
+		// in DEPLOY.md alongside alpacaruns-api.service.
+		return cmdServe(rest)
 	}
 
 	// LLM-backed subcommands share a common flag prefix.

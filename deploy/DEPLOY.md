@@ -134,19 +134,79 @@ The final image is distroless, non-root, and contains only the binary;
 state lives in the `/app/data` volume so the trade log survives container
 replacement.
 
+## Dashboard HTTP API
+
+`alpacaruns serve` exposes the read-only dashboard surface on port
+8080. It reads the same `data/trades.jsonl` + `data/strategy-state.json`
+the bot writes; the bot and the API are deliberately two separate
+processes (Option A from the hackathon spec) so either can be
+restarted without disturbing the other.
+
+Endpoints:
+
+- `GET /api/health` — liveness + version + last-poll timestamp
+- `GET /api/status` — bot state, kill-switch badges, runtime config
+- `GET /api/account` — live Alpaca account (equity, cash, day P/L, …)
+- `GET /api/positions` — live Alpaca positions
+- `GET /api/pnl?since=&until=` — equity curve + summary from the trade log
+- `GET /api/trades?symbol=&since=&until=&path=&limit=&cursor=` — fills
+- `GET /api/decisions?since=&path=&limit=&cursor=` — decision events
+- `POST /api/control/pause` — write `data/paused=true` (atomic)
+- `POST /api/control/resume` — clear the flag
+- `POST /api/control/step` — request a manual decision cycle on next tick
+
+Pause / resume writes the `data/paused` flag file atomically (write
+to `data/paused.tmp` + rename). The bot checks it as the FIRST
+step of every tick, before any Alpaca API call, so an engaged flag
+short-circuits entry planning immediately. Existing positions are
+NOT closed; only new entries are skipped.
+
+Local development:
+
+```bash
+alpacaruns serve --port 8080 --cors-origin http://localhost:3000
+```
+
+CLI flags:
+
+- `--env .env` — same .env file the bot uses (loads ALPACA_* keys)
+- `--port 8080` — TCP port (also ALPACA_API_PORT env var)
+- `--cors-origin` — single origin allowed for the Access-Control
+  header. Default `*` (any). Set to the showcase URL in production.
+- `--no-pause` / `--no-step` — disable the corresponding endpoints
+  for hardened deployments.
+
+Rate limit: 60 requests / 60s per remote IP, in-memory token bucket
+(see `api/ratelimit.go`). CORS allows only the configured origin
+(or `*` for bring-up). SIGTERM triggers graceful shutdown with a
+10s drain window.
+
 ## systemd
+
+The bot and the API run as **two independent services**:
 
 ```bash
 sudo useradd -r -s /usr/sbin/nologin alpacaruns
 sudo mkdir -p /opt/alpacaruns/data && sudo chown -R alpacaruns:alpacaruns /opt/alpacaruns
-# copy your binary, .env, and unit file into place:
+# copy your binary, .env, and both unit files into place:
 sudo cp bin/alpacaruns /usr/local/bin/alpacaruns
 sudo cp .env /opt/alpacaruns/.env && sudo chown root:alpacaruns /opt/alpacaruns/.env && sudo chmod 640 /opt/alpacaruns/.env
-sudo cp deploy/alpacaruns.service /etc/systemd/system/
+sudo cp deploy/alpacaruns.service      /etc/systemd/system/
+sudo cp deploy/alpacaruns-api.service  /etc/systemd/system/
 sudo systemctl daemon-reload
+# start the bot first (the API is read-mostly, but pause writes hit
+# the data dir the bot owns):
 sudo systemctl enable --now alpacaruns
-journalctl -u alpacaruns -f     # watch logs
+sudo systemctl enable --now alpacaruns-api
+journalctl -u alpacaruns     -f   # bot logs
+journalctl -u alpacaruns-api -f   # API logs
+curl http://localhost:8080/api/health   # smoke test
 ```
+
+Both units share the same user, hardening posture
+(`NoNewPrivileges`, `ProtectSystem=strict`, `ReadWritePaths=`…`data`,
+`PrivateTmp`, `ProtectHome`) and the same `.env` file. Restarting
+one does NOT restart the other.
 
 `Restart=always` + `RestartSec=10` brings the monitor back after crashes or
 reboots; the boot-time reconciliation re-syncs state from Alpaca, and missed
