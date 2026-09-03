@@ -147,6 +147,23 @@ go run ./cmd/alpacaruns monitor
 go run ./cmd/alpacaruns query "what is AAPL's latest quote?"
 ```
 
+## Demo dashboard (`alpacaruns serve`)
+
+A multi-page Next.js dashboard (welcome, live, trades, brain,
+controls) is statically exported and embedded into the Go binary at
+`api/ui/`. Run it with:
+
+```bash
+go run ./cmd/alpacaruns serve --port 8080 --cors-origin "*"
+# open http://localhost:8080/welcome
+```
+
+The API at `/api/health`, `/api/status`, `/api/account`,
+`/api/pnl`, `/api/trades`, `/api/decisions`, `/api/positions`, and
+`/api/control/{pause,resume,step}` is the same data the dashboard
+fetches. To rebuild the embedded UI from source, see
+`dashboard/README.md`.
+
 ## Deterministic `auto` mode (no LLM)
 
 `alpacaruns auto` replaces the LLM for execution decisions with a pure,

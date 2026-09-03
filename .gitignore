@@ -16,6 +16,10 @@ node_modules/
 dist/
 .vite/
 
+# Dashboard build artifacts (the pre-built export lives at api/ui/;
+# dashboard/out is just the intermediate).
+dashboard/out/
+
 # IDE / OS
 .idea/
 .vscode/
