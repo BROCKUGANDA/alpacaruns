@@ -1,0 +1,8 @@
+# Node / Next.js build artifacts. The pre-built static export
+# lives at api/ui/ in the Go binary and is built via
+# `cd dashboard && npm install && npm run build && cp -r out/* ../api/ui/`.
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+.DS_Store
