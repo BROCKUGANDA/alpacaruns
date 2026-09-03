@@ -1,0 +1,32 @@
+# /etc/systemd/system/alpacaruns.service
+# Install:  sudo cp alpacaruns.service /etc/systemd/system/ && sudo systemctl daemon-reload
+# Enable:   sudo systemctl enable --now alpacaruns
+# Logs:     journalctl -u alpacaruns -f
+
+[Unit]
+Description=Alpacaruns autonomous paper-trading monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=alpacaruns
+Group=alpacaruns
+WorkingDirectory=/opt/alpacaruns
+EnvironmentFile=/opt/alpacaruns/.env
+ExecStart=/usr/local/bin/alpacaruns monitor
+Restart=always
+RestartSec=10
+# Graceful shutdown: SIGTERM lets the monitor finish in-flight order polling.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/alpacaruns/data
+PrivateTmp=true
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,7 @@
+file 'C:/Users/HP/Desktop/Alpacaruns/hackathon_video/slide_audio/slide_01.mp3'
+file 'C:/Users/HP/Desktop/Alpacaruns/hackathon_video/slide_audio/slide_02.mp3'
+file 'C:/Users/HP/Desktop/Alpacaruns/hackathon_video/slide_audio/slide_03.mp3'
+file 'C:/Users/HP/Desktop/Alpacaruns/hackathon_video/slide_audio/slide_04.mp3'
+file 'C:/Users/HP/Desktop/Alpacaruns/hackathon_video/slide_audio/slide_05.mp3'
+file 'C:/Users/HP/Desktop/Alpacaruns/hackathon_video/slide_audio/slide_06.mp3'
+file 'C:/Users/HP/Desktop/Alpacaruns/hackathon_video/slide_audio/slide_07.mp3'

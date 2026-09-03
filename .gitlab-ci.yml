@@ -1,0 +1,38 @@
+# GitLab CI for Alpacaruns (DRAFT — platform choice pending).
+# Single test job on golang:1.26; build + vet + test; no deploy yet.
+
+stages:
+  - test
+
+variables:
+  GOPROXY: "https://proxy.golang.org,direct"
+  GOSUMDB: "sum.golang.org"
+  GOFLAGS: "-mod=readonly"
+  GIT_DEPTH: "10"
+  CACHE_FALLBACK_KEY: "alpacaruns-go-mod"
+
+.go-cache: &go-cache
+  key:
+    files:
+      - go.sum
+  paths:
+    - .gocache/
+    - .gomodcache/
+
+test:
+  stage: test
+  image: golang:1.26
+  timeout: 15m
+  cache:
+    <<: *go-cache
+  variables:
+    GOCACHE: "$CI_PROJECT_DIR/.gocache"
+    GOMODCACHE: "$CI_PROJECT_DIR/.gomodcache"
+  before_script:
+    - go version
+    - go env GOCACHE GOMODCACHE
+  script:
+    - go mod download
+    - go vet ./...
+    - go build ./...
+    - go test ./... -count=1
