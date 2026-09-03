@@ -1,6 +1,8 @@
 # Secrets — never commit
 .env
 .env.local
+.env.*
+!.env.example
 
 # Go build output
 bin/
@@ -10,9 +12,26 @@ bin/
 
 # Node (defensive — none used but harmless)
 node_modules/
+.next/
+dist/
+.vite/
 
-# OS
+# IDE / OS
+.idea/
+.vscode/
 .DS_Store
+*.swp
 
-# Runtime data (state files, trade logs)
+# Runtime data (state files, trade logs, uv caches)
 data/
+
+# Hackathon video intermediate artifacts (final mp4 stays tracked)
+hackathon_video/build/
+hackathon_video/slides/
+hackathon_video/slide_audio/
+
+# Misc
+*.log
+*.pem
+*.key
+*.crt
