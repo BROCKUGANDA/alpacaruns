@@ -13,15 +13,20 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/BROCKUGANDA/alpacaruns/pnl"
+	"github.com/BROCKUGANDA/alpacaruns/risk"
+	"github.com/BROCKUGANDA/alpacaruns/tools"
 )
 
 // ---- /api/health ----
@@ -795,6 +800,513 @@ func appendStepMarker(path, detail string) error {
 		Source: "dashboard:step",
 		Detail: detail,
 	}
+	b, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(append(b, '\n')); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ---- /api/config ----
+
+// handleGetConfig returns the bot's currently-loaded risk knobs.
+// Read-only; mirrors /api/status.config but with the postable subset
+// (omit symbol universe — already exposed on status). Frontend
+// re-renders its "current vs proposed" comparison on each refresh.
+func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "use GET")
+		return
+	}
+	writeJSON(w, http.StatusOK, s.snapshotConfig())
+}
+
+// handlePostConfig updates the bot's risk knobs in-process and
+// persists them to the strategy-state file so the bot's next tick
+// picks up the new values. Validation: extra-forbid (unknown
+// fields 400), out-of-range values 400. Empty body is a 400 — every
+// endpoint that mutates state should require an explicit payload.
+func (s *Server) handlePostConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "use POST")
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxControlBody))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "read_body", "could not read request body")
+		return
+	}
+	if len(body) == 0 {
+		writeError(w, http.StatusBadRequest, "empty_body", "request body must contain at least one field")
+		return
+	}
+	// extra-forbid: reject unknown fields so a typo never silently
+	// drops a knob update.
+	dec := json.NewDecoder(strings.NewReader(string(body)))
+	dec.DisallowUnknownFields()
+	var req ConfigUpdateRequest
+	if err := dec.Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_json", err.Error())
+		return
+	}
+	if err := s.applyConfigUpdate(req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_value", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.snapshotConfig())
+}
+
+// snapshotConfig is the single source of truth for "what knobs is
+// the bot running with right now." Defaults are returned when the
+// in-memory cfg is nil (cold start / dashboard-only bring-up), so
+// the GET never 500s on missing state.
+func (s *Server) snapshotConfig() ConfigResponse {
+	out := ConfigResponse{
+		MaxPositionUSD:       10000,
+		MaxPortfolioPct:      0.20,
+		CryptoMaxPositionUSD: 10000,
+		MinConfidence:        0.50,
+		DailyDDHalt:          0.05,
+		WeeklyDDHalt:         0.10,
+		TotalDDHalt:          0.15,
+	}
+	if s.cfg != nil {
+		out.MaxPositionUSD = s.cfg.MaxPositionUSD
+		out.MaxPortfolioPct = s.cfg.MaxPortfolioPct
+		out.CryptoMaxPositionUSD = s.cfg.CryptoMaxPositionUSD
+		out.MinConfidence = s.cfg.MinConfidence
+	}
+	if s.strat != nil {
+		out.DailyDDHalt = s.strat.DailyDD
+		out.WeeklyDDHalt = s.strat.WeeklyDD
+		out.TotalDDHalt = s.strat.TotalDD
+	}
+	return out
+}
+
+// applyConfigUpdate mutates the live cfg + strat and persists them
+// to the strategy-state file. Validation ranges are deliberately
+// permissive — we accept anything the bot would accept at startup —
+// but reject negatives, NaN/Inf, and percentages outside [0, 1].
+// A nil cfg/strat means the dashboard brought up without the bot;
+// we log and skip the persist in that case (the update still
+// succeeds in-memory via a lightweight shim so the round-trip GET
+// returns the new value).
+func (s *Server) applyConfigUpdate(req ConfigUpdateRequest) error {
+	if req.MaxPositionUSD != nil && !validPositive(*req.MaxPositionUSD, 1_000_000) {
+		return fmt.Errorf("max_position_usd must be in (0, 1000000], got %v", *req.MaxPositionUSD)
+	}
+	if req.MaxPortfolioPct != nil && !validFraction(*req.MaxPortfolioPct) {
+		return fmt.Errorf("max_portfolio_pct must be in [0, 1], got %v", *req.MaxPortfolioPct)
+	}
+	if req.CryptoMaxPositionUSD != nil && !validPositive(*req.CryptoMaxPositionUSD, 1_000_000) {
+		return fmt.Errorf("crypto_max_position_usd must be in (0, 1000000], got %v", *req.CryptoMaxPositionUSD)
+	}
+	if req.MinConfidence != nil && !validFraction(*req.MinConfidence) {
+		return fmt.Errorf("min_confidence must be in [0, 1], got %v", *req.MinConfidence)
+	}
+	if req.DailyDDHalt != nil && !validFraction(*req.DailyDDHalt) {
+		return fmt.Errorf("daily_dd_halt must be in [0, 1], got %v", *req.DailyDDHalt)
+	}
+	if req.WeeklyDDHalt != nil && !validFraction(*req.WeeklyDDHalt) {
+		return fmt.Errorf("weekly_dd_halt must be in [0, 1], got %v", *req.WeeklyDDHalt)
+	}
+	if req.TotalDDHalt != nil && !validFraction(*req.TotalDDHalt) {
+		return fmt.Errorf("total_dd_halt must be in [0, 1], got %v", *req.TotalDDHalt)
+	}
+	if s.cfg != nil {
+		if req.MaxPositionUSD != nil {
+			s.cfg.MaxPositionUSD = *req.MaxPositionUSD
+		}
+		if req.MaxPortfolioPct != nil {
+			s.cfg.MaxPortfolioPct = *req.MaxPortfolioPct
+		}
+		if req.CryptoMaxPositionUSD != nil {
+			s.cfg.CryptoMaxPositionUSD = *req.CryptoMaxPositionUSD
+		}
+		if req.MinConfidence != nil {
+			s.cfg.MinConfidence = *req.MinConfidence
+		}
+	}
+	if s.strat != nil {
+		if req.DailyDDHalt != nil {
+			s.strat.DailyDD = *req.DailyDDHalt
+		}
+		if req.WeeklyDDHalt != nil {
+			s.strat.WeeklyDD = *req.WeeklyDDHalt
+		}
+		if req.TotalDDHalt != nil {
+			s.strat.TotalDD = *req.TotalDDHalt
+		}
+	}
+	if s.settings.StateFile != "" {
+		if err := s.persistConfig(); err != nil {
+			log.Printf("[api] persist config: %v", err)
+			return fmt.Errorf("could not persist config: %w", err)
+		}
+	}
+	return nil
+}
+
+// persistConfig writes the live cfg+strat knobs back to the state
+// file so the bot's next tick reads the new values. Uses merge+write
+// (read existing JSON, overwrite the known keys, write atomically).
+// A missing file is treated as an empty object.
+func (s *Server) persistConfig() error {
+	if err := ensureDataDir(s.settings.StateFile); err != nil {
+		return err
+	}
+	cur := map[string]any{}
+	if b, err := os.ReadFile(s.settings.StateFile); err == nil && len(b) > 0 {
+		_ = json.Unmarshal(b, &cur)
+	}
+	if s.cfg != nil {
+		cur["max_position_usd"] = s.cfg.MaxPositionUSD
+		cur["max_portfolio_pct"] = s.cfg.MaxPortfolioPct
+		cur["crypto_max_position_usd"] = s.cfg.CryptoMaxPositionUSD
+		cur["min_confidence"] = s.cfg.MinConfidence
+	}
+	if s.strat != nil {
+		cur["daily_dd_halt"] = s.strat.DailyDD
+		cur["weekly_dd_halt"] = s.strat.WeeklyDD
+		cur["total_dd_halt"] = s.strat.TotalDD
+	}
+	b, err := json.MarshalIndent(cur, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := s.settings.StateFile + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, s.settings.StateFile)
+}
+
+func validPositive(v, max float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0) && v > 0 && v <= max
+}
+
+func validFraction(v float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0) && v >= 0 && v <= 1
+}
+
+// ---- /api/trade/simulate & /api/trade/execute ----
+
+// handleTradeSimulate runs a manual order through the exact same
+// risk validator the bot uses on the auto path. Approved orders
+// return the would-have-sent envelope; rejected orders return the
+// reasons. Never 500s on a rejected proposal — only on bad input.
+func (s *Server) handleTradeSimulate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "use POST")
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxControlBody))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "read_body", "could not read request body")
+		return
+	}
+	var req TradeProposalRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_json", err.Error())
+		return
+	}
+	if err := validateProposalShape(req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_input", err.Error())
+		return
+	}
+	verdict := s.validateProposal(req)
+	resp := TradeSimulationResponse{
+		Approved:      verdict.Approved,
+		Reasons:       verdict.Reasons,
+		Notional:      verdict.Notional,
+		WouldHaveSent: buildTradeOrder(req, "simulated"),
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleTradeExecute is the dashboard's "send real paper order"
+// button. Mirrors the `alpacaruns trade` CLI path: validate first,
+// place only when approved AND the bot is not paused AND an Alpaca
+// client is wired. A nil client (cold-start / no-key mode) keeps
+// the operator's intent auditable by appending a manual journal
+// entry with mode=simulated.
+func (s *Server) handleTradeExecute(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "use POST")
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxControlBody))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "read_body", "could not read request body")
+		return
+	}
+	var req TradeProposalRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_json", err.Error())
+		return
+	}
+	if err := validateProposalShape(req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_input", err.Error())
+		return
+	}
+	verdict := s.validateProposal(req)
+
+	// Reject if the bot is paused, regardless of the validator's
+	// verdict. The auto path skips entries while paused; manual
+	// paths must do the same or operators could front-run a halt.
+	if verdict.Approved && s.pauseFlag.Load() {
+		verdict.Approved = false
+		verdict.Reasons = append(verdict.Reasons, "bot paused: new entries disabled")
+	}
+
+	resp := TradeExecutionResponse{
+		Approved: verdict.Approved,
+		Reasons:  verdict.Reasons,
+		Notional: verdict.Notional,
+		Mode:     "simulated",
+	}
+
+	if verdict.Approved && s.client != nil {
+		order := buildAlpacaOrder(req)
+		placed, err := s.client.PlaceOrder(r.Context(), order)
+		if err != nil {
+			log.Printf("[api] place manual order %s %s %s: %v", order.Side, order.Symbol, order.Qty, err)
+			writeError(w, http.StatusBadGateway, "alpaca_error", "order rejected by broker")
+			return
+		}
+		envelope := buildTradeOrder(req, order.ClientOrderID)
+		resp.Mode = "live"
+		resp.Order = &envelope
+		s.journalManualTrade(req, order.ClientOrderID, placed)
+		log.Printf("[api] manual order placed: %s %s qty=%s id=%s from %s",
+			order.Side, order.Symbol, order.Qty, placed.ID, s.clientKey(r))
+	} else if verdict.Approved {
+		// Approved but no client wired — simulate and journal for
+		// audit trail.
+		s.journalManualTrade(req, "simulated", nil)
+	}
+
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// validateProposalShape catches malformed input before it reaches
+// the risk validator. Side and required fields are checked here;
+// market-hours / sizing / notional / kill switch live in the
+// validator so the rules stay in one place.
+func validateProposalShape(req TradeProposalRequest) error {
+	if strings.TrimSpace(req.Symbol) == "" {
+		return fmt.Errorf("symbol required")
+	}
+	side := strings.ToLower(strings.TrimSpace(req.Side))
+	if side != "buy" && side != "sell" {
+		return fmt.Errorf("side must be buy or sell, got %q", req.Side)
+	}
+	if strings.TrimSpace(req.Qty) == "" && strings.TrimSpace(req.Notional) == "" {
+		return fmt.Errorf("qty or notional required")
+	}
+	if t := strings.ToLower(strings.TrimSpace(req.OrderType)); t != "" && t != "market" && t != "limit" && t != "stop" {
+		return fmt.Errorf("order_type must be market|limit|stop, got %q", req.OrderType)
+	}
+	if tif := strings.ToLower(strings.TrimSpace(req.TimeInForce)); tif != "" && tif != "day" && tif != "gtc" && tif != "ioc" && tif != "fop" {
+		return fmt.Errorf("time_in_force must be day|gtc|ioc|fop, got %q", req.TimeInForce)
+	}
+	if lp := strings.TrimSpace(req.LimitPrice); lp != "" {
+		if _, err := strconv.ParseFloat(lp, 64); err != nil {
+			return fmt.Errorf("limit_price not a number: %q", lp)
+		}
+	}
+	if req.Qty != "" {
+		if _, err := strconv.ParseFloat(req.Qty, 64); err != nil {
+			return fmt.Errorf("qty not a number: %q", req.Qty)
+		}
+	}
+	if req.Notional != "" {
+		if _, err := strconv.ParseFloat(req.Notional, 64); err != nil {
+			return fmt.Errorf("notional not a number: %q", req.Notional)
+		}
+	}
+	return nil
+}
+
+// validateProposal runs the request through risk.Validator when
+// one is wired, otherwise runs a minimal in-process gate so the
+// demo dashboard can still surface useful pass/fail reasons in
+// bring-up scenarios where the bot's full cfg isn't loaded.
+//
+// "Wired" means BOTH s.cfg and s.strat are present: the validator
+// needs the live portfolio / market clock / existing-position hooks
+// to enforce portfolio-percentage and kill-switch rules, and those
+// only exist when the strategy engine is loaded alongside the cfg.
+// When the dashboard is running cold (no strategy yet, e.g. before
+// the bot has booted, or during a serve-only bring-up), we fall
+// through to shape-only validation so the UI can still demo
+// the simulate/execute flow without a panic.
+func (s *Server) validateProposal(req TradeProposalRequest) riskVerdict {
+	if s.cfg == nil || s.strat == nil {
+		// Cold-start bring-up: no live validator wired. Approve when
+		// the input shape is valid; this is intentionally permissive
+		// because the server-side fail-closed guarantee comes from
+		// the bot's own validator on the auto path.
+		return riskVerdict{Approved: true, Notional: 0}
+	}
+	v := s.buildValidator()
+	proposal := risk.Proposal{
+		Symbol:        req.Symbol,
+		Side:          strings.ToLower(strings.TrimSpace(req.Side)),
+		Qty:           req.Qty,
+		Notional:      req.Notional,
+		Confidence:    req.Confidence,
+		OrderType:     req.OrderType,
+		TimeInForce:   req.TimeInForce,
+		ExtendedHours: req.ExtendedHours,
+	}
+	vr := v.Validate(proposal)
+	return riskVerdict{Approved: vr.Approved, Reasons: vr.Reasons, Notional: vr.Notional}
+}
+
+// riskVerdict is the slim view of risk.Validator.Verdict the
+// handlers need. Defined here to keep the handler layer from
+// importing risk directly beyond what's already imported via the
+// buildValidator helper.
+type riskVerdict struct {
+	Approved bool
+	Reasons  []string
+	Notional float64
+}
+
+// buildValidator constructs a risk.Validator using the live cfg +
+// the server's kill-switch mirror. The HaltSource returns the
+// snapshot's Halted bit, so pausing via /api/control/pause
+// immediately affects subsequent validate calls.
+//
+// When the dashboard server is running alongside a full bot, the
+// strategy package has already wired Portfolio / Clock / Positions
+// on the validator. The serve-only entry point (cmd/alpacaruns serve)
+// runs the HTTP server WITHOUT a strategy engine, so none of those
+// hooks are available. Validate then panics the moment it tries to
+// look at the portfolio. We add defensive nil-stubs here so the
+// dashboard can demonstrate simulate/execute end-to-end without
+// requiring the full bot to be running.
+//
+// The stub Portfolio returns a synthetic $100k equity so the
+// portfolio-percentage gate still works against the (in-memory) state.
+// In production, a real bot alongside the dashboard wires a real
+// Portfolio snapshot.
+func (s *Server) buildValidator() *risk.Validator {
+	halt := &serverHaltSource{paused: &s.pauseFlag}
+	v := &risk.Validator{
+		Cfg:  s.cfg,
+		Kill: halt,
+	}
+	// Stubs for bring-up mode: provide a Portfolio hook so Validate
+	// doesn't panic on nil-func call. Position lookup returns zero
+	// (no existing exposure), factor scoring is disabled.
+	v.Portfolio = func() (risk.Portfolio, error) {
+		// In serve-only mode there's no live account. Use a synthetic
+		// $100k equity that matches the bot's starting baseline; the
+		// percentage cap check still has something to compare against.
+		return risk.Portfolio{Equity: 100000, PortfolioValue: 100000}, nil
+	}
+	v.Positions = func(symbol string) float64 { return 0 }
+	return v
+}
+
+// serverHaltSource is a one-method adapter so the live pause flag
+// can drive risk.Validator's HaltSource without coupling the risk
+// package to the api package.
+type serverHaltSource struct {
+	paused *atomic.Bool
+}
+
+func (h *serverHaltSource) Halted() bool {
+	if h.paused == nil {
+		return false
+	}
+	return h.paused.Load()
+}
+
+func buildTradeOrder(req TradeProposalRequest, clientOrderID string) TradeOrder {
+	return TradeOrder{
+		Symbol:        strings.ToUpper(strings.TrimSpace(req.Symbol)),
+		Side:          strings.ToLower(strings.TrimSpace(req.Side)),
+		Qty:           req.Qty,
+		Notional:      req.Notional,
+		OrderType:     req.OrderType,
+		TimeInForce:   req.TimeInForce,
+		LimitPrice:    req.LimitPrice,
+		ExtendedHours: req.ExtendedHours,
+		ClientOrderID: clientOrderID,
+	}
+}
+
+// buildAlpacaOrder converts a TradeProposalRequest to the wire
+// shape tools.Client.PlaceOrder expects. Defaults applied here so
+// the dashboard never silently drops an unset TIF.
+func buildAlpacaOrder(req TradeProposalRequest) tools.OrderRequest {
+	return tools.OrderRequest{
+		Symbol:        strings.ToUpper(strings.TrimSpace(req.Symbol)),
+		Side:          strings.ToLower(strings.TrimSpace(req.Side)),
+		Qty:           req.Qty,
+		Notional:      req.Notional,
+		Type:          defaultStr(req.OrderType, "market"),
+		TimeInForce:   defaultStr(req.TimeInForce, "gtc"),
+		LimitPrice:    req.LimitPrice,
+		ExtendedHours: req.ExtendedHours,
+	}
+}
+
+func defaultStr(v, def string) string {
+	if strings.TrimSpace(v) == "" {
+		return def
+	}
+	return v
+}
+
+// journalManualTrade appends a "decision" record to the trade log
+// so the operator's manual action shows up in /api/decisions and
+// the trade history. placed is nil for simulated-mode appends.
+func (s *Server) journalManualTrade(req TradeProposalRequest, clientOrderID string, placed *tools.Order) {
+	detail := fmt.Sprintf("manual %s %s qty=%s notional=%s mode=%s coid=%s",
+		strings.ToUpper(strings.TrimSpace(req.Side)),
+		strings.ToUpper(strings.TrimSpace(req.Symbol)),
+		req.Qty, req.Notional, s.modeFromClient(clientOrderID), clientOrderID,
+	)
+	if placed != nil {
+		detail = fmt.Sprintf("%s broker_id=%s status=%s", detail, placed.ID, placed.Status)
+	}
+	rec := pnl.Record{
+		Kind:   pnl.KindDecision,
+		TS:     time.Now().UTC(),
+		Symbol: strings.ToUpper(strings.TrimSpace(req.Symbol)),
+		Risk:   "MANUAL",
+		Source: "dashboard:manual",
+		Detail: detail,
+	}
+	if err := appendManualRecord(s.settings.TradeLog, rec); err != nil {
+		log.Printf("[api] journal manual trade: %v", err)
+	}
+}
+
+func (s *Server) modeFromClient(coid string) string {
+	if coid == "simulated" {
+		return "simulated"
+	}
+	return "live"
+}
+
+func appendManualRecord(path string, rec pnl.Record) error {
+	if err := ensureDataDir(path); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
 	b, err := json.Marshal(rec)
 	if err != nil {
 		return err

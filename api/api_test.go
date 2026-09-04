@@ -15,10 +15,13 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/BROCKUGANDA/alpacaruns/config"
 	"github.com/BROCKUGANDA/alpacaruns/pnl"
+	"github.com/BROCKUGANDA/alpacaruns/strategy"
 )
 
 // helper to make a tiny server with default settings pointed at dir.
@@ -37,6 +40,43 @@ func newTestServer(t *testing.T, dir string) *Server {
 		limiter:   NewRateLimiter(60, time.Second),
 		startTime: time.Now(),
 	}
+	return s
+}
+
+// newTestServerWithConfig wires the api.Server with a live
+// *config.Config + *strategy.Settings populated with the values
+// passed in. Used by /api/config and /api/trade/* tests where the
+// handlers need real knobs to read/update. The bot itself is not
+// started — only the in-memory state the dashboard API projects.
+func newTestServerWithConfig(t *testing.T, dir string, maxUSD, maxPct, daily, weekly, total float64) *Server {
+	t.Helper()
+	s := newTestServer(t, dir)
+	s.cfg = &config.Config{
+		MaxPositionUSD:       maxUSD,
+		MaxPortfolioPct:      maxPct,
+		CryptoMaxPositionUSD: maxUSD * 2,
+		MinConfidence:        0.5,
+	}
+	s.strat = &strategy.Settings{
+		DailyDD:  daily,
+		WeeklyDD: weekly,
+		TotalDD:  total,
+	}
+	return s
+}
+
+// newTestServerWithValidator wires a minimal validator-backed
+// server for /api/trade/simulate and /api/trade/execute tests.
+// Config is conservative (huge caps, low min-confidence) so a
+// clean proposal passes by default. Set s.pauseFlag.Store(true)
+// in the test to flip the kill switch.
+func newTestServerWithValidator(t *testing.T, dir string) *Server {
+	t.Helper()
+	s := newTestServerWithConfig(t, dir, 1_000_000, 1.0, 1.0, 1.0, 1.0)
+	// 1.0 confidence passes the min-confidence check (0.5 default).
+	// Reference atomic so the import isn't dead if future helpers
+	// need to flip the pause flag in this test fixture.
+	_ = atomic.Bool{}
 	return s
 }
 
@@ -786,5 +826,317 @@ func TestJournalPathsNotUserControlled(t *testing.T) {
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Fatalf("%s: status %d, want 400", u, resp.StatusCode)
 		}
+	}
+}
+
+// ---- /api/config ----
+
+// TestGetConfigReturnsCurrentValues: GET /api/config must return the
+// knobs the bot currently has loaded, so the controls form can show
+// "what is" next to "what you can change to."
+func TestGetConfigReturnsCurrentValues(t *testing.T) {
+	dir := t.TempDir()
+	s := newTestServerWithConfig(t, dir, 7500, 0.15, 0.04, 0.08, 0.12)
+	mux := s.routes()
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/api/config")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+	var cr ConfigResponse
+	if err := json.NewDecoder(resp.Body).Decode(&cr); err != nil {
+		t.Fatal(err)
+	}
+	if cr.MaxPositionUSD != 7500 {
+		t.Fatalf("max_position_usd = %v, want 7500", cr.MaxPositionUSD)
+	}
+	if cr.MaxPortfolioPct != 0.15 {
+		t.Fatalf("max_portfolio_pct = %v, want 0.15", cr.MaxPortfolioPct)
+	}
+	if cr.DailyDDHalt != 0.04 {
+		t.Fatalf("daily_dd_halt = %v, want 0.04", cr.DailyDDHalt)
+	}
+}
+
+// TestPostConfigRejectsUnknownFields: extra fields in the request
+// must 400 so a typo doesn't silently drop a knob update. Defense
+// in depth — extra=forbid for the dashboard surface.
+func TestPostConfigRejectsUnknownFields(t *testing.T) {
+	dir := t.TempDir()
+	s := newTestServerWithConfig(t, dir, 7500, 0.15, 0.04, 0.08, 0.12)
+	mux := s.routes()
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	body := strings.NewReader(`{"max_position_usd": 8000, "not_a_real_knob": true}`)
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/config", body)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status %d, want 400", resp.StatusCode)
+	}
+}
+
+// TestPostConfigUpdatesAndPersists: a successful POST /api/config
+// updates the live cfg (visible on the next GET) and writes the
+// new values back to the persisted state file so the bot picks
+// them up on its next tick.
+func TestPostConfigUpdatesAndPersists(t *testing.T) {
+	dir := t.TempDir()
+	s := newTestServerWithConfig(t, dir, 7500, 0.15, 0.04, 0.08, 0.12)
+	mux := s.routes()
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	body := strings.NewReader(`{"max_position_usd": 9000, "max_portfolio_pct": 0.25}`)
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/config", body)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d, want 200", resp.StatusCode)
+	}
+
+	// Round-trip read confirms the in-memory cfg was updated.
+	get, err := http.Get(ts.URL + "/api/config")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer get.Body.Close()
+	var cr ConfigResponse
+	if err := json.NewDecoder(get.Body).Decode(&cr); err != nil {
+		t.Fatal(err)
+	}
+	if cr.MaxPositionUSD != 9000 {
+		t.Fatalf("after update max_position_usd = %v, want 9000", cr.MaxPositionUSD)
+	}
+	if cr.MaxPortfolioPct != 0.25 {
+		t.Fatalf("after update max_portfolio_pct = %v, want 0.25", cr.MaxPortfolioPct)
+	}
+
+	// Persisted state file should also reflect the change.
+	// json.MarshalIndent uses "key: value" with a space, so the
+	// substring includes the space.
+	b, err := os.ReadFile(s.settings.StateFile)
+	if err != nil {
+		t.Fatalf("read state file: %v", err)
+	}
+	if !strings.Contains(string(b), `"max_position_usd": 9000`) {
+		t.Fatalf("state file missing new value; got %s", string(b))
+	}
+}
+
+// TestPostConfigClampsOutOfRange: an obviously bad value (negative
+// position cap) must 400, not silently persist a config that would
+// stop the bot from placing any order.
+func TestPostConfigClampsOutOfRange(t *testing.T) {
+	dir := t.TempDir()
+	s := newTestServerWithConfig(t, dir, 7500, 0.15, 0.04, 0.08, 0.12)
+	mux := s.routes()
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	body := strings.NewReader(`{"max_position_usd": -1}`)
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/config", body)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status %d, want 400", resp.StatusCode)
+	}
+}
+
+// ---- /api/trade/simulate ----
+
+// TestTradeSimulateApprovesCleanProposal: a small buy that passes
+// every risk check must return approved=true, the computed
+// notional, and the would-have-sent order payload.
+func TestTradeSimulateApprovesCleanProposal(t *testing.T) {
+	dir := t.TempDir()
+	s := newTestServerWithValidator(t, dir)
+	mux := s.routes()
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	// confidence=1.0 matches the conservative test cfg (min 0.5) so
+	// the proposal clears every gate and is approved end-to-end.
+	body := strings.NewReader(`{"symbol":"AAPL","side":"buy","qty":"1","order_type":"market","time_in_force":"day","confidence":1.0}`)
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/trade/simulate", body)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+	var sr TradeSimulationResponse
+	if err := json.NewDecoder(resp.Body).Decode(&sr); err != nil {
+		t.Fatal(err)
+	}
+	if !sr.Approved {
+		t.Fatalf("expected approved=true; reasons=%v", sr.Reasons)
+	}
+	if sr.Notional <= 0 {
+		t.Fatalf("expected positive notional; got %v", sr.Notional)
+	}
+}
+
+// TestTradeSimulateRejectsKillSwitchHalt: when the kill switch is
+// engaged, simulate must return approved=false with the kill reason
+// — never silently approve a manual order that would also be
+// rejected at execution.
+func TestTradeSimulateRejectsKillSwitchHalt(t *testing.T) {
+	dir := t.TempDir()
+	s := newTestServerWithValidator(t, dir)
+	s.pauseFlag.Store(true) // simulate a halted kill switch
+	mux := s.routes()
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	body := strings.NewReader(`{"symbol":"AAPL","side":"buy","qty":"1"}`)
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/trade/simulate", body)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d, want 200 (simulate never 500s on a rejected proposal)", resp.StatusCode)
+	}
+	var sr TradeSimulationResponse
+	if err := json.NewDecoder(resp.Body).Decode(&sr); err != nil {
+		t.Fatal(err)
+	}
+	if sr.Approved {
+		t.Fatalf("expected approved=false; got true")
+	}
+	if len(sr.Reasons) == 0 {
+		t.Fatalf("expected at least one rejection reason")
+	}
+}
+
+// TestTradeSimulateRejectsBadInput: an order that fails the input
+// validator (unknown side) must 400, not produce a fake-approved
+// response.
+func TestTradeSimulateRejectsBadInput(t *testing.T) {
+	dir := t.TempDir()
+	s := newTestServerWithValidator(t, dir)
+	mux := s.routes()
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	body := strings.NewReader(`{"symbol":"AAPL","side":"hold","qty":"1"}`)
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/trade/simulate", body)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status %d, want 400", resp.StatusCode)
+	}
+}
+
+// ---- /api/trade/execute ----
+
+// TestTradeExecuteRejectsWhenPaused: even an order that passes the
+// risk gate must be refused when the bot is paused. Execute must
+// mirror the auto path's kill-switch-on-pause behavior.
+func TestTradeExecuteRejectsWhenPaused(t *testing.T) {
+	dir := t.TempDir()
+	s := newTestServerWithValidator(t, dir)
+	if err := s.setPauseFlag(true); err != nil {
+		t.Fatal(err)
+	}
+	mux := s.routes()
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	body := strings.NewReader(`{"symbol":"AAPL","side":"buy","qty":"1"}`)
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/trade/execute", body)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d, want 200 (execute returns rejection via approved=false)", resp.StatusCode)
+	}
+	var er TradeExecutionResponse
+	if err := json.NewDecoder(resp.Body).Decode(&er); err != nil {
+		t.Fatal(err)
+	}
+	if er.Approved {
+		t.Fatalf("expected approved=false when paused")
+	}
+	if er.Order != nil {
+		t.Fatalf("no order should have been placed")
+	}
+}
+
+// TestTradeExecuteRecordsSimulatedOnlyWhenNoClient: when the
+// server has no Alpaca client wired (cold-start / no-key mode),
+// execute must still record a journal entry tagged
+// source="dashboard:sim" with path="manual", so the operator's
+// intent is auditable even without a real broker call.
+func TestTradeExecuteRecordsSimulatedOnlyWhenNoClient(t *testing.T) {
+	dir := t.TempDir()
+	s := newTestServerWithValidator(t, dir)
+	// client is nil by default — exercises the no-broker branch
+	mux := s.routes()
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	// confidence=1.0 clears the conservative-cfg min-confidence gate.
+	body := strings.NewReader(`{"symbol":"AAPL","side":"buy","qty":"1","order_type":"market","time_in_force":"day","confidence":1.0}`)
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/trade/execute", body)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+	var er TradeExecutionResponse
+	if err := json.NewDecoder(resp.Body).Decode(&er); err != nil {
+		t.Fatal(err)
+	}
+	if er.Mode != "simulated" {
+		t.Fatalf("mode = %q, want simulated", er.Mode)
+	}
+	if er.Approved == false {
+		t.Fatalf("expected approved=true; reasons=%v", er.Reasons)
+	}
+
+	// Trade log should have one new decision record tagged manual.
+	b, err := os.ReadFile(s.settings.TradeLog)
+	if err != nil {
+		t.Fatalf("read trade log: %v", err)
+	}
+	if !strings.Contains(string(b), `"dashboard:manual"`) {
+		t.Fatalf("manual journal entry not appended; log = %s", string(b))
 	}
 }

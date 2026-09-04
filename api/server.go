@@ -170,15 +170,18 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/favicon.ico", brandingAlias("favicon.ico"))
 	mux.HandleFunc("/apple-touch-icon.png", brandingAlias("favicon.png"))
 	mux.HandleFunc("/api/health", s.handleHealth)
-	mux.HandleFunc("/api/status", s.handleStatus)
-	mux.HandleFunc("/api/account", s.handleAccount)
-	mux.HandleFunc("/api/pnl", s.handlePnL)
-	mux.HandleFunc("/api/trades", s.handleTrades)
-	mux.HandleFunc("/api/decisions", s.handleDecisions)
-	mux.HandleFunc("/api/positions", s.handlePositions)
-	mux.HandleFunc("/api/control/pause", s.withControlGuard(s.handleControlPause))
-	mux.HandleFunc("/api/control/resume", s.withControlGuard(s.handleControlResume))
-	mux.HandleFunc("/api/control/step", s.withControlGuard(s.handleControlStep))
+		mux.HandleFunc("/api/status", s.handleStatus)
+		mux.HandleFunc("/api/account", s.handleAccount)
+		mux.HandleFunc("/api/pnl", s.handlePnL)
+		mux.HandleFunc("/api/trades", s.handleTrades)
+		mux.HandleFunc("/api/decisions", s.handleDecisions)
+		mux.HandleFunc("/api/positions", s.handlePositions)
+		mux.HandleFunc("/api/config", s.handleConfigRouter)
+		mux.HandleFunc("/api/trade/simulate", s.withControlGuard(s.handleTradeSimulate))
+		mux.HandleFunc("/api/trade/execute", s.withControlGuard(s.handleTradeExecute))
+		mux.HandleFunc("/api/control/pause", s.withControlGuard(s.handleControlPause))
+		mux.HandleFunc("/api/control/resume", s.withControlGuard(s.handleControlResume))
+		mux.HandleFunc("/api/control/step", s.withControlGuard(s.handleControlStep))
 	// Mount the dashboard last so /api/* wins.
 	ui, err := uiHandler()
 	if err == nil {
@@ -419,3 +422,19 @@ func KillSnapshot() KillSwitch {
 // directly. (Keep one indirect reference; the showcase uses
 // agents.NewKillSwitch() via the auto wiring layer.)
 var _ = agents.NewKillSwitch
+
+// handleConfigRouter dispatches GET vs POST on /api/config. Splitting
+// here keeps the two verb-specific handlers (handleGetConfig /
+// handlePostConfig) free of method-branching noise; same pattern as
+// the existing /api/control/* handlers, which use withControlGuard
+// (not applicable for GET).
+func (s *Server) handleConfigRouter(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		s.handleGetConfig(w, r)
+	case http.MethodPost:
+		s.withControlGuard(s.handlePostConfig)(w, r)
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "use GET or POST")
+	}
+}

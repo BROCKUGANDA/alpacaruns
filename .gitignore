@@ -8,8 +8,15 @@ creds.json
 tunnel-token.txt
 # Any cloudflared tunnel credentials JSON (tunnel secret lives here)
 deploy/cloudflared/*.json
-# Next.js build manifests we don't track
-api/ui/_next/static/[A-Za-z0-9]*/
+# Next.js build manifests we don't track. The build emits a directory
+# directly under _next/static named after a hash (e.g. zBalKiJkOu8iyyPtRKaTD
+# or --dZSJv8SAw2cSOnACp7F) that holds only _buildManifest.js and
+# _ssgManifest.js. Track the actual chunks (chunks/, css/) and the
+# app shell. The pattern is anchored to the _next/static root so it
+# doesn't accidentally sweep up legitimate subdirs (chunks/, css/).
+api/ui/_next/static/_buildManifest.js
+api/ui/_next/static/_ssgManifest.js
+api/ui/_next/static/[!c]*/
 
 # Go build output
 bin/

@@ -214,3 +214,92 @@ type ErrorResponse struct {
 	Code    string `json:"code,omitempty"`
 	TraceID string `json:"trace_id,omitempty"`
 }
+
+// ---- Config ----
+
+// ConfigResponse is the wire shape of GET /api/config. Mirrors the
+// knobs the bot currently has loaded so the controls form can show
+// "what is" next to "what you can change to". Symbol universe is
+// intentionally omitted — it is large and already exposed at
+// /api/status.config.symbols.
+type ConfigResponse struct {
+	MaxPositionUSD       float64 `json:"max_position_usd"`
+	MaxPortfolioPct      float64 `json:"max_portfolio_pct"`
+	CryptoMaxPositionUSD float64 `json:"crypto_max_position_usd"`
+	MinConfidence        float64 `json:"min_confidence"`
+	DailyDDHalt          float64 `json:"daily_dd_halt"`
+	WeeklyDDHalt         float64 `json:"weekly_dd_halt"`
+	TotalDDHalt          float64 `json:"total_dd_halt"`
+}
+
+// ConfigUpdateRequest is the body shape for POST /api/config. Every
+// field is optional; unset fields are left untouched. Unknown fields
+// cause a 400 (extra-forbid equivalent) so a typo never silently
+// drops a knob update.
+type ConfigUpdateRequest struct {
+	MaxPositionUSD       *float64 `json:"max_position_usd,omitempty"`
+	MaxPortfolioPct      *float64 `json:"max_portfolio_pct,omitempty"`
+	CryptoMaxPositionUSD *float64 `json:"crypto_max_position_usd,omitempty"`
+	MinConfidence        *float64 `json:"min_confidence,omitempty"`
+	DailyDDHalt          *float64 `json:"daily_dd_halt,omitempty"`
+	WeeklyDDHalt         *float64 `json:"weekly_dd_halt,omitempty"`
+	TotalDDHalt          *float64 `json:"total_dd_halt,omitempty"`
+}
+
+// ---- Manual Trade ----
+
+// TradeProposalRequest is the body shape for both
+// /api/trade/simulate and /api/trade/execute. Notional is the USD
+// value (mutually exclusive with Qty, takes precedence when both
+// are set — Alpaca semantics). ExtendedHours is honored only for
+// type=limit + day|gtc; the validator rejects bad combos.
+type TradeProposalRequest struct {
+	Symbol        string  `json:"symbol"`
+	Side          string  `json:"side"` // buy | sell
+	Qty           string  `json:"qty,omitempty"`
+	Notional      string  `json:"notional,omitempty"`
+	OrderType     string  `json:"order_type,omitempty"`     // market | limit
+	TimeInForce   string  `json:"time_in_force,omitempty"` // day | gtc
+	LimitPrice    string  `json:"limit_price,omitempty"`
+	ExtendedHours bool    `json:"extended_hours,omitempty"`
+	Confidence    *float64 `json:"confidence,omitempty"`
+}
+
+// TradeSimulationResponse is the shape returned by
+// /api/trade/simulate. approved=false is a normal outcome (the
+// endpoint never 500s on a rejected proposal — only on bad input);
+// the caller renders the reasons + the would-have-sent payload.
+type TradeSimulationResponse struct {
+	Approved      bool       `json:"approved"`
+	Reasons       []string   `json:"reasons,omitempty"`
+	Notional      float64    `json:"notional"`
+	WouldHaveSent TradeOrder `json:"would_have_sent"`
+}
+
+// TradeExecutionResponse is the shape returned by
+// /api/trade/execute. mode is "simulated" when the server has no
+// Alpaca client wired (cold-start / no-key mode) or the bot is
+// paused; "live" when an actual order was placed. approved=false
+// always carries at least one reason.
+type TradeExecutionResponse struct {
+	Approved bool       `json:"approved"`
+	Mode     string     `json:"mode"` // simulated | live
+	Reasons  []string   `json:"reasons,omitempty"`
+	Notional float64    `json:"notional"`
+	Order    *TradeOrder `json:"order,omitempty"`
+}
+
+// TradeOrder is the projected/actual order envelope the dashboard
+// renders next to the risk verdict. Mirrors tools.OrderRequest so
+// the UI can paste it back into the Alpaca UI for confirmation.
+type TradeOrder struct {
+	Symbol        string  `json:"symbol"`
+	Side          string  `json:"side"`
+	Qty           string  `json:"qty,omitempty"`
+	Notional      string  `json:"notional,omitempty"`
+	OrderType     string  `json:"order_type,omitempty"`
+	TimeInForce   string  `json:"time_in_force,omitempty"`
+	LimitPrice    string  `json:"limit_price,omitempty"`
+	ExtendedHours bool    `json:"extended_hours,omitempty"`
+	ClientOrderID string  `json:"client_order_id,omitempty"`
+}

@@ -145,6 +145,94 @@ export type ErrorResponse = {
   code?: string;
 };
 
+// ---- Config (GET/POST /api/config) ----
+
+// ConfigResponse is the wire shape of GET /api/config. Mirrors the
+// runtime knobs the bot currently has loaded; the controls form
+// pre-fills from this so the operator can see "what is" next to
+// "what you can change to".
+export type ConfigResponse = {
+  max_position_usd: number;
+  max_portfolio_pct: number;
+  crypto_max_position_usd: number;
+  min_confidence: number;
+  daily_dd_halt: number;
+  weekly_dd_halt: number;
+  total_dd_halt: number;
+};
+
+// ConfigUpdateRequest is the body shape for POST /api/config. Every
+// field is optional; unset fields are left untouched. Unknown
+// fields cause a 400 (the Go side rejects them) so a typo never
+// silently drops a knob update.
+export type ConfigUpdateRequest = {
+  max_position_usd?: number;
+  max_portfolio_pct?: number;
+  crypto_max_position_usd?: number;
+  min_confidence?: number;
+  daily_dd_halt?: number;
+  weekly_dd_halt?: number;
+  total_dd_halt?: number;
+};
+
+// ---- Manual Trade (POST /api/trade/simulate & /api/trade/execute) ----
+
+// TradeProposalRequest is the body shape for both endpoints.
+// Notional is the USD value (mutually exclusive with Qty, takes
+// precedence when both are set — Alpaca semantics). ExtendedHours
+// is honored only for type=limit + day|gtc; the validator rejects
+// bad combos.
+export type TradeProposalRequest = {
+  symbol: string;
+  side: "buy" | "sell" | string;
+  qty?: string;
+  notional?: string;
+  order_type?: "market" | "limit" | "stop" | string;
+  time_in_force?: "day" | "gtc" | "ioc" | "fop" | string;
+  limit_price?: string;
+  extended_hours?: boolean;
+  confidence?: number;
+};
+
+// TradeOrder is the projected/actual order envelope the dashboard
+// renders next to the risk verdict. Mirrors api/types.go's
+// TradeOrder so the UI can paste it back into the Alpaca UI for
+// confirmation.
+export type TradeOrder = {
+  symbol: string;
+  side: string;
+  qty?: string;
+  notional?: string;
+  order_type?: string;
+  time_in_force?: string;
+  limit_price?: string;
+  extended_hours?: boolean;
+  client_order_id?: string;
+};
+
+// TradeSimulationResponse is the shape returned by /api/trade/simulate.
+// approved=false is a normal outcome (the endpoint never 500s on a
+// rejected proposal — only on bad input); the caller renders the
+// reasons + the would-have-sent payload.
+export type TradeSimulationResponse = {
+  approved: boolean;
+  reasons?: string[];
+  notional: number;
+  would_have_sent: TradeOrder;
+};
+
+// TradeExecutionResponse is the shape returned by /api/trade/execute.
+// mode is "simulated" when the server has no Alpaca client wired
+// (cold-start / no-key mode) or the bot is paused; "live" when an
+// actual order was placed.
+export type TradeExecutionResponse = {
+  approved: boolean;
+  mode: "simulated" | "live" | string;
+  reasons?: string[];
+  notional: number;
+  order?: TradeOrder;
+};
+
 // API base URL. Same-origin by default so a Cloudflare-fronted HTTPS
 // deploy ("https://run.svalley.tech/api/...") hits the Go API on the
 // same origin — no mixed-content failures, no cross-origin CORS hops.
