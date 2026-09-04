@@ -1,0 +1,36 @@
+# Systemd unit template for the Alpacaruns Cloudflare Tunnel.
+#
+# Install path:  /etc/systemd/system/cloudflared-alpacaruns-demo.service
+#
+# Install steps (as root):
+#   mkdir -p /etc/alpacaruns
+#   install -m 0600 deploy/cloudflared/alpacaruns-demo.json \
+#     /etc/alpacaruns/alpacaruns-demo.json
+#   install -m 0644 deploy/cloudflared-alpacaruns-demo.service \
+#     /etc/systemd/system/cloudflared-alpacaruns-demo.service
+#   systemctl daemon-reload
+#   systemctl enable --now cloudflared-alpacaruns-demo
+#   journalctl -u cloudflared-alpacaruns-demo -f
+
+[Unit]
+Description=Alpacaruns live demo Cloudflare Tunnel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/cloudflared tunnel --no-autoupdate --config /etc/alpacaruns/cloudflared-config.yml run alpacaruns-demo
+Restart=on-failure
+RestartSec=5s
+User=cloudflared
+Group=cloudflared
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/etc/alpacaruns
+
+[Install]
+WantedBy=multi-user.target

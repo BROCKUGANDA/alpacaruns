@@ -1,0 +1,36 @@
+# Cloudflare Tunnel config for Alpacaruns live demo
+#
+# Runs on the server hosting the Alpacaruns dashboard API (default
+# :8080). The tunnel connects outbound to Cloudflare's edge; no
+# inbound port needs to be open.
+#
+# Run with:
+#   cloudflared tunnel --config deploy/cloudflared/config.yml run alpacaruns-demo
+#
+# Install as a systemd unit (template at
+# deploy/cloudflared-alpacaruns-demo.service) so the tunnel
+# auto-restarts on reboot.
+#
+# Path note: cloudflared resolves credentials-file at startup. The
+# value below is a path that works in BOTH contexts:
+#   - Local dev on Windows / macOS / Linux: relative to this config
+#     file's directory (cloudflared resolves it against the config
+#     file location).
+#   - Server (systemd): the credentials file lives at
+#     /etc/alpacaruns/alpacaruns-demo.json. Either edit this line
+#     to an absolute path before copying the file, or override at
+#     run time with --credentials-file.
+
+tunnel: 567371fc-701f-4f12-b252-ab52d9bcc36f
+credentials-file: alpacaruns-demo.json
+
+ingress:
+  # Live demo: dashboard + JSON API on the same origin so the
+  # browser uses same-origin fetches with no mixed-content or CORS
+  # hops. Cloudflare terminates HTTPS; cloudflared reaches the Go
+  # server over plain HTTP on localhost.
+  - hostname: run.svalley.tech
+    service: http://localhost:8080
+
+  # Fallback — never proxy unknown hostnames into the local stack.
+  - service: http_status:404

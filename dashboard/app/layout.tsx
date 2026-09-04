@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import "./globals.css";
 import { SiteHeader } from "@/components/site-header";
 import { AppBackground } from "@/components/app-background";
+import { FooterApiUrl } from "@/components/footer-api-url";
 
 export const metadata: Metadata = {
   title: "Alpacaruns — Live Paper Trading Bot",
@@ -26,10 +27,7 @@ export default function RootLayout({
             {children}
           </main>
           <footer className="mx-auto max-w-7xl px-4 pb-8 pt-4 text-center text-xs text-muted sm:px-6 lg:px-8">
-            Alpacaruns showcase · API:{" "}
-            <code className="font-mono">
-              {process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080"}
-            </code>
+            Alpacaruns showcase · API: <FooterApiUrl />
           </footer>
         </div>
       </body>

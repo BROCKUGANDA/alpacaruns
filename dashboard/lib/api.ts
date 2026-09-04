@@ -145,7 +145,14 @@ export type ErrorResponse = {
   code?: string;
 };
 
-const BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080";
+// API base URL. Same-origin by default so a Cloudflare-fronted HTTPS
+// deploy ("https://run.svalley.tech/api/...") hits the Go API on the
+// same origin — no mixed-content failures, no cross-origin CORS hops.
+// Override at build via NEXT_PUBLIC_API_URL when the dashboard is
+// hosted on a different origin than the API (e.g. GH Pages +
+// UpCloud API). In that case set NEXT_PUBLIC_API_URL to the API's
+// full https URL, with no trailing slash.
+const BASE = process.env.NEXT_PUBLIC_API_URL || "";
 
 // Dashboard operator token for the state-changing control endpoints
 // (POST /api/control/*). Stored in the browser's localStorage — never

@@ -6,6 +6,10 @@
 creds.json
 *.json.cred
 tunnel-token.txt
+# Any cloudflared tunnel credentials JSON (tunnel secret lives here)
+deploy/cloudflared/*.json
+# Next.js build manifests we don't track
+api/ui/_next/static/[A-Za-z0-9]*/
 
 # Go build output
 bin/
@@ -45,3 +49,17 @@ hackathon_video/slide_audio/
 *.pem
 *.key
 *.crt
+
+# Local helper scripts & scratch
+scratch/
+tmp/
+notes.md
+TODO.md
+AGENTS.local.md
+*.bak
+*.orig
+*~
+# Emacs / Vim autosaves / lockfiles
+\#*\#
+.\#*
+*.swp

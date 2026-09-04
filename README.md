@@ -1,259 +1,164 @@
-# Alpacaruns — Autonomous MoE Multi-Agent Trading System (Go + Google ADK + Alpaca)
+# Alpacaruns
 
-A Mixture-of-Experts style multi-agent system built on **Google ADK for Go**
-(`google.golang.org/adk`) that connects to **Alpaca's Trading and Market Data
-APIs** via **Alpaca's official MCP server** (`uvx alpaca-mcp-server`).
+> Mixture-of-Experts autonomous paper-trading bot (Go + Alpaca) with an
+> embedded live dashboard, deterministic factor pipeline, and an
+> optional six-expert ensemble layer.
 
 **Paper trading only by default.** All orders go to
-`https://paper-api.alpaca.markets/v2`.
+`https://paper-api.alpaca.markets/v2` until you explicitly change
+`ALPACA_BASE_URL` and set `I_ALPACA_LIVE=YES`.
 
-## Architecture
+- **Code:** `https://github.com/BROCKUGANDA/alpacaruns`
+- **Live demo:** `https://run.svalley.tech/` *(Cloudflare-fronted;
+  same origin serves the dashboard and the Go JSON API)*
+- **API surface:** `GET /api/health`, `GET /api/status`,
+  `GET /api/account`, `GET /api/pnl`, `GET /api/trades`,
+  `GET /api/decisions`, `GET /api/positions`,
+  `POST /api/control/{pause,resume,step}`
 
+## What this is
+
+A single Go binary that:
+
+1. **Polls** Alpaca market data on a configurable interval
+   (`POLL_SECONDS`).
+2. **Scores** each configured symbol with the factor engine
+   (`factors.Engine`) — trend, momentum, volume, volatility, mean-
+   reversion, breakout, cross-sectional momentum, seasonality.
+3. **Decides** deterministically — no probabilistic text-to-trade
+   pipeline; identical inputs always produce identical orders.
+5. **Validates** every order against the risk gate (kill switch,
+   position caps, drawdown halts, confidence threshold).
+6. **Executes** via the official Alpaca REST surface — equities get
+   server-side OCO brackets (TP / SL), options pass through the
+   same gate, crypto enforces TP/SL locally.
+7. **Serves** a Next.js static dashboard from the same binary, on
+   the same port, so `serve` is the only process in production.
+
+The optional **layer-2 ensemble** (`ENSEMBLE_ENABLED=true`) layers
+six expert voices on top of the same factor engine with a
+performance-weighted gater, vol-regime awareness, ATR-normalized
+sizing, and a Hold circuit breaker. Off by default; identical behaviour
+when unset.
+
+## Quick start (5-minute)
+
+```bash
+cp .env.example .env       # add your paper keys
+
+go run ./cmd/alpacaruns auto            # loop: score → decide → execute
+go run ./cmd/alpacaruns auto --once     # one pass and exit
+go run ./cmd/alpacaruns auto --dry-run  # decisions logged, no orders
+
+go run ./cmd/alpacaruns serve --port 8080 --cors-origin "*"
+# open http://localhost:8080/welcome
 ```
-                    ┌──────────────┐
-   user / tick ───▶ │  GatingRoot  │  (dynamic LLM routing)
-                    └──────┬───────┘
-        ┌──────────────────┼──────────────────┐
-        ▼                  ▼                  ▼
-  NLQueryExpert      TradingCycle        MonitorLoop
-  (ad-hoc queries)   (SequentialAgent)   (LoopAgent)
-                          │                   │
-              ┌───────────┴────────┐    HaltableRiskGate
-              ▼                    ▼    (exit_loop on breach)
-       MarketDataExpert       TradeIdeaExpert
-              │                    ▲
-              ▼                    │
-      AnalysisParallel         RiskManagementExpert
-      (ParallelAgent)                │
-       ┌─────────┴─────────┐         ▼
-       ▼                   ▼   ExecutionExpert
- TechnicalAnalysis   SentimentNews  (paper orders only)
+
+`auto` is the recommended entry point. `monitor` (LLM-gated path)
+and `query` (ad-hoc market questions via the ADK gating root) are
+also available.
+
+## Live dashboard (`alpacaruns serve`)
+
+A four-page Next.js dashboard is statically exported and embedded
+into the Go binary at `api/ui/`:
+
+| Page     | What it shows                                                              |
+|----------|---------------------------------------------------------------------------|
+| Welcome  | Health badge, splash, "Enter Live Dashboard" CTA.                         |
+| Live     | Equity, day P&L, total P&L, open-position count, equity curve, kill-      |
+|          | switch badges, live-status dot. Polls `/api/*` every 5–30 s.              |
+| Trades   | Cursor-paginated trade log (path, confidence, factor scores, notional).  |
+| Brain    | Open positions, recent decision feed, factor weights.                     |
+| Controls | Read-only config table + Pause / Resume / Step controls. Optional bearer |
+|          | token via localStorage (for cross-origin deployments only).                |
+
+To rebuild the embedded UI after dashboard changes:
+
+```bash
+cd dashboard && npm install && npm run build && cd ..
+# Rebuild the Go binary so the new api/ui is embedded:
+go build -o alpacaruns.exe ./cmd/alpacaruns
 ```
 
-- **GatingRoot** — LLM gating network; routes NL questions, cycles, monitoring.
-- **TradingCycle** — deterministic `SequentialAgent`:
-  MarketData → (Technical ∥ Sentiment) → TradeIdea → Risk → Execution.
-- **AnalysisParallel** — `ParallelAgent`; technical + sentiment run concurrently.
-- **MonitorLoop** — `LoopAgent`; polls risk each tick and self-exits via
-  `exit_loop` when limits are breached.
-- Every Alpaca call (bars, quotes, snapshots, news, account, positions,
-  paper orders) is a tool from Alpaca's official MCP server — no hand-rolled
-  REST logic duplicated here.
+The dashboard fetches `/api/*` **same-origin** by default. Set
+`NEXT_PUBLIC_API_URL` at dashboard build time when hosting the UI
+on a different origin than the API (see [Deployment](#deployment)).
+
+## Configuration
+
+Every knob lives in `.env`. The non-secret keys shipped in
+`.env.example` are the contract; see that file for the canonical
+list. Highlights:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MODE` | `supervised` | `supervised` requires human approval before execution; `autonomous` proceeds if risk passes AND `confidence ≥ MIN_CONFIDENCE`. |
+| `POLL_SECONDS` | `300` | Tick interval. |
+| `MIN_CONFIDENCE` | `0.7` | Autonomous-mode confidence gate. |
+| `MAX_POSITION_USD` | `10000` | Per-position cap. |
+| `MAX_PORTFOLIO_PCT` | `0.20` | Portfolio-percentage cap. |
+| `DAILY_DD_HALT` / `WEEKLY_DD_HALT` / `TOTAL_DD_HALT` | `0.05 / 0.10 / 0.15` | Drawdown halts (5% / 10% / 15%). |
+| `ENSEMBLE_ENABLED` | `false` | Switch the `auto` tick path to the multi-expert ensemble. |
+| `MIN_ENSEMBLE_CONFIDENCE` | `0.55` | Minimum normalised winning-vote mass for the gater to act. **Practical ceiling is ≈ 0.54** with all six experts (Hold voices contribute ×0.5 mass against the buy side), so set this **≤ 0.50** in prod or the bot silently never trades. The shipped `.env.example` uses `0.50` for this reason. |
+| `BRACKET_MODE` | `pct` | `pct` (entry × TP_PCT / SL_PCT) or `atr` (ATR-multiple brackets). |
+| `SWING_ENABLED` | `true` | Master switch for the multi-day equity pipeline. |
+| `INTRADAY_TRACK` | `off` | `off` / `shadow` (log only) / `live` (intraday with its own risk budget). |
+
+LLM providers (priority order):
+
+1. **Local llama.cpp** — set `LLM_BASE_URL` (e.g.
+   `http://127.0.0.1:8080`) and `LLM_MODEL`. Run
+   `llama-server -m Qwen3-4B-Instruct-Q4_K_M.gguf --jinja -c 16384`
+   first. `--jinja` is REQUIRED so Qwen3's native tool-call template
+   is used.
+2. **Oxlo.ai** — set `LLM_PROVIDER=oxlo` and `OXLO_API_KEY`. The
+   chosen model is `gpt-oss-20b` (lowest stable latency, correct
+   tool-call arguments in every attempt during August 2026 probe).
+3. **Gemini** — set `GEMINI_API_KEY`. Used only if both
+   `LLM_BASE_URL` is empty and `LLM_PROVIDER` is unset.
 
 ## Safety rails
 
 | Control | Mechanism |
 |---|---|
-| Paper-by-default | `ALPACA_BASE_URL` points at paper API; live requires an explicit config change |
-| Supervised mode | `MODE=supervised` — human approval required before execution |
-| Autonomous gate | `MODE=autonomous` proceeds only if risk passes AND `confidence ≥ MIN_CONFIDENCE` |
-| Hard kill-switch | Ctrl+C during `monitor` closes the halt channel immediately |
-| Position caps | `MAX_POSITION_USD`, `MAX_PORTFOLIO_PCT` enforced by RiskManagementExpert |
-| Auditability | Each expert's contribution is visible in the event stream per idea |
+| Paper-by-default | `ALPACA_BASE_URL` points at paper API; live requires an explicit config change. |
+| Supervised mode | `MODE=supervised` — human approval required before execution. |
+| Autonomous gate | `MODE=autonomous` proceeds only if risk passes AND `confidence ≥ MIN_CONFIDENCE`. |
+| Hard kill-switch | SIGINT/SIGTERM during `monitor`/`auto` closes the halt channel immediately. |
+| Position caps | `MAX_POSITION_USD`, `MAX_PORTFOLIO_PCT`, per-symbol and per-portfolio, enforced deterministically. |
+| Drawdown halts | Daily / weekly / total drawdown thresholds engage a shared halt; nothing further trades. |
+| Auditability | Every decision (cycle, ensemble, fill, reconcile, panic recovery) is journaled to `data/trades.jsonl`. |
 
-## Prerequisites
-
-- Go 1.22+
-- Python 3.10+ with [uv](https://docs.astral.sh/uv/) (`uvx` on PATH) — required by Alpaca's MCP server
-- One of:
-  - **Local LLM (default):** llama.cpp `llama-server` running with a Qwen3 GGUF, or
-  - Gemini API key (`GEMINI_API_KEY`)
-- Alpaca **paper** keys
-
-## Local llama.cpp setup (Qwen3)
-
-```bash
-# --jinja is REQUIRED for Qwen3 tool calling: it enables the model's own
-# chat template, which serializes tool calls correctly. Mismatched templates
-# are the most common cause of malformed tool calls in local agent setups.
-llama-server -m Qwen3-4B-Instruct-Q4_K_M.gguf --jinja -c 16384 --port 8080
-```
-
-**Recommended model:** Qwen3-4B-Instruct **Q4_K_M** GGUF (default above).
-Per the **February 2026 Local Agent Bench** (Mike Veerman's 21-model
-tool-calling benchmark for local models), the Qwen3 family leads the
-sub-4B class — qwen3:4b tied #1 on agent score — making it the most
-reliable tool-caller for CPU-only llama.cpp hosts at this size.
-`--jinja` stays REQUIRED: it activates Qwen3's native tool-call chat
-template. If the host has >= 12GB RAM, step up to
-**Qwen3-8B-Instruct-Q4_K_M** for stronger reasoning at similar tool-call
-reliability.
-
-### About the bundled `qwen3-7b-instruct-q4_k_m.gguf`
-
-The local file `C:\Users\HP\Models\qwen3-7b-instruct-q4_k_m.gguf` (4.4 GB)
-is misnamed: its GGUF header metadata identifies
-`general.architecture=qwen2`, `general.name="Qwen2.5 7B Instruct"` — it is
-a Qwen2.5-based 7B merge (Coder + Instruct + Math lineage), **not** Qwen3.
-It serves fine through llama-server (`llama-server -m
-qwen3-7b-instruct-q4_k_m.gguf --jinja -c 16384 --port 8080`; the
-`LLM_MODEL=qwen3.7b-instruct-q4_k_m` name in `.env` is just a label —
-llama-server serves whatever file you pass). Context is 32768 per its
-metadata, so `-c 16384` fits comfortably. As a qwen2 merge its native
-tool-call template support and tool-calling reliability are unproven vs
-Qwen3-4B; worth one smoke test via `alpacaruns query "what is AAPL's
-latest quote?"`. The recommendation above stays Qwen3-4B-Instruct Q4_K_M;
-this 7B is an acceptable fallback.
-
-Then in `.env`:
+## Architecture
 
 ```
-LLM_BASE_URL=http://127.0.0.1:8080
-LLM_MODEL=qwen3.7b-instruct-q4_k_m
+                     ┌───────────────────┐
+  user / tick ─────▶ │  Deterministic    │
+                     │  Pipeline (auto)  │
+                     └─────────┬─────────┘
+                               │
+       ┌───────────────────────┼───────────────────────┐
+       ▼                       ▼                       ▼
+  Factor Engine          Risk Gate              Order Executor
+  (trend/momentum/       (kill switch,          (Alpaca REST;
+   volume/volatility/     position caps,         OCO brackets
+   + ensemble: 6          drawdown halts,        for equities;
+   experts w/ gater)      confidence)            crypto enforces
+                                                 TP/SL locally)
+       │                       │                       │
+       └───── all state ───────┴──── journaled ────────┘
+              ▼
+        data/trades.jsonl
+              │
+              ▼ (same binary, same port)
+       ┌──────────────────────┐
+       │  Next.js Dashboard   │  embedded static export
+       │  (welcome / live /   │  served at "/welcome",
+       │   trades / brain /   │  "/live", "/trades",
+       │   controls)          │  "/brain", "/controls"
+       └──────────────────────┘
 ```
-
-Leave `LLM_BASE_URL` empty to fall back to the Gemini API instead.
-The adapter (`model/llamacpp`) implements ADK's `model.LLM` against
-llama-server's OpenAI-compatible `/v1/chat/completions`, converting ADK's
-function declarations to OpenAI tools and tool_calls back to ADK FunctionCalls.
-
-### Cloud providers
-
-**Oxlo.ai** is supported as a hosted OpenAI-compatible provider through the
-same adapter (`model/llamacpp` speaks both llama-server and Oxlo's
-`/v1/chat/completions`, including tool calls). Set these env vars:
-
-```
-LLM_PROVIDER=oxlo
-OXLO_API_KEY=<your key>   # secret; keep in .env (gitignored)
-LLM_MODEL=gpt-oss-20b     # optional; this is the default for oxlo
-```
-
-**Chosen model: `gpt-oss-20b`.** A live probe of `api.oxlo.ai/v1`
-(August 2026) sent a real function-calling request (`get_quote`) to every
-small candidate in the catalog. Only three emitted well-formed
-`finish_reason=tool_calls` responses — `llama-3.2-3b`, `mistral-7b`, and
-`gpt-oss-20b`; `gemma-3-4b` and `llama-3.1-8b` ignored the tools array.
-`gpt-oss-20b` had the lowest stable round-trip latency (~1.6–2.4 s,
-repeated runs) and correct arguments on every attempt, making it the best
-fit for the agent graph's many small tool-calling turns.
-
-Local llama.cpp remains the default: with no `LLM_PROVIDER`, an
-`LLM_BASE_URL` selects llamacpp and otherwise Gemini is used when
-`GEMINI_API_KEY` is set.
-
-## Quick start
-
-```bash
-cp .env .env.local   # or edit .env directly with your keys
-
-# one full trading cycle
-go run ./cmd/alpacaruns cycle
-
-# continuous monitoring loop (Ctrl+C = kill switch)
-go run ./cmd/alpacaruns monitor
-
-# ad-hoc market question through the gating router
-go run ./cmd/alpacaruns query "what is AAPL's latest quote?"
-```
-
-## Demo dashboard (`alpacaruns serve`)
-
-A multi-page Next.js dashboard (welcome, live, trades, brain,
-controls) is statically exported and embedded into the Go binary at
-`api/ui/`. Run it with:
-
-```bash
-go run ./cmd/alpacaruns serve --port 8080 --cors-origin "*"
-# open http://localhost:8080/welcome
-```
-
-The API at `/api/health`, `/api/status`, `/api/account`,
-`/api/pnl`, `/api/trades`, `/api/decisions`, `/api/positions`, and
-`/api/control/{pause,resume,step}` is the same data the dashboard
-fetches. To rebuild the embedded UI from source, see
-`dashboard/README.md`.
-
-## Deterministic `auto` mode (no LLM)
-
-`alpacaruns auto` replaces the LLM for execution decisions with a pure,
-auditable pipeline: market data in, factor scores computed, threshold
-rule applied, sized orders out. Identical inputs always produce identical
-decisions. The LLM remains available for `query`/analysis paths only.
-
-```bash
-go run ./cmd/alpacaruns auto            # loop: score -> decide -> execute
-go run ./cmd/alpacaruns auto --once     # one pass and exit
-go run ./cmd/alpacaruns auto --dry-run  # decisions logged, no orders
-```
-
-Pipeline per tick (every POLL_SECONDS):
-
-1. **Score** each symbol via the existing multi-factor engine
-   (`factors.Engine`; equities from stock bars, crypto from
-   `/v1beta3/crypto/us/bars`).
-2. **Decide** deterministically — BUY when `composite >= FACTOR_MIN_SCORE`
-   AND `trend >= TREND_BUY` AND `momentum >= MOMENTUM_BUY`; SELL a held
-   position when `composite <= EXIT_COMPOSITE` OR
-   `momentum <= EXIT_MOMENTUM`; otherwise HOLD.
-3. **Gate on time** — equities/options only trade inside `TRADING_WINDOWS`
-   (ET); crypto trades 24/7 inside its own `CRYPTO_WINDOWS`.
-4. **Size** fixed-fractional: budget = portfolio × `POSITION_PCT`, capped
-   by `MAX_POSITION_USD`; qty = floor(budget / price); skip if < 1.
-5. **Risk gate** — every order passes `agents.NewValidator`, so all caps,
-   kill-switch and session rules apply exactly as on the LLM path.
-6. **Execute** — equities get server-side OCO brackets
-   (`take_profit` = entry×(1+TP_PCT), `stop_loss` = entry×(1−SL_PCT)).
-   Crypto does NOT support bracket orders on Alpaca, so levels are
-   persisted to `data/strategy-state.json` and enforced locally by the
-   position monitor (which also rebuilds missing equity stops after
-   restarts). Options overlay: an equity BUY may be replaced by a deep-ITM
-   call (~60–70 delta, 30–45 DTE) sized so premium ≤ position budget.
-7. **Halt** — daily ≥ DAILY_DD_HALT (default 5%), weekly ≥ WEEKLY_DD_HALT
-   (10%) or total ≥ TOTAL_DD_HALT (15%) drawdown engages the shared kill
-   switch; nothing further trades.
-
-All new env vars are documented in `deploy/DEPLOY.md`.
-
-### Layer-2 ensemble (optional, off by default)
-
-Setting `ENSEMBLE_ENABLED=true` switches the tick path to a multi-expert
-ensemble layered on the same factor engine — still fully deterministic,
-no LLM:
-
-1. **Bars fetched ONCE** per tick and shared across all experts.
-2. **Six expert voices** score every symbol:
-   `trend` (the existing factor rule wrapped as an expert), `meanrev`
-   (SMA-20 z-score, ranging regimes only), `breakout` (Donchian-20 with
-   volume confirmation), `pairs` (cointegration-lite ratio z-score for
-   configured pairs, long-only), `xsmom` (cross-sectional 20-day
-   momentum: top-3 buy, held bottom-third sell), `seasonality`
-   (turn-of-month + day-of-week tilts; capped below trade-triggering
-   confidence).
-3. **Vol-regime assessment** (`volregime.go`) classifies LowVol /
-   RisingVol / Crisis from benchmark ATR percentile and a realized-vol
-   VIX proxy.
-4. **Performance-weighted gater**: each voice's weight = base weight ×
-   (0.5 + trailing hit-rate over its last 30 resolved signals); RisingVol/
-   Crisis scales contrarian voices (meanrev/pairs) down ×0.5/×0 and trend
-   voices up ×1.25/×1.5, inverted in LowVol. The winning side must clear
-   `MIN_ENSEMBLE_CONFIDENCE` (default 0.55) or the gater holds; a
-   directional split without 2:1 dominance trips a Hold circuit breaker
-   logged loudly.
-5. **Risk budget** before execution: ATR-normalized sizing (portfolio ×
-   `RISK_PCT_PER_TRADE` ÷ 2×ATR, MIN-ed against the legacy caps so old
-   limits still bind), correlation netting (block buys averaging >0.85
-   return-correlation to held positions), and a liquidity cap (entry ≤1%
-   of 20-day average dollar volume). Pending signals persist in
-   `data/ensemble-state.json` and resolve when price moves ≥0.5×ATR
-   favorably within 5 sessions.
-6. **Execution** reuses the exact existing window-gate / sizing /
-   risk-validator / bracket paths (`handleBuy`/`handleSell`). Every
-   ensemble decision is journaled with its full per-expert vote trail.
-
-With `ENSEMBLE_ENABLED=false` or unset, behavior is byte-for-byte the
-original single-expert loop.
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `ENSEMBLE_ENABLED` | `false` | switch the `auto` tick path to the multi-expert ensemble |
-| `MIN_ENSEMBLE_CONFIDENCE` | `0.55` | minimum normalized winning vote mass to act |
-| `ENSEMBLE_BENCHMARK` | `SPY` | vol-regime reference symbol |
-| `ENSEMBLE_PAIRS` | `SPY/QQQ,XLE/XLF` | comma-separated LEG_A/LEG_B pairs for the stat-arb voice (long-only) |
-| `RISK_PCT_PER_TRADE` | `0.01` | fraction of portfolio risked per entry at a 2×ATR stop |
-| `ENSEMBLE_MAX_CORRELATION` | `0.85` | average return-corr ceiling vs held positions for new buys |
-| `ENSEMBLE_LIQUIDITY_PCT` | `0.01` | max entry notional as fraction of 20-day average dollar volume |
-| `ENSEMBLE_PERF_WINDOW` | `30` | trailing resolved-signal window per expert hit-rate |
 
 ## Tests
 
@@ -261,21 +166,87 @@ original single-expert loop.
 go test ./...
 ```
 
-Unit tests mock the Alpaca HTTP surface (order placement/cancel, bars, errors);
-config tests cover paper-defaults and mode validation.
+Unit tests mock the Alpaca HTTP surface (order placement/cancel,
+bars, errors) and cover config defaults, mode validation, ensemble
+math, and the risk validator.
+
+> **Pre-existing failures**: `risk` + `strategy` tests fail
+> identically on the pristine tree — not introduced by recent
+> changes. Tracked as a separate hardening backlog; touch only with
+> a reproducer.
+
+## Deployment
+
+See [`deploy/DEPLOY.md`](deploy/DEPLOY.md) for the full 24/7
+bring-up. Short version:
+
+1. Build: `go build -o alpacaruns.linux ./cmd/alpacaruns`
+2. Ship to your host (systemd unit template at
+   `deploy/alpacaruns.service`).
+3. Run behind a reverse proxy or a Cloudflare Tunnel for HTTPS.
+
+### Cloudflare Tunnel (recommended for demo)
+
+The live demo at `run.svalley.tech` is fronted by a Cloudflare
+Tunnel so the browser hits `https://run.svalley.tech/api/...` on
+the same origin as the dashboard — no mixed-content failures, no
+CORS hops, automatic TLS.
+
+To set up a similar tunnel:
+
+```bash
+cloudflared tunnel login                                    # one-time
+cloudflared tunnel create alpacaruns-demo
+cloudflared tunnel route dns alpacaruns-demo run.example.com
+
+# Run locally; cloudflared connects outbound to Cloudflare's edge.
+cloudflared tunnel run alpacaruns-demo \
+  --url http://localhost:8080     # or use a config file:
+#   tunnel: alpacaruns-demo
+#   credentials-file: ~/.cloudflared/<UUID>.json
+#   ingress:
+#     - hostname: run.example.com
+#       service: http://localhost:8080
+#     - service: http_status:404
+```
+
+The Go server's CORS middleware is configured via
+`--cors-origin` (default `*`); same-origin browser fetches from the
+embedded dashboard are always allowed, so a default CORS of `*` is
+fine for the demo.
 
 ## Paper → Live (DO NOT skip this warning)
 
-⚠️ **Live trading can lose real money.** To promote: change `ALPACA_BASE_URL`
-to `https://api.alpaca.markets/v2` AND swap in live keys AND review every risk
-limit. There is no separate "promote" flag in this scaffold by design — the
-change must be deliberate in two places.
+Live trading loses real money. To promote:
+
+1. Change `ALPACA_BASE_URL` to `https://api.alpaca.markets/v2`.
+2. Swap in live keys.
+3. Set `I_ALPACA_LIVE=YES` (config refuses to start a live session
+   without this acknowledgement).
+4. Review every risk limit.
+
+There is no separate "promote" flag by design — the change must be
+deliberate in three places.
 
 ## Layout
 
 ```
-agents/       MoE agents + Sequential/Parallel/Loop wiring + MCP bridge
-config/       env loading, mode/confidence/risk settings
-tools/        legacy direct REST client + tests (kept for reference/tests)
-cmd/alpacaruns/  CLI: cycle | monitor | query
+agents/             MoE agent graph (LLM-gated paths; reference)
+config/             env loading, mode/confidence/risk settings
+tools/              legacy direct REST client + tests (reference)
+factors/            factor engine (trend/momentum/volume/volatility/...)
+strategy/           multi-expert ensemble + runner (optional layer 2)
+pnl/                P/L aggregation from trades.jsonl
+risk/               deterministic pre-trade validator + kill switch
+stream/             market-data + trade-updates streams
+options/            options overlay (deep-ITM calls on BUY)
+cmd/alpacaruns/     CLI: cycle | monitor | query | auto | serve | pl | trade
+api/                dashboard HTTP server (handlers, security, embed)
+  ui/               embedded Next.js static export (build artifact)
+deploy/             systemd units + Dockerfiles + DEPLOY.md
+docs/               hackathon writeup, hardening audit, slide decks
 ```
+
+## License
+
+MIT — see [`LICENSE`](LICENSE).
