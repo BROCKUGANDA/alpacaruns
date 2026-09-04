@@ -510,3 +510,281 @@ func TestConcurrentPauseWrites(t *testing.T) {
 	}
 	wg.Wait()
 }
+// ---- security surface ----
+
+func TestControlAuthTokenRequired(t *testing.T) {
+	dir := t.TempDir()
+	s := newTestServer(t, dir)
+	s.settings.AuthToken = "opaque-test-token"
+	mux := s.routes()
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	post := func(token string) int {
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/control/pause", nil)
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if got := post(""); got != http.StatusUnauthorized {
+		t.Fatalf("no token: status %d, want 401", got)
+	}
+	if got := post("wrong-token"); got != http.StatusUnauthorized {
+		t.Fatalf("wrong token: status %d, want 401", got)
+	}
+	if got := post("opaque-test-token"); got != http.StatusOK {
+		t.Fatalf("right token: status %d, want 200", got)
+	}
+}
+
+func TestControlAuthCrossOriginRejected(t *testing.T) {
+	dir := t.TempDir()
+	s := newTestServer(t, dir) // no token configured
+	mux := s.routes()
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	post := func(origin, referer string) int {
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/control/pause", nil)
+		if origin != "" {
+			req.Header.Set("Origin", origin)
+		}
+		if referer != "" {
+			req.Header.Set("Referer", referer)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if got := post("https://evil.example.com", ""); got != http.StatusForbidden {
+		t.Fatalf("foreign origin: status %d, want 403", got)
+	}
+	// Same-origin browser fetch passes without a token.
+	if got := post(ts.URL, ""); got != http.StatusOK {
+		t.Fatalf("same origin: status %d, want 200", got)
+	}
+	if got := post("", ts.URL+"/controls"); got != http.StatusOK {
+		t.Fatalf("same referer: status %d, want 200", got)
+	}
+	// Token-less non-browser caller passes when no token configured.
+	if got := post("", ""); got != http.StatusOK {
+		t.Fatalf("no origin headers: status %d, want 200", got)
+	}
+}
+
+func TestSecurityHeaders(t *testing.T) {
+	dir := t.TempDir()
+	s := newTestServer(t, dir)
+	mux := s.routes()
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/api/health")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	for k, want := range map[string]string{
+		"X-Content-Type-Options": "nosniff",
+		"X-Frame-Options":        "DENY",
+		"Referrer-Policy":        "no-referrer",
+	} {
+		if got := resp.Header.Get(k); got != want {
+			t.Fatalf("api header %s = %q, want %q", k, got, want)
+		}
+	}
+	if got := resp.Header.Get("Content-Security-Policy"); got == "" {
+		t.Fatalf("api responses must carry a CSP")
+	}
+	if got := resp.Header.Get("Strict-Transport-Security"); got != "" {
+		t.Fatalf("HSTS must be off without TLS, got %q", got)
+	}
+
+	// Embedded UI: framing denied, but no JSON-style CSP (Next.js
+	// hydration needs inline scripts).
+	uresp, err := http.Get(ts.URL + "/welcome/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer uresp.Body.Close()
+	if uresp.StatusCode != 200 {
+		t.Fatalf("welcome status %d", uresp.StatusCode)
+	}
+	if got := uresp.Header.Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Fatalf("ui nosniff = %q", got)
+	}
+	if got := uresp.Header.Get("Content-Security-Policy"); got != "" {
+		t.Fatalf("ui must not carry the api CSP, got %q", got)
+	}
+}
+
+func TestMaskAccountNumber(t *testing.T) {
+	if got := maskAccountNumber("PA3LNUDV231J"); got != "****231J" {
+		t.Fatalf("got %q", got)
+	}
+	if got := maskAccountNumber("ab"); got != "****" {
+		t.Fatalf("short input must fully mask, got %q", got)
+	}
+	if got := maskAccountNumber(""); got != "****" {
+		t.Fatalf("empty input must fully mask, got %q", got)
+	}
+}
+
+func TestBadQueryParamsRejected(t *testing.T) {
+	dir := t.TempDir()
+	s := newTestServer(t, dir)
+	mux := s.routes()
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	bad := map[string][]string{
+		"/api/trades": {
+			"limit=abc", "limit=0", "limit=-5", "limit=201", "limit=999999",
+			"cursor=-1", "cursor=xyz",
+			"since=not-a-date", "until=32-13-99",
+			"since=2026-09-03&until=2026-09-01",
+			"path=bogus",
+			"symbol=SPY%20X", "symbol=%3Ctag%3E", "symbol=" + strings.Repeat("A", 33),
+		},
+		// /api/decisions takes no symbol filter; unknown params are
+		// ignored there by design (narrow contract per endpoint).
+		"/api/decisions": {
+			"limit=abc", "limit=0", "limit=-5", "limit=201", "limit=999999",
+			"cursor=-1", "cursor=xyz",
+			"since=not-a-date", "until=32-13-99",
+			"since=2026-09-03&until=2026-09-01",
+			"path=bogus",
+		},
+	}
+	for ep, cases := range bad {
+		for _, qs := range cases {
+			resp, err := http.Get(ts.URL + ep + "?" + qs)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("%s?%s: status %d, want 400", ep, qs, resp.StatusCode)
+			}
+		}
+	}
+	// limit=200 (ceiling) and a valid symbol still pass.
+	resp, err := http.Get(ts.URL + "/api/trades?limit=200&symbol=SPY&path=agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("valid params: status %d, want 200", resp.StatusCode)
+	}
+}
+
+func TestXFFIgnoredWhenUntrusted(t *testing.T) {
+	dir := t.TempDir()
+	s := newTestServer(t, dir) // TrustedProxy=false
+	req, _ := http.NewRequest(http.MethodGet, "/api/health", nil)
+	req.RemoteAddr = "10.0.0.9:1234"
+	req.Header.Set("X-Forwarded-For", "9.9.9.9, 8.8.8.8")
+	if got := s.clientKey(req); got != "10.0.0.9" {
+		t.Fatalf("untrusted XFF honored: key %q", got)
+	}
+	s.settings.TrustedProxy = true
+	if got := s.clientKey(req); got != "9.9.9.9" {
+		t.Fatalf("trusted XFF ignored: key %q", got)
+	}
+}
+
+func TestWriteJSONEscapesHTML(t *testing.T) {
+	rec := httptest.NewRecorder()
+	writeJSON(rec, http.StatusOK, map[string]string{"detail": "</script><img src=x>"})
+	body := rec.Body.String()
+	if strings.Contains(body, "</script>") || strings.Contains(body, "<img") {
+		t.Fatalf("raw HTML in JSON body: %q", body)
+	}
+	if !strings.Contains(body, "\\u003c") {
+		t.Fatalf("expected escaped angle brackets, got %q", body)
+	}
+}
+
+func TestControlRateLimit429(t *testing.T) {
+	dir := t.TempDir()
+	s := newTestServer(t, dir)
+	mux := s.routes()
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	var saw429 bool
+	for i := 0; i < controlBudget+10; i++ {
+		resp, err := http.Post(ts.URL+"/api/control/pause", "application/json", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusTooManyRequests {
+			saw429 = true
+			if resp.Header.Get("Retry-After") == "" {
+				t.Fatalf("429 without Retry-After")
+			}
+			break
+		}
+	}
+	if !saw429 {
+		t.Fatalf("control budget never exhausted after %d requests", controlBudget+10)
+	}
+}
+
+func TestJournalPathsNotUserControlled(t *testing.T) {
+	// Regression guard for the "parameterize queries" review: no
+	// handler may derive a filesystem path from request input. The
+	// only path sources are ServerSettings (flags/env). Values that
+	// merely LOOK like traversal but use the legal filter charset
+	// (/, . — needed for pairs like BTC/USD) must match nothing and
+	// return an empty list, never touch the filesystem.
+	dir := t.TempDir()
+	s := newTestServer(t, dir)
+	mux := s.routes()
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	// Charset-legal but filesystem-flavored filters: 200 + zero rows.
+	resp, err := http.Get(ts.URL + "/api/trades?symbol=../../etc/passwd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tr TradesResponse
+	if err := json.NewDecoder(resp.Body).Decode(&tr); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || len(tr.Trades) != 0 {
+		t.Fatalf("traversal filter: status %d rows %d, want 200 + 0 rows",
+			resp.StatusCode, len(tr.Trades))
+	}
+
+	// Illegal values in the other params: 400.
+	for _, u := range []string{
+		"/api/trades?since=..%2F..%2Fsecret",
+		"/api/decisions?path=..%2F..",
+		"/api/pnl?until=..%2F..%2F..",
+	} {
+		resp, err := http.Get(ts.URL + u)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("%s: status %d, want 400", u, resp.StatusCode)
+		}
+	}
+}

@@ -9,6 +9,8 @@ import useSWR, { mutate } from "swr";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   apiFetch,
+  getDashboardToken,
+  setDashboardToken,
   swrFetcher,
   type ControlResponse,
   type StatusResponse,
@@ -91,6 +93,9 @@ function ConfigTable({
 
 function ActionButtons() {
   const [pending, setPending] = useState<string | null>(null);
+  const [token, setToken] = useState<string>(() =>
+    typeof window !== "undefined" ? getDashboardToken() ?? "" : "",
+  );
   const [toast, setToast] = useState<{
     kind: "ok" | "err";
     text: string;
@@ -119,6 +124,29 @@ function ActionButtons() {
 
   return (
     <>
+      <div className="rounded-xl border border-border bg-panel p-5">
+        <div className="mb-1 text-xs uppercase tracking-wide text-muted">
+          Operator token (optional)
+        </div>
+        <p className="mb-3 text-xs text-muted">
+          Needed only when the API requires a bearer token (DASHBOARD_TOKEN
+          on the server) or when this dashboard is hosted on a different
+          origin. Stored in this browser only — never sent except as an
+          Authorization header on control actions.
+        </p>
+        <input
+          type="password"
+          autoComplete="off"
+          spellCheck={false}
+          placeholder="Bearer token for pause / resume / step"
+          value={token}
+          onChange={(e) => {
+            setToken(e.target.value);
+            setDashboardToken(e.target.value);
+          }}
+          className="w-full rounded-lg border border-border bg-bg px-3 py-2 font-mono text-sm text-zinc-100 placeholder:text-muted/60 focus:border-accent/60 focus:outline-none"
+        />
+      </div>
       <div className="grid gap-3 sm:grid-cols-3">
         <button
           disabled={pending !== null}

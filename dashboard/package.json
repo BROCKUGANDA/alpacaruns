@@ -9,13 +9,13 @@
     "lint": "next lint"
   },
   "dependencies": {
-    "next": "14.2.18",
+    "clsx": "2.1.1",
+    "framer-motion": "11.11.17",
+    "next": "^14.2.35",
     "react": "18.3.1",
     "react-dom": "18.3.1",
-    "framer-motion": "11.11.17",
-    "swr": "2.2.5",
-    "clsx": "2.1.1",
     "recharts": "2.13.3",
+    "swr": "2.2.5",
     "tailwind-merge": "2.5.4"
   },
   "devDependencies": {

@@ -71,6 +71,31 @@ type ServerSettings struct {
 	// AllowPause, when false, refuses /api/control/pause and
 	// /api/control/resume (production deployments may want this off).
 	AllowPause bool
+	// AuthToken guards the state-changing control endpoints
+	// (--auth-token / DASHBOARD_TOKEN). Callers present it as
+	// `Authorization: Bearer <token>`. Same-origin browser fetches
+	// from the embedded dashboard are additionally allowed without
+	// a token (CSRF-safe via the Origin check); cross-origin POSTs
+	// are always rejected. Empty means "no token required for
+	// non-browser callers" — fine for local bring-up, loud warning
+	// in the logs, never for an internet-facing deploy.
+	AuthToken string
+	// TrustedProxy, when true, lets the rate limiter and host checks
+	// honor X-Forwarded-For / X-Forwarded-Host (--trusted-proxy /
+	// TRUSTED_PROXY=1). Default false: behind an untrusted network
+	// any client could otherwise spoof XFF and walk around the
+	// limiter one fake IP at a time.
+	TrustedProxy bool
+	// TLSCert/TLSKey enable a direct-TLS listener (--tls-cert /
+	// --tls-key, env TLS_CERT / TLS_KEY). Empty = plaintext HTTP;
+	// terminate TLS at the reverse proxy / Cloudflare Tunnel instead
+	// (see deploy/DEPLOY.md) and keep HSTS off in that case.
+	TLSCert string
+	TLSKey  string
+	// HSTS, when true, emits Strict-Transport-Security. Set
+	// automatically when TLSCert/TLSKey are provided; leave off for
+	// plaintext origins (browsers ignore HSTS over HTTP anyway).
+	HSTS bool
 }
 
 // DefaultSettings returns settings pointing at data/* relative to the
@@ -119,6 +144,14 @@ func New(cfg *config.Config, client *tools.Client, set ServerSettings, strat *st
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       90 * time.Second,
 	}
+	if set.AuthToken == "" {
+		log.Printf("[api] WARNING: no --auth-token configured; control endpoints accept token-less " +
+			"same-origin and local requests. Set DASHBOARD_TOKEN before exposing this port beyond localhost.")
+	}
+	if set.CORSOrigin == "*" {
+		log.Printf("[api] WARNING: CORS origin is \"*\"; any website can read /api/* responses. " +
+			"Set --cors-origin to the dashboard origin in production.")
+	}
 	return s
 }
 
@@ -143,9 +176,9 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/api/trades", s.handleTrades)
 	mux.HandleFunc("/api/decisions", s.handleDecisions)
 	mux.HandleFunc("/api/positions", s.handlePositions)
-	mux.HandleFunc("/api/control/pause", s.handleControlPause)
-	mux.HandleFunc("/api/control/resume", s.handleControlResume)
-	mux.HandleFunc("/api/control/step", s.handleControlStep)
+	mux.HandleFunc("/api/control/pause", s.withControlGuard(s.handleControlPause))
+	mux.HandleFunc("/api/control/resume", s.withControlGuard(s.handleControlResume))
+	mux.HandleFunc("/api/control/step", s.withControlGuard(s.handleControlStep))
 	// Mount the dashboard last so /api/* wins.
 	ui, err := uiHandler()
 	if err == nil {
@@ -154,13 +187,16 @@ func (s *Server) routes() http.Handler {
 	return s.withMiddleware(mux)
 }
 
-// withMiddleware wraps the router in CORS + rate-limit + recover
-// middleware. Recovery is the innermost so a panic in any handler
-// returns a 500 instead of tearing down the connection.
+// withMiddleware wraps the router in security-headers + CORS +
+// rate-limit + recover middleware. Recovery is the innermost so a
+// panic in any handler returns a 500 instead of tearing down the
+// connection. Security headers are outermost so even rejected
+// requests (429, CORS preflight) carry them.
 func (s *Server) withMiddleware(h http.Handler) http.Handler {
 	h = s.recoverMiddleware(h)
 	h = s.corsMiddleware(h)
 	h = s.rateLimitMiddleware(h)
+	h = s.securityHeaders(h)
 	return h
 }
 
@@ -245,9 +281,16 @@ func (s *Server) Run(ctx context.Context) error {
 
 	errCh := make(chan error, 1)
 	go func() {
-		log.Printf("[api] listening on %s (cors=%s trade_log=%s state=%s)",
-			s.httpSrv.Addr, s.settings.CORSOrigin, s.settings.TradeLog, s.settings.StateFile)
-		if err := s.httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		tlsOn := s.settings.TLSCert != "" && s.settings.TLSKey != ""
+		log.Printf("[api] listening on %s (tls=%v cors=%s trade_log=%s state=%s)",
+			s.httpSrv.Addr, tlsOn, s.settings.CORSOrigin, s.settings.TradeLog, s.settings.StateFile)
+		var err error
+		if tlsOn {
+			err = s.httpSrv.ListenAndServeTLS(s.settings.TLSCert, s.settings.TLSKey)
+		} else {
+			err = s.httpSrv.ListenAndServe()
+		}
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 			return
 		}
@@ -280,13 +323,15 @@ func (s *Server) Run(ctx context.Context) error {
 // writeJSON serializes v as JSON. Errors during marshal are
 // extremely rare for our types; if they happen we fall through to
 // a 500 with a generic message so the client never sees a hanging
-// connection.
+// connection. HTML escaping stays ON (the default): journal Detail
+// strings originate from bot logs and must never break out of a
+// JSON string context in a downstream consumer.
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	enc := json.NewEncoder(w)
-	enc.SetEscapeHTML(false)
+	enc.SetEscapeHTML(true)
 	if err := enc.Encode(v); err != nil {
 		log.Printf("[api] write json: %v", err)
 	}

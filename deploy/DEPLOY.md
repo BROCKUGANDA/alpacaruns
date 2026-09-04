@@ -175,11 +175,52 @@ CLI flags:
   header. Default `*` (any). Set to the showcase URL in production.
 - `--no-pause` / `--no-step` — disable the corresponding endpoints
   for hardened deployments.
+- `--auth-token` (env `DASHBOARD_TOKEN`) — bearer token guarding
+  `POST /api/control/*`. Same-origin browser fetches from the
+  embedded dashboard keep working without it; every other caller
+  must send `Authorization: Bearer <token>`. **Set this on any
+  internet-facing deploy.**
+- `--trusted-proxy` (env `TRUSTED_PROXY=1`) — honor
+  `X-Forwarded-For`/`X-Forwarded-Host` for rate limiting. Leave OFF
+  unless a proxy you control strips spoofed headers.
+- `--tls-cert` + `--tls-key` (env `TLS_CERT` / `TLS_KEY`) — serve
+  HTTPS directly and emit HSTS. Otherwise terminate TLS at the
+  reverse proxy / Cloudflare Tunnel (preferred).
 
-Rate limit: 60 requests / 60s per remote IP, in-memory token bucket
-(see `api/ratelimit.go`). CORS allows only the configured origin
-(or `*` for bring-up). SIGTERM triggers graceful shutdown with a
-10s drain window.
+Rate limits: 60 requests / 60s per remote IP on all routes
+(in-memory token bucket, `Retry-After: 60` on 429), plus a strict
+20/minute budget on the state-changing control endpoints (see
+`api/security.go`). CORS allows only the configured origin (or `*`
+for bring-up). SIGTERM triggers graceful shutdown with a 10s drain
+window.
+
+### API security posture (review checklist)
+
+- **Auth**: control POSTs require a bearer token, except
+  same-origin browser fetches (CSRF-safe via Origin/Referer host
+  check); foreign-Origin POSTs are always 403. (`api/security.go:
+  authorizeControl`)
+- **No sessions/cookies**: the API is stateless and sets no cookies,
+  so there is no session surface to hijack.
+- **Secrets**: Alpaca keys live only in process env / `.env`
+  (mode 640, `root:alpacaruns`), never in logs or responses; the
+  account number is masked to last-4 in `/api/account`.
+- **Input**: every query param is validated (`limit` 1..200,
+  non-negative `cursor`, `since` ≤ `until`, symbol charset, path
+  enum); invalid values are 400, never silently coerced. No handler
+  derives a file path from request input — the only path sources
+  are flags/env.
+- **Output**: JSON is HTML-escaped; error bodies are generic codes +
+  messages, details go to the server log only.
+- **Headers** (all responses): `nosniff`, `DENY` framing,
+  `no-referrer`, locked-down `Permissions-Policy`;
+  `default-src 'none'` CSP on `/api/*` JSON only (the embedded
+  Next.js UI needs inline scripts to hydrate); HSTS when serving
+  TLS.
+- **Uploads**: no upload endpoint exists; control POST bodies are
+  capped at 8 KiB.
+- **Deps**: `govulncheck ./api/...` clean (Go 1.26.7); Next.js
+  pinned to patched 14.2.35.
 
 ## systemd
 

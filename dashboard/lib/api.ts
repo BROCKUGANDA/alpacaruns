@@ -147,18 +147,60 @@ export type ErrorResponse = {
 
 const BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080";
 
+// Dashboard operator token for the state-changing control endpoints
+// (POST /api/control/*). Stored in the browser's localStorage — never
+// in the bundle — so a separately-deployed dashboard can authenticate
+// without shipping the secret in client JS. Same-origin deployments
+// against the embedded Go UI don't need it (the server allows
+// same-origin browser fetches outright); set it only when the API
+// requires a bearer token (DASHBOARD_TOKEN on the server).
+const TOKEN_KEY = "alpacaruns_control_token";
+
+export function getDashboardToken(): string | null {
+  try {
+    const v = window.localStorage.getItem(TOKEN_KEY);
+    return v && v.trim() !== "" ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+export function setDashboardToken(token: string): void {
+  try {
+    if (token.trim() === "") {
+      window.localStorage.removeItem(TOKEN_KEY);
+    } else {
+      window.localStorage.setItem(TOKEN_KEY, token.trim());
+    }
+  } catch {
+    // Private mode / blocked storage: controls still work same-origin.
+  }
+}
+
 // apiFetch — wrapper around fetch that:
 //   - prefixes the API base URL
+//   - attaches the operator bearer token on control POSTs when set
 //   - sends Content-Type when there's a body
 //   - throws on non-2xx with a typed Error carrying the API code
 // Used by every SWR fetcher so error handling is uniform.
 export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
+  const headers = new Headers({ "Content-Type": "application/json" });
+  if (init?.headers) {
+    new Headers(init.headers).forEach((v, k) => {
+      if (!headers.has(k)) headers.set(k, v);
+    });
+  }
+  // Only control endpoints need auth; read endpoints stay anonymous
+  // so the dashboard renders without any setup.
+  if (path.startsWith("/api/control/") && (init?.method || "GET") !== "GET") {
+    const token = typeof window !== "undefined" ? getDashboardToken() : null;
+    if (token && !headers.has("Authorization")) {
+      headers.set("Authorization", `Bearer ${token}`);
+    }
+  }
   const res = await fetch(BASE + path, {
     ...init,
-    headers: {
-      "Content-Type": "application/json",
-      ...(init?.headers || {}),
-    },
+    headers,
     cache: "no-store",
   });
   if (!res.ok) {

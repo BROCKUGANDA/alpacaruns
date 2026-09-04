@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Alpacaruns logo">
+  <defs>
+    <linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#10b981"/>
+      <stop offset="100%" stop-color="#0ea5e9"/>
+    </linearGradient>
+    <linearGradient id="g2" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#facc15" stop-opacity="0.95"/>
+      <stop offset="100%" stop-color="#f59e0b" stop-opacity="0.85"/>
+    </linearGradient>
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="0.6" result="b"/>
+      <feMerge>
+        <feMergeNode in="b"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+  <!-- Soft circular plate so the logo holds up on light + dark UI -->
+  <circle cx="32" cy="32" r="30" fill="#0a0e17" stroke="url(#g)" stroke-width="1.5" opacity="0.95"/>
+  <!-- Alpaca silhouette: head + neck + body in profile. -->
+  <path d="M14 38c2-6 6-10 10-13 1-2 2-5 2-8 0-2-1-4 0-6 1-2 4-3 7-3 4 0 8 2 10 5 1 2 0 4-1 5l-1 2c-1 2-2 4-4 5 1 1 1 2 0 3-2 3-5 5-8 6l-1 6c0 2-2 4-5 4-3 0-6-2-7-4-1-1-2-1-2-2z"
+        fill="url(#g)"/>
+  <!-- Eye. -->
+  <circle cx="36" cy="20" r="1.5" fill="#0a0e17"/>
+  <!-- Eye highlight -->
+  <circle cx="36.4" cy="19.6" r="0.5" fill="#facc15"/>
+  <!-- Circuit overlay (3 traces + nodes) — the "AI" half of the brand. -->
+  <g stroke="url(#g2)" stroke-width="1.3" fill="none" opacity="0.9" filter="url(#glow)">
+    <path d="M48 22 L52 22 L52 30 L48 30"/>
+    <path d="M48 38 L54 38 L54 46 L48 46"/>
+    <path d="M40 52 L46 52 L46 58"/>
+  </g>
+  <g fill="url(#g2)">
+    <circle cx="48" cy="22" r="1.4"/>
+    <circle cx="52" cy="30" r="1.4"/>
+    <circle cx="54" cy="46" r="1.4"/>
+    <circle cx="46" cy="58" r="1.4"/>
+  </g>
+</svg>

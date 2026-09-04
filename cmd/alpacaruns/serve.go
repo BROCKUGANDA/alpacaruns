@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 
 	"github.com/BROCKUGANDA/alpacaruns/api"
@@ -25,11 +26,15 @@ import (
 
 // serveFlags holds the parsed `serve` subcommand flags.
 type serveFlags struct {
-	envFile    string
-	port       int
-	corsOrigin string
+	envFile      string
+	port         int
+	corsOrigin   string
 	disablePause bool
 	disableStep  bool
+	authToken    string
+	trustedProxy bool
+	tlsCert      string
+	tlsKey       string
 }
 
 // newServeFlagSet builds and binds the `serve` flag set; extracted
@@ -42,6 +47,10 @@ func newServeFlagSet(f *serveFlags) *flag.FlagSet {
 	fs.StringVar(&f.corsOrigin, "cors-origin", "", "allowed CORS origin (default: any, set explicitly in production)")
 	fs.BoolVar(&f.disablePause, "no-pause", false, "disable /api/control/pause and /resume endpoints")
 	fs.BoolVar(&f.disableStep, "no-step", false, "disable /api/control/step endpoint")
+	fs.StringVar(&f.authToken, "auth-token", "", "bearer token guarding /api/control/* (also DASHBOARD_TOKEN env)")
+	fs.BoolVar(&f.trustedProxy, "trusted-proxy", false, "honor X-Forwarded-For/Host for rate limiting (also TRUSTED_PROXY=1)")
+	fs.StringVar(&f.tlsCert, "tls-cert", "", "TLS certificate file for a direct-HTTPS listener (also TLS_CERT env)")
+	fs.StringVar(&f.tlsKey, "tls-key", "", "TLS key file for a direct-HTTPS listener (also TLS_KEY env)")
 	return fs
 }
 
@@ -85,15 +94,42 @@ func cmdServe(args []string) int {
 	if cors == "" {
 		cors = "*"
 	}
+	authToken := fl.authToken
+	if authToken == "" {
+		authToken = os.Getenv("DASHBOARD_TOKEN")
+	}
+	trustedProxy := fl.trustedProxy
+	if !trustedProxy {
+		if v := os.Getenv("TRUSTED_PROXY"); v == "1" || strings.EqualFold(v, "true") {
+			trustedProxy = true
+		}
+	}
+	tlsCert := fl.tlsCert
+	if tlsCert == "" {
+		tlsCert = os.Getenv("TLS_CERT")
+	}
+	tlsKey := fl.tlsKey
+	if tlsKey == "" {
+		tlsKey = os.Getenv("TLS_KEY")
+	}
+	if (tlsCert == "") != (tlsKey == "") {
+		log.Printf("serve: --tls-cert and --tls-key must be set together; TLS disabled")
+		tlsCert, tlsKey = "", ""
+	}
 
 	settings := api.ServerSettings{
-		Port:        port,
-		CORSOrigin:  cors,
-		TradeLog:    cfg.TradeLog,
-		StateFile:   dataSibling(cfg.TradeLog, "strategy-state.json"),
-		PauseFlag:   dataSibling(cfg.TradeLog, "paused"),
-		AllowStep:   !fl.disableStep,
-		AllowPause:  !fl.disablePause,
+		Port:         port,
+		CORSOrigin:   cors,
+		TradeLog:     cfg.TradeLog,
+		StateFile:    dataSibling(cfg.TradeLog, "strategy-state.json"),
+		PauseFlag:    dataSibling(cfg.TradeLog, "paused"),
+		AllowStep:    !fl.disableStep,
+		AllowPause:   !fl.disablePause,
+		AuthToken:    authToken,
+		TrustedProxy: trustedProxy,
+		TLSCert:      tlsCert,
+		TLSKey:       tlsKey,
+		HSTS:         tlsCert != "" && tlsKey != "",
 	}
 
 	srv := api.New(cfg, client, settings, &set)

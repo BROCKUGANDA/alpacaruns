@@ -10,6 +10,18 @@
 #
 # CORS origin defaults to "*" for bring-up; in production set
 # --cors-origin to the showcase URL (e.g. https://alpacaruns.example.com).
+#
+# SECURITY for internet-facing deploys:
+#   1. Create /opt/alpacaruns/.env.dashboard (root:alpacaruns, 640) with:
+#        DASHBOARD_TOKEN=<long random token, e.g. `openssl rand -hex 32`>
+#        CORS_ORIGIN=https://your-dashboard-origin
+#      then uncomment the EnvironmentFile line below. Control endpoints
+#      will require `Authorization: Bearer <token>` from non-browser
+#      callers; the embedded same-origin dashboard keeps working.
+#   2. Prefer TLS termination at the reverse proxy / Cloudflare Tunnel
+#      (see deploy/cloudflare-tunnel.md); or set TLS_CERT/TLS_KEY in
+#      the same env file for a direct-HTTPS listener (enables HSTS).
+#EnvironmentFile=-/opt/alpacaruns/.env.dashboard
 
 [Unit]
 Description=Alpacaruns dashboard HTTP API

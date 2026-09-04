@@ -10,9 +10,7 @@
 package api
 
 import (
-	"net"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 )
@@ -101,29 +99,20 @@ func (r *RateLimiter) Allow(key string) bool {
 	return true
 }
 
-// clientKey extracts the rate-limit key from a request. Honors
-// X-Forwarded-For first (when behind a trusted proxy) then falls
-// back to the remote address. Empty key means "no limit".
+// clientKey extracts the rate-limit key from a request. It is kept
+// as a package-level helper for tests; production code must use
+// (s *Server) clientKey, which honors X-Forwarded-For only behind a
+// trusted proxy (see api/security.go).
 func clientKey(r *http.Request) string {
-	if xf := r.Header.Get("X-Forwarded-For"); xf != "" {
-		// Take the first address; trimmed of whitespace.
-		if i := strings.IndexByte(xf, ','); i > 0 {
-			return strings.TrimSpace(xf[:i])
-		}
-		return strings.TrimSpace(xf)
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
+	return untrustedClientKey(r)
 }
 
 // rateLimitMiddleware is the http.Handler middleware that applies the
-// limiter; 429 Too Many Requests when over budget.
+// limiter; 429 Too Many Requests (with Retry-After) when over budget.
 func (s *Server) rateLimitMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !s.limiter.Allow(clientKey(r)) {
+		if !s.limiter.Allow(s.clientKey(r)) {
+			w.Header().Set("Retry-After", "60")
 			writeError(w, http.StatusTooManyRequests, "rate_limited", "too many requests; slow down")
 			return
 		}

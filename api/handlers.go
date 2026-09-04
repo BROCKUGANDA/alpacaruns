@@ -146,7 +146,10 @@ func (s *Server) handleAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	acct, err := s.client.GetAccount(r.Context())
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "alpaca_error", err.Error())
+		// Never forward the upstream error text: it can carry URL
+		// fragments or account identifiers. Log it, send a code.
+		log.Printf("[api] alpaca GetAccount: %v", err)
+		writeError(w, http.StatusBadGateway, "alpaca_error", "alpaca request failed")
 		return
 	}
 	// Try to compute day P&L by reading last_close_equity. Some
@@ -171,7 +174,7 @@ func (s *Server) handleAccount(w http.ResponseWriter, r *http.Request) {
 		BuyingPower:    acct.BuyingPower,
 		Multiplier:     acct.Multiplier,
 		Status:         acct.Status,
-		AccountNumber:  acct.AccountNumber,
+		AccountNumber:  maskAccountNumber(acct.AccountNumber),
 		CreatedAt:      acct.CreatedAt,
 		LastEquity:     lastEq,
 		PortfolioValue: acct.PortfolioValue,
@@ -188,17 +191,22 @@ func (s *Server) handlePnL(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	since, err := parseTime(q.Get("since"))
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_param", err.Error())
+		writeError(w, http.StatusBadRequest, "bad_param", "invalid since parameter")
 		return
 	}
 	until, err := parseTime(q.Get("until"))
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_param", err.Error())
+		writeError(w, http.StatusBadRequest, "bad_param", "invalid until parameter")
+		return
+	}
+	if !since.IsZero() && !until.IsZero() && until.Before(since) {
+		writeError(w, http.StatusBadRequest, "bad_param", "until is before since")
 		return
 	}
 	records, err := readAllRecords(s.settings.TradeLog)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "read_log", err.Error())
+		log.Printf("[api] read trade log: %v", err)
+		writeError(w, http.StatusInternalServerError, "read_log", "cannot read trade log")
 		return
 	}
 	st := readStrategyState(s.settings.StateFile)
@@ -389,32 +397,39 @@ func (s *Server) handleTrades(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	since, err := parseTime(q.Get("since"))
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_param", err.Error())
+		writeError(w, http.StatusBadRequest, "bad_param", "invalid since parameter")
 		return
 	}
 	until, err := parseTime(q.Get("until"))
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_param", err.Error())
+		writeError(w, http.StatusBadRequest, "bad_param", "invalid until parameter")
 		return
 	}
-	symbolFilter := q.Get("symbol")
-	pathFilter := q.Get("path")
-	limit := 100
-	if v := q.Get("limit"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 500 {
-			limit = n
-		}
+	if !since.IsZero() && !until.IsZero() && until.Before(since) {
+		writeError(w, http.StatusBadRequest, "bad_param", "until is before since")
+		return
 	}
-	cursor := int64(0)
-	if v := q.Get("cursor"); v != "" {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n >= 0 {
-			cursor = n
-		}
+	symbolFilter, ok := parseSymbolFilter(w, q.Get("symbol"))
+	if !ok {
+		return
+	}
+	pathFilter, ok := parsePathFilter(w, q.Get("path"))
+	if !ok {
+		return
+	}
+	limit, ok := parseLimit(w, q.Get("limit"))
+	if !ok {
+		return
+	}
+	cursor, ok := parseCursor(w, q.Get("cursor"))
+	if !ok {
+		return
 	}
 
 	records, err := readAllRecords(s.settings.TradeLog)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "read_log", err.Error())
+		log.Printf("[api] read trade log: %v", err)
+		writeError(w, http.StatusInternalServerError, "read_log", "cannot read trade log")
 		return
 	}
 	fills := readFills(records, since, until)
@@ -540,31 +555,35 @@ func (s *Server) handleDecisions(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	since, err := parseTime(q.Get("since"))
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_param", err.Error())
+		writeError(w, http.StatusBadRequest, "bad_param", "invalid since parameter")
 		return
 	}
 	until, err := parseTime(q.Get("until"))
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_param", err.Error())
+		writeError(w, http.StatusBadRequest, "bad_param", "invalid until parameter")
 		return
 	}
-	pathFilter := q.Get("path")
-	limit := 100
-	if v := q.Get("limit"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 500 {
-			limit = n
-		}
+	if !since.IsZero() && !until.IsZero() && until.Before(since) {
+		writeError(w, http.StatusBadRequest, "bad_param", "until is before since")
+		return
 	}
-	cursor := int64(0)
-	if v := q.Get("cursor"); v != "" {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n >= 0 {
-			cursor = n
-		}
+	pathFilter, ok := parsePathFilter(w, q.Get("path"))
+	if !ok {
+		return
+	}
+	limit, ok := parseLimit(w, q.Get("limit"))
+	if !ok {
+		return
+	}
+	cursor, ok := parseCursor(w, q.Get("cursor"))
+	if !ok {
+		return
 	}
 
 	records, err := readAllRecords(s.settings.TradeLog)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "read_log", err.Error())
+		log.Printf("[api] read trade log: %v", err)
+		writeError(w, http.StatusInternalServerError, "read_log", "cannot read trade log")
 		return
 	}
 	decisions := readDecisions(records, pathFilter, since, until)
@@ -648,10 +667,11 @@ func (s *Server) handleControlPause(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.setPauseFlag(true); err != nil {
-		writeError(w, http.StatusInternalServerError, "write_flag", err.Error())
+		log.Printf("[api] set pause flag: %v", err)
+		writeError(w, http.StatusInternalServerError, "write_flag", "cannot update pause flag")
 		return
 	}
-	log.Printf("[api] pause flag engaged via /api/control/pause from %s", clientKey(r))
+	log.Printf("[api] pause flag engaged via /api/control/pause from %s", s.clientKey(r))
 	writeJSON(w, http.StatusOK, ControlResponse{
 		Action: "pause",
 		Paused: true,
@@ -672,10 +692,11 @@ func (s *Server) handleControlResume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.setPauseFlag(false); err != nil {
-		writeError(w, http.StatusInternalServerError, "write_flag", err.Error())
+		log.Printf("[api] clear pause flag: %v", err)
+		writeError(w, http.StatusInternalServerError, "write_flag", "cannot update pause flag")
 		return
 	}
-	log.Printf("[api] pause flag cleared via /api/control/resume from %s", clientKey(r))
+	log.Printf("[api] pause flag cleared via /api/control/resume from %s", s.clientKey(r))
 	writeJSON(w, http.StatusOK, ControlResponse{
 		Action: "resume",
 		Paused: false,
@@ -715,11 +736,12 @@ func (s *Server) handleControlStep(w http.ResponseWriter, r *http.Request) {
 	// truncated lines by skipping them. The dashboard only renders
 	// the latest entry, so a brief drift is invisible.
 	if err := appendStepMarker(s.settings.TradeLog, detail); err != nil {
-		writeError(w, http.StatusInternalServerError, "write_log", err.Error())
+		log.Printf("[api] append step marker: %v", err)
+		writeError(w, http.StatusInternalServerError, "write_log", "cannot record step request")
 		return
 	}
 	s.tickNumber.Add(1)
-	log.Printf("[api] manual step requested from %s", clientKey(r))
+	log.Printf("[api] manual step requested from %s", s.clientKey(r))
 	writeJSON(w, http.StatusOK, ControlResponse{
 		Action: "step",
 		Paused: s.pauseFlag.Load(),
