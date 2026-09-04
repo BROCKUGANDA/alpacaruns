@@ -3,12 +3,18 @@
 .env.local
 .env.*
 !.env.example
+creds.json
+*.json.cred
+tunnel-token.txt
 
 # Go build output
 bin/
 *.exe
 *.test
 *.out
+alpacaruns.linux
+alpacaruns-darwin
+alpacaruns-windows.exe
 
 # Node (defensive — none used but harmless)
 node_modules/

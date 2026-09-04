@@ -255,3 +255,35 @@ Strategy settings are parsed inside `strategy/settings.go`, reading
 `os.Getenv` strictly after `config.Load` — which materializes the selected
 `.env` into process environment variables — because `config/config.go` is
 owned by a separate workstream and strategy knobs stay self-contained.
+
+## Demo dashboard (`alpacaruns serve`)
+
+The Go binary embeds the Next.js dashboard at `api/ui/` and exposes
+the JSON API on the same `:8080` port. To run it on the live server:
+
+```bash
+# 1. install + start the API service
+sudo cp deploy/alpacaruns-api.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now alpacaruns-api
+# serves the JSON API + embedded dashboard UI on :80
+# (low port binding requires AmbientCapabilities=CAP_NET_BIND_SERVICE,
+#  which is already set in the unit)
+```
+
+The dashboard reads the same `data/trades.jsonl` and
+`data/strategy-state.json` files that the trading bot writes, so it
+is always live the moment the bot ticks.
+
+Public URL options (in order of operational simplicity):
+
+1. **Direct IP** — `http://5.22.215.51/` (current production bind).
+2. **Cloudflare Tunnel** — see `deploy/cloudflare-tunnel.md` for the
+   current tunnel setup (tunnel ID `8a06d87d-...`, ingress
+   `demo.svalley.tech → http://localhost:80`). The tunnel runs as
+   `cloudflared-alpacaruns-demo.service`; logs are at
+   `journalctl -u cloudflared-alpacaruns-demo -f`. Note that the
+   `svalley.tech` zone currently returns `UserProjectAccountProblem`
+   (closed Cloudflare billing), so the tunnel is up but the
+   proxied hostname is unreachable until the account billing is
+   restored — for now, hit the dashboard over the raw IP.
