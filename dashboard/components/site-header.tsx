@@ -11,11 +11,23 @@ import { swrFetcher, type StatusResponse } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 const NAV = [
-  { href: "/", label: "Live" },
+  { href: "/live", label: "Live" },
   { href: "/trades", label: "Trades" },
   { href: "/brain", label: "Brain" },
   { href: "/controls", label: "Controls" },
 ];
+
+// isActive — special-case the root. Next.js pathname is "/", "/live",
+// "/trades/", etc. The brand link is the only thing that should
+// highlight on "/" (the welcome splash), so the nav items compare
+// strictly against their own hrefs. The brand gets its own visual
+// treatment separately.
+function isActive(path: string, href: string): boolean {
+  if (href === "/") return path === "/";
+  // Treat "/live" and "/live/" identically; ignore trailing slash.
+  const norm = (s: string) => (s.endsWith("/") && s.length > 1 ? s.slice(0, -1) : s);
+  return norm(path) === norm(href);
+}
 
 export function SiteHeader() {
   const path = usePathname();
@@ -38,7 +50,7 @@ export function SiteHeader() {
   return (
     <header className="sticky top-0 z-30 border-b border-border bg-bg/80 backdrop-blur">
       <div className="mx-auto flex max-w-7xl items-center gap-4 px-4 py-3 sm:px-6 lg:px-8">
-        <Link href="/" className="flex items-center gap-3">
+        <Link href="/" className="flex items-center gap-3" aria-label="Go to welcome screen">
           <img
             src="/logo.svg"
             alt=""
@@ -73,7 +85,7 @@ export function SiteHeader() {
 
         <nav className="ml-auto flex items-center gap-1 text-sm">
           {NAV.map((n) => {
-            const active = path === n.href;
+            const active = isActive(path, n.href);
             return (
               <Link
                 key={n.href}

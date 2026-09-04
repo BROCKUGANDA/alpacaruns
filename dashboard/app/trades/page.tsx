@@ -35,11 +35,16 @@ import { SwrProvider } from "@/components/swr-provider";
 
 const PAGE_SIZE = 25;
 
+// Filter values for the trade-log path filter. The Go backend's
+// parsePathFilter accepts agent | ensemble | manual | auto;
+// the "all" pseudo-value is local-only and never sent in the query.
+type PathFilter = "all" | "agent" | "ensemble" | "manual" | "auto";
+
 export default function TradesPage() {
   const [filter, setFilter] = useState<{
     symbol: string;
     side: "all" | "buy" | "sell";
-    path: "all" | "agent" | "ensemble" | "manual";
+    path: PathFilter;
     since: string;
   }>({
     symbol: "",
@@ -198,7 +203,7 @@ function FilterBar({
   setFilter,
   symbols,
 }: {
-  filter: { symbol: string; side: "all" | "buy" | "sell"; path: "all" | "agent" | "ensemble" | "manual"; since: string };
+  filter: { symbol: string; side: "all" | "buy" | "sell"; path: PathFilter; since: string };
   setFilter: (f: typeof filter) => void;
   symbols: string[];
 }) {
@@ -233,7 +238,7 @@ function FilterBar({
         ))}
       </div>
       <div className="flex overflow-hidden rounded-md border border-border">
-        {(["all", "agent", "ensemble", "manual"] as const).map((p) => (
+        {(["all", "agent", "ensemble", "manual", "auto"] as const).map((p) => (
           <button
             key={p}
             onClick={() => setFilter({ ...filter, path: p })}

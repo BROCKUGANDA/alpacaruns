@@ -294,18 +294,20 @@ func parseSymbolFilter(w http.ResponseWriter, v string) (string, bool) {
 }
 
 // parsePathFilter validates ?path= against the dashboard's fixed
-// vocabulary (agent | ensemble | manual). Unknown buckets are
+// vocabulary (agent | ensemble | manual | auto). Unknown buckets are
 // rejected rather than passed through to an exact-match that can
-// never hit.
+// never hit. "auto" is the deterministic factor-engine path written
+// by the auto loop (formerly the only path); agent/ensemble/manual
+// cover the LLM-gated, layer-2 ensemble, and dashboard-CLI paths.
 func parsePathFilter(w http.ResponseWriter, v string) (string, bool) {
 	if v == "" {
 		return "", true
 	}
 	switch v {
-	case "agent", "ensemble", "manual":
+	case "agent", "ensemble", "manual", "auto":
 		return v, true
 	}
-	writeError(w, http.StatusBadRequest, "bad_param", "path must be one of agent, ensemble, manual")
+	writeError(w, http.StatusBadRequest, "bad_param", "path must be one of agent, ensemble, manual, auto")
 	return "", false
 }
 

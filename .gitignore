@@ -56,6 +56,7 @@ hackathon_video/slide_audio/
 *.pem
 *.key
 *.crt
+srv.log
 
 # Local helper scripts & scratch
 scratch/

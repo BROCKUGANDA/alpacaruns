@@ -29,6 +29,7 @@
 // from localStorage via getDashboardToken / setDashboardToken.
 
 import { useEffect, useMemo, useState } from "react";
+import Link from "next/link";
 import useSWR, { mutate } from "swr";
 import { motion, AnimatePresence } from "framer-motion";
 import {
@@ -899,6 +900,10 @@ function VerdictPanel({
     sim?.would_have_sent ?? exec?.order ?? null;
   const notional = sim?.notional ?? exec?.notional ?? 0;
   const mode = exec?.mode ?? "simulated";
+  // Show "View in Trade Log" only when an order actually went to
+  // the broker (mode=live). Simulated decisions are journaled but the
+  // operator probably wants to see the verdict and move on.
+  const showTradesLink = exec?.mode === "live";
 
   return (
     <div
@@ -930,12 +935,22 @@ function VerdictPanel({
             notional ≈ {fmtMoney(notional)}
           </span>
         </div>
-        <button
-          onClick={onClear}
-          className="text-[10px] uppercase tracking-wide text-muted hover:text-accent"
-        >
-          Dismiss
-        </button>
+        <div className="flex items-center gap-3">
+          {showTradesLink && (
+            <Link
+              href="/trades"
+              className="text-[10px] uppercase tracking-wide text-accent hover:text-zinc-100"
+            >
+              View in Trade Log →
+            </Link>
+          )}
+          <button
+            onClick={onClear}
+            className="text-[10px] uppercase tracking-wide text-muted hover:text-accent"
+          >
+            Dismiss
+          </button>
+        </div>
       </div>
       {reasons.length > 0 && (
         <ul className="mt-2 list-disc space-y-0.5 pl-5 text-xs text-zinc-300">

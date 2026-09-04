@@ -121,7 +121,6 @@ function VoteChip({ label, stance }: { label: string; stance: string }) {
 }
 
 function FactorPanel() {
-  if (typeof window === "undefined") return null;
   const { data, error, isLoading } = useSWR<StatusResponse>(
     "/api/status",
     swrFetcher,
