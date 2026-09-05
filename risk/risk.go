@@ -282,6 +282,8 @@ func (v *Validator) Validate(p Proposal) Verdict {
 	// 5. Portfolio-level checks need live equity — fail closed on error.
 	pf, err := v.Portfolio()
 	if err != nil {
+		reasons = append(reasons, fmt.Sprintf("account unavailable (%v)", err))
+		return Verdict{Approved: false, Reasons: reasons}
 	} else {
 		if notional > 0 {
 			perCap := v.Cfg.MaxPositionUSD

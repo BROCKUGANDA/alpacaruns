@@ -11,6 +11,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -1336,16 +1337,56 @@ func (s *Server) buildValidator() *risk.Validator {
 		Cfg:  s.cfg,
 		Kill: halt,
 	}
-	// Stubs for bring-up mode: provide a Portfolio hook so Validate
-	// doesn't panic on nil-func call. Position lookup returns zero
-	// (no existing exposure), factor scoring is disabled.
-	v.Portfolio = func() (risk.Portfolio, error) {
-		// In serve-only mode there's no live account. Use a synthetic
-		// $100k equity that matches the bot's starting baseline; the
-		// percentage cap check still has something to compare against.
-		return risk.Portfolio{Equity: 100000, PortfolioValue: 100000}, nil
+	// Portfolio hook: when a real Alpaca client is wired, validate
+	// against the LIVE account so the portfolio-percentage cap is real
+	// for manual orders too. Only in cold-start bring-up (no client,
+	// e.g. serve without keys) do we fall back to a synthetic $100k
+	// equity that matches the bot's starting baseline; in that mode
+	// nothing can be executed anyway (PlaceOrder is unreachable with a
+	// nil client), so the synthetic number only drives the simulate
+	// demo. A live-account fetch error must FAIL CLOSED — account
+	// unavailable means we cannot judge the cap, so we reject rather
+	// than guess.
+	if s.client != nil {
+		v.Portfolio = func() (risk.Portfolio, error) {
+			acct, err := s.client.GetAccount(context.Background())
+			if err != nil {
+				return risk.Portfolio{}, fmt.Errorf("account unavailable: %w", err)
+			}
+			eq, _ := strconv.ParseFloat(acct.Equity, 64)
+			pfv, _ := strconv.ParseFloat(acct.PortfolioValue, 64)
+			if eq <= 0 && pfv > 0 {
+				eq = pfv
+			}
+			return risk.Portfolio{Equity: eq, PortfolioValue: pfv}, nil
+		}
+		v.Positions = func(symbol string) float64 {
+			// Best-effort additive-exposure lookup; a fetch error means
+			// "unknown", which the validator treats as zero — the live
+			// Portfolio hook above still gates the notional cap.
+			ps, err := s.client.GetPositions(context.Background())
+			if err != nil {
+				return 0
+			}
+			want := strings.ToUpper(strings.TrimSpace(symbol))
+			for _, p := range ps {
+				if strings.ToUpper(p.Symbol) != want {
+					continue
+				}
+				q, _ := strconv.ParseFloat(p.Qty, 64)
+				px, _ := strconv.ParseFloat(p.CurrentPrice, 64)
+				if v := q * px; v > 0 {
+					return v
+				}
+			}
+			return 0
+		}
+	} else {
+		v.Portfolio = func() (risk.Portfolio, error) {
+			return risk.Portfolio{Equity: 100000, PortfolioValue: 100000}, nil
+		}
+		v.Positions = func(symbol string) float64 { return 0 }
 	}
-	v.Positions = func(symbol string) float64 { return 0 }
 	return v
 }
 

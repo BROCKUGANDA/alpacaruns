@@ -107,6 +107,17 @@ func (e *Engine) Score(ctx context.Context, symbol string) (Result, error) {
 		return Result{}, fmt.Errorf("factor scoring %s: fetch bars: %w", symbol, err)
 	}
 	daily := allBars[symbol]
+	// Drop corrupt bars (non-positive or non-finite close) before any
+	// ratio math: one bad print with close=0 would otherwise poison the
+	// momentum/volatility divisions with Inf/NaN and silently flip the
+	// gate. Volume factors read the same filtered slice.
+	kept := daily[:0:0]
+	for _, b := range daily {
+		if b.Close > 0 && finite(b.Close) {
+			kept = append(kept, b)
+		}
+	}
+	daily = kept
 	sort.Slice(daily, func(i, j int) bool { return daily[i].Time < daily[j].Time })
 	closes := make([]float64, len(daily))
 	for i, b := range daily {
@@ -140,6 +151,13 @@ func (e *Engine) Score(ctx context.Context, symbol string) (Result, error) {
 		return Result{}, fmt.Errorf("factor scoring %s: all factor weights are zero", symbol)
 	}
 	res.Composite = num / den
+	// Non-finite input data (or a future factor with degenerate math)
+	// must never reach the decision gate: NaN comparisons are always
+	// false, which silently turns every BUY branch into a HOLD and,
+	// worse, NaN >= FactorMinScore is false so SELL exits could stall.
+	if !finite(res.Composite) {
+		return Result{}, fmt.Errorf("factor scoring %s: composite is not finite (%g)", symbol, res.Composite)
+	}
 	res.Passed = res.Composite >= e.minScore
 	return res, nil
 }
@@ -278,7 +296,18 @@ func stdev(xs []float64) float64 {
 }
 
 func clamp01(x float64) float64 {
-	return math.Max(0, math.Min(1, x))
+	if !finite(x) || x < 0 {
+		return 0
+	}
+	if x > 1 {
+		return 1
+	}
+	return x
+}
+
+// finite reports whether x is a usable real number (not NaN, not ±Inf).
+func finite(x float64) bool {
+	return !math.IsNaN(x) && !math.IsInf(x, 0)
 }
 
 // ScoreFactors adapts Engine to the risk.FactorScorer interface so the

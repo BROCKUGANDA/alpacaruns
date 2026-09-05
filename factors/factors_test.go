@@ -277,6 +277,45 @@ func TestEngineBarFetchErrorPropagates(t *testing.T) {
 	}
 }
 
+// A feed that returns a bar with a zero/non-finite close must never
+// poison the factor math (Inf/NaN ratios) — the corrupt bars are
+// dropped and scoring proceeds on the clean remainder, or errors
+// loudly when too few remain.
+func TestScoreDropsCorruptBars(t *testing.T) {
+	good := risingCloses(60, 100, 1)
+	// Inject a zero close and a NaN close mid-series.
+	corrupt := make([]float64, len(good))
+	copy(corrupt, good)
+	corrupt[25] = 0
+	corrupt[26] = math.NaN()
+	bars := dailyBars(corrupt, 1000)
+	e := newTestEngine(fakeBars{bars: map[string][]tools.Bar{"AAPL": bars}}, nil)
+	res, err := e.Score(context.Background(), "AAPL")
+	if err != nil {
+		t.Fatalf("corrupt bars should be dropped, not fail scoring: %v", err)
+	}
+	if !finite(res.Composite) || res.Composite < 0 || res.Composite > 1 {
+		t.Fatalf("composite must be a finite [0,1] score, got %g", res.Composite)
+	}
+	// Every factor score must be finite too.
+	for name, fr := range res.Factors {
+		if !finite(fr.Score) {
+			t.Fatalf("factor %s produced non-finite score %g", name, fr.Score)
+		}
+	}
+}
+
+// If ALL bars are corrupt (e.g. an empty page of zero-close prints),
+// scoring must error — never emit a NaN composite the gate would
+// silently treat as "not passed".
+func TestScoreAllCorruptBarsErrors(t *testing.T) {
+	bars := dailyBars(make([]float64, 60), 1000) // all closes = 0
+	e := newTestEngine(fakeBars{bars: map[string][]tools.Bar{"AAPL": bars}}, nil)
+	if _, err := e.Score(context.Background(), "AAPL"); err == nil {
+		t.Fatal("expected error when every bar is corrupt")
+	}
+}
+
 func contains(s, sub string) bool {
 	return len(sub) == 0 || (len(s) >= len(sub) && indexOf(s, sub) >= 0)
 }

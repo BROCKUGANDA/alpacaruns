@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -65,6 +66,13 @@ type autoLoop struct {
 	// so the separate `serve` API process can show liveness / tick count
 	// without any in-process sharing.
 	tickNum int64
+	// posCache memoizes the broker /positions snapshot for the duration
+	// of ONE tick (invalidated at tick start). Without it, every buy
+	// decision in a tick re-fetches the full position list (the
+	// per-symbol cap check), which multiplies Alpaca calls by universe
+	// size — exactly how a small account trips the API rate limit and
+	// starves the price/bar fetches that matter.
+	posCache []tools.Position
 }
 
 // autoFlags holds the parsed `auto` subcommand flags.
@@ -133,7 +141,7 @@ func cmdAuto(args []string) int {
 			log.Printf("[auto] stopped (signal or kill switch)")
 			return 0
 		}
-		if err := loop.tick(ctx); err != nil {
+		if err := loop.safeTick(ctx); err != nil {
 			log.Printf("[auto] tick error: %v", err)
 		}
 		if once {
@@ -144,6 +152,30 @@ func cmdAuto(args []string) int {
 			return 0
 		}
 	}
+}
+
+// safeTick runs one tick behind a panic barrier. The auto loop is the
+// long-running 24/7 process: a panic in one tick (nil map, index math,
+// a broker payload shape we didn't expect) must degrade to a logged
+// error and the NEXT tick — never tear the process down and leave
+// positions unmonitored. The panic value is logged with the symbol of
+// the failing tick's stack so the operator can reproduce.
+func (l *autoLoop) safeTick(ctx context.Context) (err error) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			log.Printf("[auto] PANIC recovered in tick: %v\n%s", rec, stackTrace())
+			err = fmt.Errorf("tick panicked: %v", rec)
+		}
+	}()
+	return l.tick(ctx)
+}
+
+// stackTrace renders the current goroutine stack at panic depth so the
+// log names the failing function, not just the panic value.
+func stackTrace() string {
+	buf := make([]byte, 8*1024)
+	n := runtime.Stack(buf, false)
+	return string(buf[:n])
 }
 
 // buildAutoLoop constructs every collaborator from loaded config.
@@ -336,6 +368,9 @@ func (l *autoLoop) tick(ctx context.Context) error {
 			log.Printf("[auto] heartbeat: %v", err)
 		}
 	}
+	// New tick, new world: drop the previous tick's /positions snapshot
+	// so the per-symbol cap sees fills placed since.
+	l.posCache = nil
 	// Pause flag check FIRST (before any Alpaca call). When the operator
 	// toggles "Pause new trades" in the dashboard (POST /api/control/pause),
 	// data/paused is written with content "true". The bot reads the file
@@ -398,7 +433,7 @@ func (l *autoLoop) tick(ctx context.Context) error {
 		l.persistStartingEquity(equity)
 	}
 
-	positions, err := l.client.GetPositions(ctx)
+	positions, err := l.positionsCached(ctx)
 	if err != nil {
 		return fmt.Errorf("positions: %w", err)
 	}
@@ -451,6 +486,12 @@ func (l *autoLoop) tick(ctx context.Context) error {
 	}
 
 	universe := append(append([]string{}, l.set.EquitySymbols...), l.set.CryptoSymbols...)
+
+	// Freeze the tick's positions view for all per-symbol cap checks in
+	// this pass (handleBuy -> positionUsd reads it without re-fetching).
+	if _, err := l.positionsCached(ctx); err != nil {
+		log.Printf("[auto] positions prefetch failed (cap checks will refetch): %v", err)
+	}
 
 	// Intraday track runs every tick alongside swing (independent engine,
 	// own windows). Errors never block the swing path.
@@ -609,12 +650,27 @@ func (l *autoLoop) intraHeldSymbols() map[string]bool {
 
 func (l *autoLoop) State() *strategy.StateStore { return l.exec.State }
 
+// positionsCached returns the tick-scoped /positions snapshot, fetching
+// it at most once per tick. Callers that need broker-fresh data (fills
+// just placed) must call l.client.GetPositions directly.
+func (l *autoLoop) positionsCached(ctx context.Context) ([]tools.Position, error) {
+	if l.posCache != nil {
+		return l.posCache, nil
+	}
+	pos, err := l.client.GetPositions(ctx)
+	if err != nil {
+		return nil, err
+	}
+	l.posCache = pos
+	return pos, nil
+}
+
 // positionUsd returns the live market value (current_price * abs(qty))
 // of the open position for symbol, or 0 when flat / lookup fails.
 // Used by the per-symbol position cap to detect "no double-down" and
 // by the profit-target and time-based close logic to size exits.
 func (l *autoLoop) positionUsd(ctx context.Context, symbol string) float64 {
-	pos, err := l.client.GetPositions(ctx)
+	pos, err := l.positionsCached(ctx)
 	if err != nil {
 		return 0
 	}
@@ -635,7 +691,7 @@ func (l *autoLoop) positionUsd(ctx context.Context, symbol string) float64 {
 // dedupe on the broker side; the call is fire-and-forget for paper
 // trading.
 func (l *autoLoop) closePosition(ctx context.Context, symbol, reason string) {
-	pos, err := l.client.GetPositions(ctx)
+	pos, err := l.positionsCached(ctx)
 	if err != nil {
 		log.Printf("[auto] %s close skipped: positions lookup failed: %v", symbol, err)
 		return

@@ -178,8 +178,11 @@ func LoadSettings(getenv func(string) string, pollSeconds int) (Settings, error)
 	if s.PositionPct, err = envFloat(getenv, "POSITION_PCT", defPositionPct); err != nil {
 		return s, err
 	}
-	if s.PositionPct <= 0 || s.PositionPct > 5 {
-		return s, fmt.Errorf("POSITION_PCT must be in (0,5], got %g", s.PositionPct)
+	// POSITION_PCT is a fraction of portfolio per position: cap at 1.0 so
+	// no single entry can be sized above 100% of the portfolio (the bot
+	// is cash-account, long-only — leverage-by-config is a footgun).
+	if s.PositionPct <= 0 || s.PositionPct > 1 {
+		return s, fmt.Errorf("POSITION_PCT must be in (0,1], got %g", s.PositionPct)
 	}
 	if s.TPPct, err = envFloat(getenv, "TP_PCT", defTPPct); err != nil {
 		return s, err

@@ -181,9 +181,9 @@ func TestPlanEntryCryptoNoBracket(t *testing.T) {
 	} else if !strings.Contains(err.Error(), "below one unit") {
 		t.Fatalf("skip reason should mention min-qty rule, got: %v", err)
 	}
-	// A lower crypto price (500, from the fake price table) is affordable
-	// and must yield a bracket-free plan. The fake returns one price per
-	// symbol, so use a second engine wired to the cheaper mark.
+	// A lower crypto price (500, from the fake price table) is affordable.
+	// The fake returns one price per symbol, so use a second engine wired
+	// to the cheaper mark.
 	e2, err := NewEngine(EngineConfig{
 		Scorer: fakeScorer{res: map[string]factorsScored{
 			"BTC/USD": {Composite: .9, Trend: .9, Momentum: .9},
@@ -200,8 +200,16 @@ func TestPlanEntryCryptoNoBracket(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !cr2.Crypto || cr2.Brackets.TakeProfit != 0 || cr2.Brackets.StopLoss != 0 {
-		t.Fatalf("crypto must carry NO server-side brackets, got %+v", cr2)
+	// Crypto plans carry levels in Brackets for LOCAL enforcement only:
+	// Alpaca rejects server-side bracket orders on crypto, so these are
+	// persisted to strategy-state.json and enforced by PositionMonitor
+	// (see commit 719e14a). The plan must be flagged Crypto with the pct
+	// bracket levels computed off the entry mark.
+	if !cr2.Crypto {
+		t.Fatalf("crypto flag must be set, got %+v", cr2)
+	}
+	if cr2.Brackets.TakeProfit != 540 || cr2.Brackets.StopLoss != 480 {
+		t.Fatalf("crypto local TP/SL levels wrong: %+v", cr2.Brackets)
 	}
 }
 

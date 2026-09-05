@@ -171,6 +171,10 @@ func readRecords(path string) ([]Record, error) {
 	defer f.Close()
 	var recs []Record
 	sc := bufio.NewScanner(f)
+	// Same 1 MiB cap as api/journal.go: ensemble decision rows embed the
+	// full per-expert vote trail and can exceed the scanner's 64 KiB
+	// default, which would fail every subsequent read of the log.
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	lineNo := 0
 	for sc.Scan() {
 		lineNo++

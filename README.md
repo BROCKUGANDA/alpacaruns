@@ -9,9 +9,11 @@
 `ALPACA_BASE_URL` and set `I_ALPACA_LIVE=YES`.
 
 - **Code:** `https://github.com/BROCKUGANDA/alpacaruns`
-- **Live demo:** `https://run.svalley.tech/` *(terminates TLS via Caddy +
-  Let's Encrypt on the host; serves the dashboard and the Go JSON API on
-  the same origin)*
+- **Live demo:** **`https://run.svalley.tech/`** — live right now (bot
+  ticks every ~5 min; check `https://run.svalley.tech/api/health` for
+  liveness and `/api/status` for the live tick counter, config, and
+  kill-switch state). TLS terminates via Caddy + Let's Encrypt on the
+  host; the dashboard and the Go JSON API share one origin.
 - **API surface:** `GET /api/health`, `GET /api/status`,
   `GET /api/account`, `GET /api/pnl`, `GET /api/trades`,
   `GET /api/decisions`, `GET /api/positions`,
@@ -164,17 +166,27 @@ LLM providers (priority order):
 ## Tests
 
 ```bash
-go test ./...
+go test ./...   # all packages green
+go vet ./...
 ```
 
 Unit tests mock the Alpaca HTTP surface (order placement/cancel,
 bars, errors) and cover config defaults, mode validation, ensemble
 math, and the risk validator.
 
-> **Pre-existing failures**: `risk` + `strategy` tests fail
-> identically on the pristine tree — not introduced by recent
-> changes. Tracked as a separate hardening backlog; touch only with
-> a reproducer.
+### Hardening pass (2026-09-05)
+
+All packages pass `go test ./...` and `go vet ./...`. Fixes in this
+pass:
+
+| Area | Fix |
+|---|---|
+| Risk gate (fail-closed) | Account-fetch errors used to silently skip the portfolio-percentage and per-position cap checks; the gate now rejects with `account unavailable` — matching the documented fail-closed contract. |
+| Factor scoring | Corrupt bars (zero / non-finite closes) are dropped before ratio math; the composite must be finite or scoring errors out — NaN can no longer silently flip BUY gates into HOLDs. |
+| Runtime | The `auto` loop runs each tick behind a panic barrier (one panicking tick logs + recovers instead of killing the 24/7 process and leaving positions unmonitored). Trade-log reading handles >64 KiB ensemble vote-trail lines in the bot's own ledger readers. |
+| Finance | Dashboard manual-order validation runs against the LIVE account when a broker client is wired (portfolio cap is real, not a synthetic $100k); fetch errors fail closed. `POSITION_PCT` is capped at 1.0 — a single position can no longer be configured above 100% of portfolio. |
+| Production | One `/positions` fetch per tick (shared across all per-symbol cap checks) instead of one per buy decision — keeps the Alpaca rate budget for the price/bar fetches that matter. |
+| Crypto TP/SL test | Updated to assert the intended behavior (local TP/SL levels persisted for `PositionMonitor` enforcement), un-doing a stale pre-fix expectation. |
 
 ## Deployment
 
