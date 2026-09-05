@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -449,6 +450,11 @@ func (s *Server) handleTrades(w http.ResponseWriter, r *http.Request) {
 		}
 		filtered = append(filtered, f)
 	}
+	// Sort newest-first so the dashboard's "Trade Log" header
+	// matches what the operator expects. The JSONL file is
+	// append-only and ordered oldest-first; without this, the
+	// first page of an old bot would be ancient history.
+	sortRecordsByTSDesc(filtered)
 	// Cursor: index of the first record to return.
 	if cursor > int64(len(filtered)) {
 		cursor = int64(len(filtered))
@@ -552,6 +558,18 @@ func extractFactorScores(detail string) map[string]float64 {
 
 // ---- /api/decisions ----
 
+// fillRowsFromRecords sorts the window newest-first so the dashboard's
+// "recent trades" / "recent decisions" headers actually show recent
+// entries. The JSONL file is append-only and ordered oldest-first;
+// without this sort, the first 20 results are the OLDEST records
+// in the file (which on a long-running bot is a 10-day-old boot
+// reconcile), and the user has to page deep to see today's activity.
+func sortRecordsByTSDesc(records []pnl.Record) {
+	sort.Slice(records, func(i, j int) bool {
+		return records[i].TS.After(records[j].TS)
+	})
+}
+
 func (s *Server) handleDecisions(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "use GET")
@@ -592,6 +610,10 @@ func (s *Server) handleDecisions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	decisions := readDecisions(records, pathFilter, since, until)
+	// Sort newest-first so the dashboard's "Recent decisions" header
+	// matches what the operator expects. Without this, the first
+	// page is dominated by the bot's startup reconcile records.
+	sortRecordsByTSDesc(decisions)
 	if cursor > int64(len(decisions)) {
 		cursor = int64(len(decisions))
 	}
@@ -605,6 +627,7 @@ func (s *Server) handleDecisions(w http.ResponseWriter, r *http.Request) {
 		rows = append(rows, DecisionRow{
 			TS:           r.TS,
 			Symbol:       r.Symbol,
+			Side:         r.Side,
 			Risk:         r.Risk,
 			Source:       r.Source,
 			Confidence:   r.Confidence,
@@ -640,8 +663,25 @@ func (s *Server) handlePositions(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, "alpaca_error", err.Error())
 		return
 	}
+	// Look up each symbol's stored bracket in the strategy state so the
+	// dashboard can show "held for 3d 4h". A miss means the bot has
+	// no recorded level for that symbol (e.g. position inherited from
+	// a prior run before this code shipped) — leave Since zero and
+	// the UI renders "—" instead of a misleading "0s".
+	var levels map[string]time.Time
+	if s.settings.StateFile != "" {
+		if st, err := loadStrategyStateFull(s.settings.StateFile); err == nil {
+			levels = map[string]time.Time{}
+			for sym, lv := range st.Levels {
+				if lv != nil && !lv.Since.IsZero() {
+					levels[sym] = lv.Since
+				}
+			}
+		}
+	}
 	rows := make([]PositionRow, 0, len(positions))
 	for _, p := range positions {
+		since := levels[p.Symbol] // zero if not in the map
 		rows = append(rows, PositionRow{
 			Symbol:          p.Symbol,
 			Qty:             p.Qty,
@@ -652,6 +692,7 @@ func (s *Server) handlePositions(w http.ResponseWriter, r *http.Request) {
 			UnrealizedPLPct: p.UnrealizedPLPC,
 			ChangeToday:     p.ChangeToday,
 			Side:            p.Side,
+			Since:           since,
 		})
 	}
 	writeJSON(w, http.StatusOK, struct {
@@ -829,6 +870,13 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 // picks up the new values. Validation: extra-forbid (unknown
 // fields 400), out-of-range values 400. Empty body is a 400 — every
 // endpoint that mutates state should require an explicit payload.
+//
+// `?dry_run=true` makes the endpoint validate and return the
+// would-be state WITHOUT persisting — same shape as the live POST,
+// but the strategy-state file is not written and the in-memory cfg
+// is left alone. The frontend uses this for a "Preview changes"
+// button that shows operators what a preset would do to the live
+// knobs without committing the change.
 func (s *Server) handlePostConfig(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "use POST")
@@ -852,11 +900,81 @@ func (s *Server) handlePostConfig(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_json", err.Error())
 		return
 	}
+	if err := s.validateConfigUpdate(req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_value", err.Error())
+		return
+	}
+	// dry-run: validate + return the would-be snapshot, do not mutate
+	// the live cfg / strat / strategy-state file. Frontend uses this
+	// for the "Preview changes" button.
+	if r.URL.Query().Get("dry_run") == "true" {
+		writeJSON(w, http.StatusOK, s.snapshotConfigWith(req))
+		return
+	}
 	if err := s.applyConfigUpdate(req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_value", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, s.snapshotConfig())
+}
+
+// validateConfigUpdate runs the same range checks applyConfigUpdate
+// does, but without writing anything. Used by both the live POST
+// and the dry-run ?dry_run=true path so a 400 invalid_value is
+// returned before any commit.
+func (s *Server) validateConfigUpdate(req ConfigUpdateRequest) error {
+	if req.MaxPositionUSD != nil && !validPositive(*req.MaxPositionUSD, 1_000_000) {
+		return fmt.Errorf("max_position_usd must be in (0, 1000000], got %v", *req.MaxPositionUSD)
+	}
+	if req.MaxPortfolioPct != nil && !validFraction(*req.MaxPortfolioPct) {
+		return fmt.Errorf("max_portfolio_pct must be in [0, 1], got %v", *req.MaxPortfolioPct)
+	}
+	if req.CryptoMaxPositionUSD != nil && !validPositive(*req.CryptoMaxPositionUSD, 1_000_000) {
+		return fmt.Errorf("crypto_max_position_usd must be in (0, 1000000], got %v", *req.CryptoMaxPositionUSD)
+	}
+	if req.MinConfidence != nil && !validFraction(*req.MinConfidence) {
+		return fmt.Errorf("min_confidence must be in [0, 1], got %v", *req.MinConfidence)
+	}
+	if req.DailyDDHalt != nil && !validFraction(*req.DailyDDHalt) {
+		return fmt.Errorf("daily_dd_halt must be in [0, 1], got %v", *req.DailyDDHalt)
+	}
+	if req.WeeklyDDHalt != nil && !validFraction(*req.WeeklyDDHalt) {
+		return fmt.Errorf("weekly_dd_halt must be in [0, 1], got %v", *req.WeeklyDDHalt)
+	}
+	if req.TotalDDHalt != nil && !validFraction(*req.TotalDDHalt) {
+		return fmt.Errorf("total_dd_halt must be in [0, 1], got %v", *req.TotalDDHalt)
+	}
+	return nil
+}
+
+// snapshotConfigWith returns the post-apply snapshot: same shape as
+// snapshotConfig but each field uses the request value when set, so
+// the dry-run response shows exactly what the live POST would commit.
+// Fields not present in the request keep the current value.
+func (s *Server) snapshotConfigWith(req ConfigUpdateRequest) ConfigResponse {
+	out := s.snapshotConfig()
+	if req.MaxPositionUSD != nil {
+		out.MaxPositionUSD = *req.MaxPositionUSD
+	}
+	if req.MaxPortfolioPct != nil {
+		out.MaxPortfolioPct = *req.MaxPortfolioPct
+	}
+	if req.CryptoMaxPositionUSD != nil {
+		out.CryptoMaxPositionUSD = *req.CryptoMaxPositionUSD
+	}
+	if req.MinConfidence != nil {
+		out.MinConfidence = *req.MinConfidence
+	}
+	if req.DailyDDHalt != nil {
+		out.DailyDDHalt = *req.DailyDDHalt
+	}
+	if req.WeeklyDDHalt != nil {
+		out.WeeklyDDHalt = *req.WeeklyDDHalt
+	}
+	if req.TotalDDHalt != nil {
+		out.TotalDDHalt = *req.TotalDDHalt
+	}
+	return out
 }
 
 // snapshotConfig is the single source of truth for "what knobs is

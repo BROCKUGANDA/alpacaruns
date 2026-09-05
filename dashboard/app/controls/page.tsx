@@ -317,6 +317,41 @@ function RiskConfigForm() {
     }
   }
 
+  // preview runs the same payload through /api/config?dry_run=true
+  // and surfaces the would-be snapshot in a side panel. The form
+  // values are NOT committed — the live config is untouched. This
+  // gives operators a "demo" view of what a preset or hand-tweaked
+  // form would do before they commit.
+  const [previewing, setPreviewing] = useState(false);
+  const [preview, setPreview] = useState<ConfigResponse | null>(null);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+
+  async function runPreview() {
+    if (!form) return;
+    const { patch, errors } = parseForm(form);
+    if (errors.length) {
+      setPreviewError(errors.join(" · "));
+      setPreview(null);
+      return;
+    }
+    setPreviewing(true);
+    setPreviewError(null);
+    try {
+      const r = await apiFetch<ConfigResponse>(
+        "/api/config?dry_run=true",
+        { method: "POST", body: JSON.stringify(patch) },
+      );
+      setPreview(r);
+    } catch (err) {
+      setPreviewError(
+        err instanceof Error ? err.message : "Preview failed",
+      );
+      setPreview(null);
+    } finally {
+      setPreviewing(false);
+    }
+  }
+
   async function reset() {
     if (data) setForm(toForm(data));
   }
@@ -401,6 +436,13 @@ function RiskConfigForm() {
 
       <div className="mt-4 flex items-center justify-end gap-3">
         <button
+          disabled={saving || previewing}
+          onClick={runPreview}
+          className="rounded-lg border border-border bg-bg px-4 py-2 text-sm font-semibold text-zinc-200 hover:border-accent/40 disabled:opacity-50"
+        >
+          {previewing ? "Previewing…" : "Preview changes"}
+        </button>
+        <button
           disabled={saving}
           onClick={save}
           className="rounded-lg border border-accent/40 bg-accent/10 px-4 py-2 text-sm font-semibold text-accent hover:bg-accent/20 disabled:opacity-50"
@@ -408,6 +450,55 @@ function RiskConfigForm() {
           {saving ? "Saving…" : "Save config"}
         </button>
       </div>
+
+      {preview && (
+        <div className="mt-3 rounded-lg border border-warn/40 bg-warn/10 p-3 text-xs">
+          <div className="mb-1 flex items-center justify-between">
+            <div className="font-semibold text-warn">
+              Preview (not committed)
+            </div>
+            <button
+              onClick={() => setPreview(null)}
+              className="text-[10px] uppercase tracking-wide text-muted hover:text-accent"
+            >
+              Dismiss
+            </button>
+          </div>
+          <p className="mb-2 text-muted">
+            Live config is unchanged. The values below are what Save
+            would commit.
+          </p>
+          <table className="w-full font-mono text-[11px]">
+            <tbody>
+              {(Object.keys(form ?? {}) as (keyof FormState)[]).map((k) => {
+                const cur = data?.[k as keyof ConfigResponse] as number | undefined;
+                const next = preview[k as keyof ConfigResponse] as number | undefined;
+                if (cur === next) return null;
+                return (
+                  <tr key={k} className="border-b border-warn/20 last:border-0">
+                    <td className="py-0.5 pr-3 text-muted">{k}</td>
+                    <td className="py-0.5 pr-3 text-right text-muted line-through">
+                      {k.includes("pct") || k.includes("halt")
+                        ? fmtPct(Number(cur), 2)
+                        : fmtMoney(Number(cur))}
+                    </td>
+                    <td className="py-0.5 text-right text-warn">
+                      {k.includes("pct") || k.includes("halt")
+                        ? fmtPct(Number(next), 2)
+                        : fmtMoney(Number(next))}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {previewError && (
+        <div className="mt-3 rounded-md border border-danger/40 bg-danger/10 px-3 py-2 text-xs text-danger">
+          {previewError}
+        </div>
+      )}
 
       <ToastView toast={toast} />
     </div>

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/BROCKUGANDA/alpacaruns/pnl"
+	"github.com/BROCKUGANDA/alpacaruns/strategy"
 )
 
 // readAllRecords loads the trade log at path, oldest first. Missing
@@ -140,6 +141,32 @@ func readStrategyState(path string) strategyState {
 	}
 	_ = json.Unmarshal(b, &s)
 	return s
+}
+
+// loadStrategyStateFull reads the strategy state file with its full
+// schema (including the per-symbol PositionLevels map). The api server
+// keeps a flat, smaller view in readStrategyState for the /api/status
+// snapshot; handlePositions wants the Levels map so it can show the
+// entry time of each held bracket.
+func loadStrategyStateFull(path string) (*strategy.State, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return &strategy.State{
+				Version: 1,
+				Levels:  map[string]*strategy.PositionLevels{},
+			}, nil
+		}
+		return nil, err
+	}
+	var st strategy.State
+	if err := json.Unmarshal(b, &st); err != nil {
+		return nil, err
+	}
+	if st.Levels == nil {
+		st.Levels = map[string]*strategy.PositionLevels{}
+	}
+	return &st, nil
 }
 
 // ensureDataDir creates the data/ directory tree lazily so a fresh

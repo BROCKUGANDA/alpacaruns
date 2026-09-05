@@ -516,7 +516,8 @@ func (l *autoLoop) intraEntry(ctx context.Context, dec strategy.Decision, pfv fl
 		return
 	}
 	autoJournal(l.journal, fmt.Sprintf("intraday-buy %s qty=%d price=%.4f tp=%.4f sl=%.4f",
-		plan.Symbol, plan.Qty, plan.Price, plan.Brackets.TakeProfit, plan.Brackets.StopLoss))
+		plan.Symbol, plan.Qty, plan.Price, plan.Brackets.TakeProfit, plan.Brackets.StopLoss),
+		plan.Symbol, "buy", 0)
 	if l.set.IntradayTrack == "shadow" {
 		log.Printf("[intraday] SHADOW BUY %s qty=%d @~%.4f tp=%.4f sl=%.4f",
 			plan.Symbol, plan.Qty, plan.Price, plan.Brackets.TakeProfit, plan.Brackets.StopLoss)
@@ -541,7 +542,8 @@ func (l *autoLoop) intraExit(ctx context.Context, dec strategy.Decision, why str
 		_ = l.State().ClearLevel(key)
 		return
 	}
-	autoJournal(l.journal, fmt.Sprintf("intraday-sell %s qty=%s (%s)", dec.Symbol, trimNum(qty), why))
+	autoJournal(l.journal, fmt.Sprintf("intraday-sell %s qty=%s (%s)", dec.Symbol, trimNum(qty), why),
+		dec.Symbol, "sell", 0)
 	if l.set.IntradayTrack == "shadow" {
 		log.Printf("[intraday] SHADOW SELL %s qty=%s (%s)", dec.Symbol, trimNum(qty), why)
 		return
@@ -667,6 +669,7 @@ func (l *autoLoop) closePosition(ctx context.Context, symbol, reason string) {
 	if l.journal != nil {
 		_ = l.journal.Append(pnl.Record{
 			Kind: pnl.KindDecision, Source: "strategy:auto", Risk: "APPROVED",
+			Symbol: symbol, Side: side,
 			Detail: fmt.Sprintf("close %s reason=%s side=%s qty=%s order=%s",
 				symbol, reason, side, req.Qty, o.ID),
 		})
@@ -850,17 +853,20 @@ func (l *autoLoop) tickEnsemble(ctx context.Context, universe []string, held map
 		case d.Blocked:
 			log.Printf("[ensemble] BLOCKED %s BUY: %s", d.Symbol, d.BlockWhy)
 			autoJournal(l.journal, fmt.Sprintf("ensemble-blocked buy %s conf=%.2f why=%q votes=[%s]",
-				d.Symbol, d.Confidence, d.BlockWhy, votes))
+				d.Symbol, d.Confidence, d.BlockWhy, votes),
+				d.Symbol, "buy", d.Confidence)
 		case d.Action == ensemble.ActionBuy:
 			dec := strategy.Decision{Symbol: d.Symbol, Signal: strategy.SignalBuy,
 				Composite: d.Confidence, Reason: "ensemble: " + d.Reason}
 			autoJournal(l.journal, fmt.Sprintf("ensemble-buy %s qty=%d conf=%.2f votes=[%s] reason=%q",
-				d.Symbol, d.Qty, d.Confidence, votes, d.Reason))
+				d.Symbol, d.Qty, d.Confidence, votes, d.Reason),
+				d.Symbol, "buy", d.Confidence)
 			l.handleBuy(ctx, dec, pfv, d.Confidence)
 		case d.Action == ensemble.ActionSell:
 			dec := strategy.Decision{Symbol: d.Symbol, Signal: strategy.SignalSell,
 				Reason: "ensemble: " + d.Reason}
-			autoJournal(l.journal, fmt.Sprintf("ensemble-sell %s conf=%.2f votes=[%s]", d.Symbol, d.Confidence, votes))
+			autoJournal(l.journal, fmt.Sprintf("ensemble-sell %s conf=%.2f votes=[%s]", d.Symbol, d.Confidence, votes),
+				d.Symbol, "sell", d.Confidence)
 			l.handleSell(ctx, dec)
 		}
 	}
@@ -924,7 +930,8 @@ func (l *autoLoop) handleBuy(ctx context.Context, dec strategy.Decision, pfv, co
 		leg, why := l.optPlanner.Plan(ctx, dec.Symbol, pfv)
 		if leg != nil {
 			autoJournal(l.journal, fmt.Sprintf("buy-option %s %s contracts=%d delta=%.2f premium=%.2f",
-				dec.Symbol, leg.OCC, leg.Contracts, leg.Delta, leg.Premium))
+				dec.Symbol, leg.OCC, leg.Contracts, leg.Delta, leg.Premium),
+				dec.Symbol, "buy", 0)
 			if l.dryRun {
 				log.Printf("[auto] DRY-RUN option entry %s x%d (%s)", leg.OCC, leg.Contracts, dec.Symbol)
 				return
@@ -939,7 +946,8 @@ func (l *autoLoop) handleBuy(ctx context.Context, dec strategy.Decision, pfv, co
 		log.Printf("[auto] option overlay skipped for %s: %s", dec.Symbol, why)
 	}
 	autoJournal(l.journal, fmt.Sprintf("buy %s qty=%d price=%.4f tp=%.4f sl=%.4f crypto=%t",
-		plan.Symbol, plan.Qty, plan.Price, plan.Brackets.TakeProfit, plan.Brackets.StopLoss, plan.Crypto))
+		plan.Symbol, plan.Qty, plan.Price, plan.Brackets.TakeProfit, plan.Brackets.StopLoss, plan.Crypto),
+		plan.Symbol, "buy", conf)
 	if l.dryRun {
 		log.Printf("[auto] DRY-RUN BUY %s qty=%d @~%.4f tp=%.4f sl=%.4f",
 			plan.Symbol, plan.Qty, plan.Price, plan.Brackets.TakeProfit, plan.Brackets.StopLoss)
@@ -983,7 +991,8 @@ func (l *autoLoop) preOrder(ctx context.Context, dec strategy.Decision, pfv, con
 		leg, why := l.optPlanner.Plan(ctx, dec.Symbol, pfv)
 		if leg != nil {
 			autoJournal(l.journal, fmt.Sprintf("pre-order-option %s %s contracts=%d delta=%.2f premium=%.2f",
-				dec.Symbol, leg.OCC, leg.Contracts, leg.Delta, leg.Premium))
+				dec.Symbol, leg.OCC, leg.Contracts, leg.Delta, leg.Premium),
+				dec.Symbol, "buy", conf)
 			if l.dryRun {
 				log.Printf("[auto] DRY-RUN PRE-ORDER option %s x%d (%s)", leg.OCC, leg.Contracts, dec.Symbol)
 			} else if err := placeOptionEntry(ctx, l.client, leg); err != nil {
@@ -996,7 +1005,8 @@ func (l *autoLoop) preOrder(ctx context.Context, dec strategy.Decision, pfv, con
 		}
 	}
 	autoJournal(l.journal, fmt.Sprintf("pre-order %s qty=%d ref-price=%.4f tp=%.4f sl=%.4f conf=%.2f",
-		plan.Symbol, plan.Qty, plan.Price, plan.Brackets.TakeProfit, plan.Brackets.StopLoss, conf))
+		plan.Symbol, plan.Qty, plan.Price, plan.Brackets.TakeProfit, plan.Brackets.StopLoss, conf),
+		plan.Symbol, "buy", conf)
 	if l.dryRun {
 		log.Printf("[auto] DRY-RUN PRE-ORDER %s qty=%d @limit %.4f tp=%.4f sl=%.4f",
 			plan.Symbol, plan.Qty, plan.Price, plan.Brackets.TakeProfit, plan.Brackets.StopLoss)
@@ -1012,7 +1022,7 @@ func (l *autoLoop) handleSell(ctx context.Context, dec strategy.Decision) {
 		log.Printf("[auto] %s SELL outside window; skipped", dec.Symbol)
 		return
 	}
-	autoJournal(l.journal, "sell-exit "+dec.Symbol+" "+dec.Reason)
+	autoJournal(l.journal, "sell-exit "+dec.Symbol+" "+dec.Reason, dec.Symbol, "sell", 0)
 	if l.dryRun {
 		log.Printf("[auto] DRY-RUN SELL %s: %s", dec.Symbol, dec.Reason)
 		return
@@ -1031,7 +1041,8 @@ func (l *autoLoop) handleSell(ctx context.Context, dec strategy.Decision) {
 		return
 	}
 	log.Printf("[auto] EXIT %s qty=%s placed (%s)", dec.Symbol, trimNum(qty), dec.Reason)
-	autoJournal(l.journal, fmt.Sprintf("exit %s qty=%s", dec.Symbol, trimNum(qty)))
+	autoJournal(l.journal, fmt.Sprintf("exit %s qty=%s", dec.Symbol, trimNum(qty)),
+		dec.Symbol, "sell", 0)
 	_ = l.exec.State.ClearLevel(dec.Symbol)
 }
 
@@ -1075,14 +1086,30 @@ func trimNum(f float64) string {
 	return strconv.FormatFloat(f, 'f', -1, 64)
 }
 
-func autoJournal(j *pnl.Journal, detail string) {
+// autoJournal writes a single audit-trail line for a buy/sell decision
+// taken by the auto loop. Symbol + Side are populated explicitly so
+// the dashboard's Recent Decisions feed can show them in the table
+// (rows with empty Symbol render as blank "—" cells and confuse
+// operators into thinking the bot never sells). The Confidence is
+// the strategy.Engine's composite score at decision time when
+// available; zero on early-loop ticks before the scorer warms up.
+func autoJournal(j *pnl.Journal, detail, symbol, side string, confidence float64) {
 	if j == nil {
 		return
 	}
-	_ = j.Append(pnl.Record{
-		Kind: pnl.KindDecision, Source: "strategy:auto",
-		Risk: "APPROVED", Detail: detail,
-	})
+	conf := confidence
+	rec := pnl.Record{
+		Kind:   pnl.KindDecision,
+		Source: "strategy:auto",
+		Risk:   "APPROVED",
+		Symbol: symbol,
+		Side:   side,
+		Detail: detail,
+	}
+	if conf > 0 {
+		rec.Confidence = &conf
+	}
+	_ = j.Append(rec)
 }
 
 // adaptiveSizingMultiplier maps account P/L fraction to a position-budget

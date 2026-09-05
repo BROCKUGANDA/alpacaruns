@@ -164,6 +164,7 @@ type TradesResponse struct {
 type DecisionRow struct {
 	TS           time.Time          `json:"ts"`
 	Symbol       string             `json:"symbol"`
+	Side         string             `json:"side,omitempty"` // buy | sell | "" (reconcile, blocked, etc.)
 	Risk         string             `json:"risk"`
 	Source       string             `json:"source"`
 	Confidence   *float64           `json:"confidence,omitempty"`
@@ -182,15 +183,20 @@ type DecisionsResponse struct {
 
 // PositionRow is one row of GET /api/positions.
 type PositionRow struct {
-	Symbol          string  `json:"symbol"`
-	Qty             string  `json:"qty"`
-	AvgEntryPrice   string  `json:"avg_entry_price"`
-	CurrentPrice    string  `json:"current_price"`
-	MarketValue     string  `json:"market_value"`
-	UnrealizedPL    string  `json:"unrealized_pl"`
-	UnrealizedPLPct string  `json:"unrealized_pl_pct"`
-	ChangeToday     string  `json:"change_today,omitempty"`
-	Side            string  `json:"side"`
+	Symbol          string    `json:"symbol"`
+	Qty             string    `json:"qty"`
+	AvgEntryPrice   string    `json:"avg_entry_price"`
+	CurrentPrice    string    `json:"current_price"`
+	MarketValue     string    `json:"market_value"`
+	UnrealizedPL    string    `json:"unrealized_pl"`
+	UnrealizedPLPct string    `json:"unrealized_pl_pct"`
+	ChangeToday     string    `json:"change_today,omitempty"`
+	Side            string    `json:"side"`
+	// Since is the entry time of the bot's last recorded bracket for
+	// this symbol (zero when no bracket is stored, e.g. a position
+	// the bot inherited from a prior run). The dashboard renders it
+	// as a "held for 3d 4h" label next to the position row.
+	Since time.Time `json:"since,omitempty"`
 }
 
 // ---- Control ----

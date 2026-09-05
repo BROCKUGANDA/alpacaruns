@@ -102,6 +102,7 @@ export type TradesResponse = {
 export type DecisionRow = {
   ts: string;
   symbol: string;
+  side?: string; // buy | sell | "" when not set (e.g. reconcile)
   risk: string;
   source: string;
   confidence?: number;
@@ -125,6 +126,12 @@ export type PositionRow = {
   unrealized_pl_pct: string;
   change_today?: string;
   side: string;
+  // since is the bot's last-recorded bracket time for this symbol.
+  // Zero (or absent) when the bot has no bracket for this symbol
+  // — e.g. a position inherited from a prior run, or one
+  // reconciled by the bot without setting a level. The dashboard
+  // renders it as a "held for 3d 4h" pill or "—" when missing.
+  since?: string;
 };
 
 export type PositionsResponse = {
