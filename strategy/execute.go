@@ -39,6 +39,39 @@ func (x *Executor) ExecuteEntry(ctx context.Context, p EntryPlan, conf float64) 
 	if isNotional && !p.Crypto {
 		return fmt.Errorf("notional orders only supported for crypto (got %s)", p.Symbol)
 	}
+	// Balance-aware pre-trade guard: before touching the broker, verify
+	// the account can actually fund this entry. Crypto on Alpaca requires
+	// settled cash (no margin), so a negative/zero cash balance means
+	// EVERY crypto buy will 403 — better to skip with a clear reason than
+	// fire a guaranteed-fail order every tick. Equities are funded from
+	// buying power (margin). This single check covers every entry path
+	// (swing, intraday, ensemble, pre-order) because they all flow through
+	// here.
+	notionalUSD := p.Notional
+	if notionalUSD <= 0 && p.Qty > 0 && p.Price > 0 {
+		notionalUSD = float64(p.Qty) * p.Price
+	}
+	if notionalUSD > 0 {
+		acct, err := x.Client.GetAccount(ctx)
+		if err != nil {
+			return fmt.Errorf("balance check: account unavailable: %w", err)
+		}
+		var avail float64
+		if p.Crypto {
+			avail = parseFloatSafe(acct.Cash)
+			if avail <= 0 {
+				return fmt.Errorf("balance check: no available USD for %s (cash=%.2f); skipping buy", p.Symbol, avail)
+			}
+		} else {
+			avail = parseFloatSafe(acct.BuyingPower)
+			if avail <= 0 {
+				return fmt.Errorf("balance check: no buying power for %s (bp=%.2f); skipping buy", p.Symbol, avail)
+			}
+		}
+		if notionalUSD > avail {
+			return fmt.Errorf("balance check: %s buy $%.2f exceeds available $%.2f; skipping", p.Symbol, notionalUSD, avail)
+		}
+	}
 	// Crypto notional orders must be day orders (Alpaca rejects
 	// fractional notional with GTC). For qty-based crypto orders, the
 	// default GTC is fine.
@@ -91,7 +124,6 @@ func (x *Executor) ExecuteEntry(ctx context.Context, p EntryPlan, conf float64) 
 	}
 	return nil
 }
-
 
 // placeWithBrackets issues the order request. Equities get the bracket
 // envelope merged into the JSON body via a typed extension of
@@ -171,4 +203,15 @@ func (x *Executor) log() *log.Logger {
 		return log.Default()
 	}
 	return x.Log
+}
+
+// parseFloatSafe parses a numeric string from Alpaca (which returns
+// prices/balances as strings), returning 0 for empty/invalid input so a
+// missing balance is treated as "nothing available" — fail closed.
+func parseFloatSafe(s string) float64 {
+	v, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+	if err != nil {
+		return 0
+	}
+	return v
 }
