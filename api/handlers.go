@@ -37,10 +37,21 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "use GET")
 		return
 	}
-	lastPollNS := s.lastPollTS.Load()
+	// Liveness comes from the bot's per-tick Heartbeat persisted to
+	// data/strategy-state.json (strategy.StateStore.Heartbeat), because
+	// the bot and serve are separate processes and share only that file.
+	// lastPollTS is a legacy in-memory signal that no longer updates in
+	// the two-process layout; we use it only as a fallback so a freshly
+	// booted serve process (before any heartbeat write) still reads a
+	// sane state.
 	lastPoll := time.Time{}
-	if lastPollNS > 0 {
-		lastPoll = time.Unix(0, lastPollNS)
+	if st := readStrategyState(s.settings.StateFile); !st.LastTick.IsZero() {
+		lastPoll = st.LastTick
+	}
+	if lastPoll.IsZero() {
+		if ns := s.lastPollTS.Load(); ns > 0 {
+			lastPoll = time.Unix(0, ns)
+		}
 	}
 	botAlive := false
 	if !lastPoll.IsZero() {
@@ -70,6 +81,11 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	st := readStrategyState(s.settings.StateFile)
+	// The strategy-state file is the source of truth for tick count and
+	// last-tick time (the bot's per-tick Heartbeat write), since the bot
+	// and this API are separate processes. Fall back to the in-memory
+	// values only when the bot has never written a heartbeat (fresh data
+	// dir) — they're zero on boot anyway.
 	_ = st // reserved for future per-scope HALT labels
 	ks := KillSnapshot()
 	// The snapshot file is the source of truth for *current* halt
@@ -90,9 +106,11 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		state = StatePaused
 	}
 
-	lastTick := time.Time{}
-	if ns := s.lastPollTS.Load(); ns > 0 {
-		lastTick = time.Unix(0, ns)
+	lastTick := st.LastTick
+	if lastTick.IsZero() {
+		if ns := s.lastPollTS.Load(); ns > 0 {
+			lastTick = time.Unix(0, ns)
+		}
 	}
 	lastErr := ""
 	if v := s.lastError.Load(); v != nil {
@@ -105,7 +123,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		Bot:        state,
 		KillSwitch: ks,
 		Config:     s.buildStatusConfig(),
-		TickNumber: s.tickNumber.Load(),
+		TickNumber: st.TickNumber,
 		LastTick:   lastTick,
 		LastError:  lastErr,
 		Paused:     paused,
@@ -136,8 +154,6 @@ func (s *Server) buildStatusConfig() StatusConfig {
 	}
 	return out
 }
-
-
 
 // ---- /api/account ----
 

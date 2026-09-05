@@ -128,9 +128,15 @@ func sourceMatchesPath(source, want string) bool {
 // readStateJSON reads data/strategy-state.json (a flat key/value
 // object). Missing file or partial fields return zero values.
 type strategyState struct {
-	PeakEquity    float64   `json:"peak_equity"`
-	WeekStart     time.Time `json:"week_start"`
-	StartingEquity float64  `json:"starting_equity"`
+	PeakEquity     float64   `json:"peak_equity"`
+	WeekStart      time.Time `json:"week_start"`
+	StartingEquity float64   `json:"starting_equity"`
+	// TickNumber/LastTick come from the bot's per-tick Heartbeat write
+	// (strategy.StateStore.Heartbeat). They are the only cross-process
+	// liveness signal the API has, since the bot and serve are separate
+	// processes sharing data/strategy-state.json rather than memory.
+	TickNumber int64     `json:"tick_number"`
+	LastTick   time.Time `json:"last_tick"`
 }
 
 func readStrategyState(path string) strategyState {

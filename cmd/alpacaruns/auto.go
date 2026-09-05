@@ -13,9 +13,9 @@ import (
 	"log"
 	"log/slog"
 	"math"
-	"path/filepath"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -42,7 +42,7 @@ type autoLoop struct {
 	optPlanner *strategy.OptionPlanner
 	journal    *pnl.Journal
 	client     *tools.Client
-	dryRun bool
+	dryRun     bool
 	// pauseFlagPath is the path to the JSON pause flag file (defaults
 	// to data/paused). Kept on the struct so tests can point it at a
 	// temp dir without reaching for an env var.
@@ -52,7 +52,7 @@ type autoLoop struct {
 	pausedLogged bool
 	// ensemble is non-nil only when ENSEMBLE_ENABLED=true; nil keeps the
 	// original single-expert tick path bit-for-bit.
-	ensemble   *ensemble.Runner
+	ensemble *ensemble.Runner
 	// Intraday track (INTRADAY_TRACK != off): independent 15-minute-bar
 	// engine, own execution windows and sizing; shadow mode logs only.
 	intra    *strategy.Engine
@@ -61,6 +61,10 @@ type autoLoop struct {
 	// every tick to gate entries via ConfidenceBias; written whenever
 	// closePosition fires and the trade log shows a closed round-trip.
 	stats *statsLedger
+	// tickNum is a monotonic loop counter persisted via State.Heartbeat
+	// so the separate `serve` API process can show liveness / tick count
+	// without any in-process sharing.
+	tickNum int64
 }
 
 // autoFlags holds the parsed `auto` subcommand flags.
@@ -166,8 +170,8 @@ func buildAutoLoop(ctx context.Context, cfg *config.Config, set strategy.Setting
 	val := agents.NewValidatorWithScorer(kill, cfg, riskScorer)
 
 	engine, err := strategy.NewEngine(strategy.EngineConfig{
-		Scorer: scorer,
-		Prices: strategy.NewPriceSource(client),
+		Scorer:        scorer,
+		Prices:        strategy.NewPriceSource(client),
 		ReferenceBars: bars,
 		Threshold: strategy.Thresholds{
 			FactorMinScore: cfg.FactorMinScore,
@@ -236,8 +240,8 @@ func buildAutoLoop(ctx context.Context, cfg *config.Config, set strategy.Setting
 		intraScorer := strategy.FactorScorer{Inner: factors.NewEngine(cfg, bars, nil,
 			factors.Options{Timeframe: "15Min", MomentumDays: 16, VolWindow: 20})}
 		intraEngine, err := strategy.NewEngine(strategy.EngineConfig{
-			Scorer: intraScorer,
-			Prices: strategy.NewPriceSource(client),
+			Scorer:        intraScorer,
+			Prices:        strategy.NewPriceSource(client),
 			ReferenceBars: bars,
 			Threshold: strategy.Thresholds{
 				FactorMinScore: cfg.FactorMinScore,
@@ -247,9 +251,9 @@ func buildAutoLoop(ctx context.Context, cfg *config.Config, set strategy.Setting
 				ExitMomentum:   set.ExitMomentum,
 			},
 			Sizing: strategy.Sizing{PositionPct: set.PositionPctIntraday, MaxPositionUSD: cfg.MaxPositionUSD},
-			TPPct: set.IntradayTPPct, SLPct: set.IntradaySLPct,
+			TPPct:  set.IntradayTPPct, SLPct: set.IntradaySLPct,
 			BracketMode: set.BracketMode,
-			ATRMultTP: set.ATRMultTP, ATRMultSL: set.ATRMultSL,
+			ATRMultTP:   set.ATRMultTP, ATRMultSL: set.ATRMultSL,
 		})
 		if err != nil {
 			log.Printf("intraday engine: %v", err)
@@ -320,6 +324,18 @@ func ensembleStatePath(tradeLogPath string) string {
 // tick runs one deterministic pass: drawdown halts first, then score ->
 // decide -> window-gate -> size -> risk-gate -> execute (or log).
 func (l *autoLoop) tick(ctx context.Context) error {
+	// Heartbeat FIRST (before the pause flag and any Alpaca call). This
+	// persists tick counter + timestamp to strategy-state.json every tick
+	// so the separate `serve` API process can show liveness and a fresh
+	// "last tick" without in-process sharing. Bumping it even when paused
+	// means a paused-but-running bot still reports as alive on the
+	// dashboard. Best-effort: a failed write must never abort a tick.
+	l.tickNum++
+	if l.exec != nil && l.exec.State != nil {
+		if err := l.exec.State.Heartbeat(l.tickNum); err != nil {
+			log.Printf("[auto] heartbeat: %v", err)
+		}
+	}
 	// Pause flag check FIRST (before any Alpaca call). When the operator
 	// toggles "Pause new trades" in the dashboard (POST /api/control/pause),
 	// data/paused is written with content "true". The bot reads the file
@@ -360,11 +376,11 @@ func (l *autoLoop) tick(ctx context.Context) error {
 			if mult != 1.0 {
 				log.Printf("[auto] adaptive sizing: pnl=%.2f%% mult=%.2fx (start=%.2f equity=%.2f)",
 					pnl*100, mult, start, equity)
-			pfv = pfv * mult
+				pfv = pfv * mult
+			}
 		}
-	}
-	// Periodic stats log: every 10th tick, dump the per-symbol
-	// Periodic stats log: every 10th tick, dump the per-symbol
+		// Periodic stats log: every 10th tick, dump the per-symbol
+		// Periodic stats log: every 10th tick, dump the per-symbol
 		// ledger so we can watch the bot learn from its own trades.
 		if l.stats != nil {
 			l.stats.mu.Lock()
@@ -375,14 +391,12 @@ func (l *autoLoop) tick(ctx context.Context) error {
 				log.Printf("[auto] trade stats @tick=%d: %s", tickNum, l.stats.formatDump())
 			}
 		}
- 	}
+	}
 	// First-tick initialization: persist the starting equity for next
 	// boot. Idempotent — only writes when the key is unset.
 	if l.set.AdaptiveSizing && l.startingEquity() == 0 && equity > 0 {
 		l.persistStartingEquity(equity)
 	}
-
-
 
 	positions, err := l.client.GetPositions(ctx)
 	if err != nil {
@@ -436,7 +450,7 @@ func (l *autoLoop) tick(ctx context.Context) error {
 		l.takeProfits(ctx, l.set.ProfitTargetPct)
 	}
 
- 	universe := append(append([]string{}, l.set.EquitySymbols...), l.set.CryptoSymbols...)
+	universe := append(append([]string{}, l.set.EquitySymbols...), l.set.CryptoSymbols...)
 
 	// Intraday track runs every tick alongside swing (independent engine,
 	// own windows). Errors never block the swing path.
@@ -592,7 +606,6 @@ func (l *autoLoop) intraHeldSymbols() map[string]bool {
 	}
 	return held
 }
-
 
 func (l *autoLoop) State() *strategy.StateStore { return l.exec.State }
 
@@ -819,7 +832,6 @@ func (l *autoLoop) takeProfits(ctx context.Context, targetPct float64) {
 func sanitizeForOrderID(s string) string {
 	return strings.ReplaceAll(strings.ReplaceAll(s, "/", "-"), " ", "")
 }
-
 
 func (l *autoLoop) nowET() time.Time {
 	if et, err := time.LoadLocation("America/New_York"); err == nil {
@@ -1173,9 +1185,8 @@ func (l *autoLoop) persistStartingEquity(equity float64) {
 	existing["starting_equity"] = equity
 	if out, err := json.MarshalIndent(existing, "", "  "); err == nil {
 		_ = os.WriteFile(path, out, 0o644)
+	}
 }
-}
-
 
 // ---- pause flag ----
 

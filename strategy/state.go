@@ -32,6 +32,16 @@ type State struct {
 	PeakEquity float64 `json:"peak_equity,omitempty"`
 	// WeekStart is the Monday 00:00 UTC timestamp anchoring weekly P/L.
 	WeekStart time.Time `json:"week_start,omitempty"`
+	// TickNumber is a monotonically increasing counter bumped on every
+	// bot tick. It is the only cross-process heartbeat the dashboard
+	// API has access to (the bot and `serve` are separate processes
+	// that share data/strategy-state.json, not in-memory atomics).
+	// The dashboard renders "Tick N" from it; the API treats a fresh
+	// LastTick — within 3x the poll interval — as proof the bot is alive.
+	TickNumber int64 `json:"tick_number,omitempty"`
+	// LastTick is the UTC timestamp of the most recent completed bot
+	// tick. Zero until the bot's first tick writes it.
+	LastTick time.Time `json:"last_tick,omitempty"`
 }
 
 const stateVersion = 1
@@ -132,6 +142,23 @@ func (s *StateStore) ClearLevel(symbol string) error {
 		return err
 	}
 	delete(st.Levels, symbol)
+	return s.saveLocked(st)
+}
+
+// Heartbeat bumps the tick counter and stamps the last-tick time.
+// Called once per bot tick so the dashboard API can derive liveness
+// without any in-memory sharing (bot and serve run as two processes).
+// Atomic: load → mutate → save occupy the same mutex naturally, so a
+// concurrent SetLevel from the same tick cannot clobber the heartbeat.
+func (s *StateStore) Heartbeat(tickNum int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st, err := s.load()
+	if err != nil {
+		return err
+	}
+	st.TickNumber = tickNum
+	st.LastTick = time.Now().UTC()
 	return s.saveLocked(st)
 }
 

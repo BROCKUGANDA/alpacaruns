@@ -35,19 +35,19 @@ import (
 // reads it on every tick to gate entries (ConfidenceBias) and write
 // it on every closed trade.
 type TradeStats struct {
-	Symbol       string  `json:"symbol"`
-	Wins         int     `json:"wins"`
-	Losses       int     `json:"losses"`
-	WinRate      float64 `json:"win_rate"`        // 0..1, smoothed by EWMA
-	AvgWinPct    float64 `json:"avg_win_pct"`     // mean gain on winners, e.g. 0.025 = 2.5%
-	AvgLossPct   float64 `json:"avg_loss_pct"`    // mean loss on losers, e.g. -0.012 = -1.2%
-	AvgHoldMin   float64 `json:"avg_hold_min"`    // mean minutes between buy and sell
-	LastWinAt    time.Time `json:"last_win_at"`     // last profitable close
-	LastLossAt   time.Time `json:"last_loss_at"`    // last losing close
-	LastTradeAt  time.Time `json:"last_trade_at"`   // any close (buy or sell)
-	ConfidenceBias float64 `json:"confidence_bias"` // additive bias: -0.10 to +0.15
-	TotalPnL     float64 `json:"total_pnl"`        // cumulative realized P/L
-	TotalFills   int     `json:"total_fills"`
+	Symbol         string    `json:"symbol"`
+	Wins           int       `json:"wins"`
+	Losses         int       `json:"losses"`
+	WinRate        float64   `json:"win_rate"`        // 0..1, smoothed by EWMA
+	AvgWinPct      float64   `json:"avg_win_pct"`     // mean gain on winners, e.g. 0.025 = 2.5%
+	AvgLossPct     float64   `json:"avg_loss_pct"`    // mean loss on losers, e.g. -0.012 = -1.2%
+	AvgHoldMin     float64   `json:"avg_hold_min"`    // mean minutes between buy and sell
+	LastWinAt      time.Time `json:"last_win_at"`     // last profitable close
+	LastLossAt     time.Time `json:"last_loss_at"`    // last losing close
+	LastTradeAt    time.Time `json:"last_trade_at"`   // any close (buy or sell)
+	ConfidenceBias float64   `json:"confidence_bias"` // additive bias: -0.10 to +0.15
+	TotalPnL       float64   `json:"total_pnl"`       // cumulative realized P/L
+	TotalFills     int       `json:"total_fills"`
 }
 
 // statsFile is the on-disk format. All symbols in one map; the file is
@@ -98,8 +98,6 @@ func (l *statsLedger) load() error {
 	l.cache = f.BySymbol
 	return nil
 }
-
-
 
 // persist writes the cache atomically (temp + rename) so a crash
 // mid-write doesn't corrupt the file.
@@ -155,6 +153,7 @@ func (l *statsLedger) all() []TradeStats {
 // hold = time between buy and sell, and pnl = realized dollars.
 func (l *statsLedger) recordClose(symbol string, pct, pnl float64, hold time.Duration) {
 	l.mu.Lock()
+	defer l.mu.Unlock()
 	s := l.cache[symbol]
 	if s.Symbol == "" {
 		s.Symbol = symbol
