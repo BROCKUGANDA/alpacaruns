@@ -300,21 +300,29 @@ func (m *PositionMonitor) findPosition(ctx context.Context, symbol string) (*pos
 		return nil, err
 	}
 	for _, p := range ps {
-		if p.Symbol == symbol {
-			q, _ := strconv.ParseFloat(p.Qty, 64)
-			// Capture the broker's own current mark too. The broker
-			// /positions response carries current_price for every open
-			// position, which is an authoritative, always-present quote
-			// for the TP/SL check — far more reliable than re-fetching
-			// Data-API snapshots in a separate loop (those can be empty
-			// or rate-limited, which is exactly how a crypto TP silently
-			// failed to fire while price was above the bracket).
-			var px float64
-			if cp := strings.TrimSpace(p.CurrentPrice); cp != "" {
-				px, _ = strconv.ParseFloat(cp, 64)
-			}
-			return &positionQty{Qty: q, Price: px}, nil
+		// Broker position symbols are venue-formatted: crypto comes back
+		// as "BTCUSD" while strategy levels use "BTC/USD" (BASE/QUOTE).
+		// Match either form (slash-stripped, case-insensitive) so a
+		// crypto TP/SL level reliably finds its position instead of
+		// silently failing and dropping the level.
+		want := strings.ToLower(strings.ReplaceAll(symbol, "/", ""))
+		got := strings.ToLower(strings.ReplaceAll(p.Symbol, "/", ""))
+		if want != got {
+			continue
 		}
+		q, _ := strconv.ParseFloat(p.Qty, 64)
+		// Capture the broker's own current mark too. The broker
+		// /positions response carries current_price for every open
+		// position, which is an authoritative, always-present quote
+		// for the TP/SL check — far more reliable than re-fetching
+		// Data-API snapshots in a separate loop (those can be empty
+		// or rate-limited, which is exactly how a crypto TP silently
+		// failed to fire while price was above the bracket).
+		var px float64
+		if cp := strings.TrimSpace(p.CurrentPrice); cp != "" {
+			px, _ = strconv.ParseFloat(cp, 64)
+		}
+		return &positionQty{Qty: q, Price: px}, nil
 	}
 	return nil, nil
 }

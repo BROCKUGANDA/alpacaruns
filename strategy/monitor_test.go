@@ -210,6 +210,48 @@ func TestCryptoLevelEnforcement(t *testing.T) {
 
 var _ = fmt.Sprintf
 
+// TestCryptoTPSL_BrokerSymbolAndPrice verifies the two fixes together:
+// (1) a level stored as "BTC/USD" finds a broker position surfaced as
+// "BTCUSD" (venue formatting differs), and (2) the TP/SL decision uses
+// the broker /positions current_price even when the Data-API prices map
+// is empty — the exact scenario that silently failed to bank a gain.
+func TestCryptoTPSL_BrokerSymbolAndPrice(t *testing.T) {
+	dir := t.TempDir()
+	kill := agents.NewKillSwitch()
+	set := defSettings()
+	m, fb := mkMonitor(t, dir, kill, set)
+
+	lv := PositionLevels{Symbol: "BTC/USD", EntryPrice: 50000, TakeProfit: 54000, StopLoss: 48000}
+	if err := m.State.SetLevel(lv); err != nil {
+		t.Fatal(err)
+	}
+	// Broker reports the position as "BTCUSD" (no slash) with a live
+	// current_price already above the take-profit. prices map is EMPTY:
+	// the old code would skip this (no Data-API mark) and never close.
+	fb.positions = []tools.Position{{Symbol: "BTCUSD", Qty: "0.1", CurrentPrice: "55000"}}
+
+	res, err := m.Tick(context.Background(), map[string]float64{}, 100000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Closed) != 1 || res.Closed[0] != "BTC/USD" {
+		t.Fatalf("expected BTC/USD take-profit from broker price, got closed=%v", res.Closed)
+	}
+	// Level must have been cleared after the close.
+	levels, _ := m.State.CryptoLevels()
+	if len(levels) != 0 {
+		t.Fatalf("level should be cleared after close, still have %v", levels)
+	}
+	// And a real sell order must have been placed through the broker.
+	// The monitor passes the level's (slash-form) symbol; the executor
+	// normalizes to the venue form (BTCUSD) at the wire boundary.
+	if len(fb.placed) != 1 || fb.placed[0].Symbol != "BTC/USD" || fb.placed[0].Side != "sell" {
+		t.Fatalf("expected a BTC/USD sell, got %+v", fb.placed)
+	}
+}
+
+var _ = fmt.Sprintf
+
 // ---- equity bracket rebuild ----
 
 func TestEquityBracketRebuild(t *testing.T) {
