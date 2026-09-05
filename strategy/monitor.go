@@ -107,9 +107,29 @@ func (m *PositionMonitor) enforceTPSL(ctx context.Context, prices map[string]flo
 		return nil, fmt.Errorf("load state: %w", err)
 	}
 	for _, lv := range levels {
-		price, ok := prices[lv.Symbol]
-		if !ok || price <= 0 {
-			continue // no mark this tick: nothing to do
+		// Resolve the position first — it carries an authoritative,
+		// always-present current mark (/positions.current_price) and the
+		// live qty. This removes the silent-failure window where a
+		// Data-API price fetch for a crypto symbol came back empty and
+		// the TP/SL check was skipped even though price was above TP.
+		pos, err := m.findPosition(ctx, lv.Symbol)
+		if err != nil {
+			m.log().Printf("[monitor] %s: position lookup failed: %v", lv.Symbol, err)
+			continue
+		}
+		if pos == nil || pos.Qty <= 0 {
+			// Position already gone; drop stale levels.
+			_ = m.State.ClearLevel(lv.Symbol)
+			continue
+		}
+		price := pos.Price
+		if price <= 0 {
+			// Broker mark unavailable; fall back to the passed Data-API
+			// price map.
+			price = prices[lv.Symbol]
+		}
+		if price <= 0 {
+			continue // no reliable mark this tick: nothing to do
 		}
 		side := ""
 		reason := ""
@@ -121,22 +141,12 @@ func (m *PositionMonitor) enforceTPSL(ctx context.Context, prices map[string]flo
 		default:
 			continue
 		}
-		pos, err := m.findPosition(ctx, lv.Symbol)
-		if err != nil {
-			m.log().Printf("[monitor] %s: position lookup failed: %v", lv.Symbol, err)
-			continue
-		}
-		if pos == nil || pos.Qty <= 0 {
-			// Position already gone; drop stale levels.
-			_ = m.State.ClearLevel(lv.Symbol)
-			continue
-		}
 		req := tools.OrderRequest{
-			Symbol:        lv.Symbol,
-			Qty:           trimFloat(pos.Qty),
-			Side:          side,
-			Type:          "market",
-			TimeInForce:   "gtc",
+			Symbol:      lv.Symbol,
+			Qty:         trimFloat(pos.Qty),
+			Side:        side,
+			Type:        "market",
+			TimeInForce: "gtc",
 			// Deterministic per (symbol, reason, levels, qty): a retry
 			// after a timeout carries the SAME id so Alpaca rejects the
 			// duplicate instead of double-selling into an accidental
@@ -206,12 +216,12 @@ func (m *PositionMonitor) verifyEquityBrackets(ctx context.Context) error {
 		}
 		stopPrice := round2(lv.StopLoss)
 		req := tools.OrderRequest{
-			Symbol:        sym,
-			Qty:           trimFloat(pos.Qty),
-			Side:          "sell",
-			Type:          "stop",
-			TimeInForce:   "gtc",
-			StopPrice:     strconv.FormatFloat(stopPrice, 'f', 2, 64),
+			Symbol:      sym,
+			Qty:         trimFloat(pos.Qty),
+			Side:        "sell",
+			Type:        "stop",
+			TimeInForce: "gtc",
+			StopPrice:   strconv.FormatFloat(stopPrice, 'f', 2, 64),
 			// Deterministic per (symbol, price, qty): retries after a
 			// timeout dedupe broker-side; a rebuilt stop at a new level
 			// gets a fresh id.
@@ -292,7 +302,18 @@ func (m *PositionMonitor) findPosition(ctx context.Context, symbol string) (*pos
 	for _, p := range ps {
 		if p.Symbol == symbol {
 			q, _ := strconv.ParseFloat(p.Qty, 64)
-			return &positionQty{Qty: q}, nil
+			// Capture the broker's own current mark too. The broker
+			// /positions response carries current_price for every open
+			// position, which is an authoritative, always-present quote
+			// for the TP/SL check — far more reliable than re-fetching
+			// Data-API snapshots in a separate loop (those can be empty
+			// or rate-limited, which is exactly how a crypto TP silently
+			// failed to fire while price was above the bracket).
+			var px float64
+			if cp := strings.TrimSpace(p.CurrentPrice); cp != "" {
+				px, _ = strconv.ParseFloat(cp, 64)
+			}
+			return &positionQty{Qty: q, Price: px}, nil
 		}
 	}
 	return nil, nil
@@ -313,7 +334,13 @@ func (a *alpacaBroker) Place(ctx context.Context, req tools.OrderRequest) (*tool
 	return a.c.PlaceOrder(ctx, req)
 }
 
-type positionQty struct{ Qty float64 }
+type positionQty struct {
+	Qty float64
+	// Price is the position's current mark as reported by the broker
+	// (/positions.current_price). Zero when unavailable; callers fall
+	// back to the Data-API price map in that case.
+	Price float64
+}
 
 func (m *PositionMonitor) log() *log.Logger {
 	if m.Log == nil {
