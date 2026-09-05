@@ -9,8 +9,9 @@
 `ALPACA_BASE_URL` and set `I_ALPACA_LIVE=YES`.
 
 - **Code:** `https://github.com/BROCKUGANDA/alpacaruns`
-- **Live demo:** `https://run.svalley.tech/` *(Cloudflare-fronted;
-  same origin serves the dashboard and the Go JSON API)*
+- **Live demo:** `https://run.svalley.tech/` *(terminates TLS via Caddy +
+  Let's Encrypt on the host; serves the dashboard and the Go JSON API on
+  the same origin)*
 - **API surface:** `GET /api/health`, `GET /api/status`,
   `GET /api/account`, `GET /api/pnl`, `GET /api/trades`,
   `GET /api/decisions`, `GET /api/positions`,
@@ -185,12 +186,38 @@ bring-up. Short version:
    `deploy/alpacaruns.service`).
 3. Run behind a reverse proxy or a Cloudflare Tunnel for HTTPS.
 
-### Cloudflare Tunnel (recommended for demo)
+### Caddy + Let's Encrypt (current live demo)
 
-The live demo at `run.svalley.tech` is fronted by a Cloudflare
-Tunnel so the browser hits `https://run.svalley.tech/api/...` on
-the same origin as the dashboard — no mixed-content failures, no
-CORS hops, automatic TLS.
+The live `run.svalley.tech` demo terminates TLS with **Caddy +
+Let's Encrypt** on the host. `run.svalley.tech` is a DNS-only A record
+→ the host IP, and Caddy owns `:443` (TLS) + `:80` (ACME HTTP-01
+verify + HTTPS redirect), reverse-proxying to the API on
+`127.0.0.1:8080`:
+
+```caddy
+run.svalley.tech {
+    reverse_proxy 127.0.0.1:8080
+}
+```
+
+```bash
+apt-get install -y caddy   # or the official Caddy APT repo
+# run.svalley.tech -> host A record, DNS-only (no Cloudflare proxy)
+# API unit binds 127.0.0.1:8080; Caddy takes :80/:443
+systemctl start caddy      # auto-issues the cert for run.svalley.tech
+```
+
+Same-origin guarantees hold: the dashboard and `/api/*` are served from
+`https://run.svalley.tech` through Caddy, so there are no mixed-content
+or CORS hops. Set `DASHBOARD_TOKEN` in `.env` and
+`--cors-origin https://run.svalley.tech` on the API for the internet
+facing deploy.
+
+### Cloudflare Tunnel (alternative for a tunneled demo)
+
+A Cloudflare Tunnel is a good alternative when you don't want inbound
+ports open — `cloudflared` connects outbound to Cloudflare's edge and
+Cloudflare terminates TLS.
 
 To set up a similar tunnel:
 
