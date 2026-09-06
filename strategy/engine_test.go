@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/BROCKUGANDA/alpacaruns/options"
 	"github.com/BROCKUGANDA/alpacaruns/tools"
 )
 
@@ -229,3 +230,55 @@ var (
 	_ = time.Now
 	_ = tools.Bar{}
 )
+
+// ---- option overlay premium sizing (per-CONTRACT cost) ----
+
+// fakeOptionSource serves one deep-ITM call with a $10/share quote.
+type fakeOptionSource struct{}
+
+func (fakeOptionSource) GetContracts(_ context.Context, _ options.ContractsQuery) ([]options.Contract, string, error) {
+	// Expiry 30 days out so the call always sits inside the planner's
+	// DTE window regardless of when the test runs.
+	expiry := time.Now().UTC().AddDate(0, 0, 30).Format("2006-01-02")
+	return []options.Contract{{
+		Symbol: "AAPL260116C00150000", Type: "call", Tradable: true,
+		ExpirationDate: expiry, RootSymbol: "AAPL",
+	}}, "", nil
+}
+
+func (fakeOptionSource) GetSnapshots(_ context.Context, symbols []string) (map[string]options.Snapshot, error) {
+	out := map[string]options.Snapshot{}
+	for _, s := range symbols {
+		// $9.50 bid / $10.50 ask => $10.00 per-share mid => $1000/contract.
+		out[s] = options.Snapshot{
+			LatestQuote: options.Quote{BidPrice: 9.50, AskPrice: 10.50},
+			Greeks:      options.Greeks{Delta: 0.65},
+		}
+	}
+	return out, nil
+}
+
+// The planner must size contracts against the PER-CONTRACT premium
+// (per-share quote x 100). Regression: the raw per-share mid was passed
+// to SizeOptionContract, sizing ~100x too many contracts and blowing
+// past MAX_POSITION_USD on the premium actually spent.
+func TestOptionPlannerPerContractPremium(t *testing.T) {
+	p, err := NewOptionPlanner(fakeOptionSource{}, Settings{
+		OptDeltaMin: 0.6, OptDeltaMax: 0.7, OptMinDTE: 20, OptMaxDTE: 45,
+	}, Sizing{PositionPct: 0.05, MaxPositionUSD: 10000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	leg, why := p.Plan(context.Background(), "AAPL", 100000)
+	if leg == nil {
+		t.Fatalf("planner skipped: %s", why)
+	}
+	// Budget = min(0.05*100000, 10000) = 5000; per-contract = 1000.
+	// => 5 contracts, NOT 500 (the 100x-oversize bug).
+	if leg.Contracts != 5 {
+		t.Fatalf("want 5 contracts at $1000/contract within $5000 budget, got %d", leg.Contracts)
+	}
+	if leg.Premium != 1000 {
+		t.Fatalf("Premium must be per-contract ($1000), got %g", leg.Premium)
+	}
+}

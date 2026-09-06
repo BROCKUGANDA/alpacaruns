@@ -125,6 +125,63 @@ func (x *Executor) ExecuteEntry(ctx context.Context, p EntryPlan, conf float64) 
 	return nil
 }
 
+// ExecuteOptionEntry places a deep-ITM call entry through the SAME risk
+// gate + balance guard as equity entries. The validator prices OCC
+// proposals with the 100-share multiplier, so MAX_POSITION_USD caps the
+// premium outlay; the balance check confirms the account can fund it
+// before the order goes out. Previously the overlay called PlaceOrder
+// directly — bypassing the risk gate AND the balance check entirely.
+func (x *Executor) ExecuteOptionEntry(ctx context.Context, leg *OptionLeg, conf float64) error {
+	if leg == nil || leg.Contracts < 1 {
+		return fmt.Errorf("option leg needs at least one contract, got %+v", leg)
+	}
+	// Balance guard first: contracts x per-contract premium is the cash
+	// the account must have. Options are cash-settled against buying
+	// power on Alpaca; a shortfall is a guaranteed broker reject — better
+	// to skip with a clear reason than fire a doomed order every tick.
+	outlay := float64(leg.Contracts) * leg.Premium
+	acct, err := x.Client.GetAccount(ctx)
+	if err != nil {
+		return fmt.Errorf("balance check: account unavailable: %w", err)
+	}
+	avail := parseFloatSafe(acct.BuyingPower)
+	if outlay > avail {
+		return fmt.Errorf("balance check: %s premium outlay $%.2f exceeds buying power $%.2f; skipping", leg.OCC, outlay, avail)
+	}
+	req := tools.OrderRequest{
+		Symbol:      leg.OCC,
+		Qty:         strconv.Itoa(leg.Contracts),
+		Side:        "buy",
+		Type:        "market",
+		TimeInForce: "day", // options require day|gtc
+	}
+	// Full deterministic risk gate — same validator, same caps, same
+	// kill-switch. The gate's OCC branch prices via its own PriceSource
+	// (quote mid x 100), which double-checks our outlay estimate.
+	verdict := x.Validator.Validate(risk.Proposal{
+		Symbol: leg.OCC, Side: "buy", Qty: req.Qty,
+		Confidence: &conf, OrderType: req.Type, TimeInForce: req.TimeInForce,
+	})
+	if !verdict.Approved {
+		return fmt.Errorf("risk gate rejected %s option entry: %s", leg.OCC, strings.Join(verdict.Reasons, "; "))
+	}
+	o, err := x.Client.PlaceOrder(ctx, req)
+	if err != nil {
+		return fmt.Errorf("place %s option entry: %w", leg.OCC, err)
+	}
+	x.log().Printf("[strategy] OPTION ENTRY %s x%d premium=%.2f/contract outlay=%.2f order=%s",
+		leg.OCC, leg.Contracts, leg.Premium, outlay, o.ID)
+	if x.Journal != nil {
+		_ = x.Journal.Append(pnl.Record{
+			Kind: pnl.KindDecision, Source: "strategy:auto", Risk: "APPROVED",
+			Confidence: &conf,
+			Detail: fmt.Sprintf("option-entry %s x%d premium=%.2f outlay=%.2f order=%s",
+				leg.OCC, leg.Contracts, leg.Premium, outlay, o.ID),
+		})
+	}
+	return nil
+}
+
 // placeWithBrackets issues the order request. Equities get the bracket
 // envelope merged into the JSON body via a typed extension of
 // OrderRequest — Alpaca accepts unknown-order fields only through the
@@ -165,7 +222,26 @@ func (x *Executor) placeWithBrackets(ctx context.Context, req tools.OrderRequest
 // last daily close; TP/SL children ride the same bracket envelope and
 // only activate once the parent fills at/after the next open. The risk
 // validator's session gate must have PRE_ORDERS enabled or this rejects.
+//
+// Balance-aware: the resting order consumes buying power the moment the
+// market opens, so the account must be able to fund it NOW. Same guard
+// as ExecuteEntry — cash-funded equities checked against buying power,
+// fail closed when the account is unreadable.
 func (x *Executor) ExecutePreOrder(ctx context.Context, p EntryPlan, conf float64) error {
+	notionalUSD := float64(p.Qty) * p.Price
+	if notionalUSD > 0 {
+		acct, err := x.Client.GetAccount(ctx)
+		if err != nil {
+			return fmt.Errorf("balance check: account unavailable: %w", err)
+		}
+		avail := parseFloatSafe(acct.BuyingPower)
+		if avail <= 0 {
+			return fmt.Errorf("balance check: no buying power for %s (bp=%.2f); skipping pre-order", p.Symbol, avail)
+		}
+		if notionalUSD > avail {
+			return fmt.Errorf("balance check: %s pre-order $%.2f exceeds available $%.2f; skipping", p.Symbol, notionalUSD, avail)
+		}
+	}
 	req := tools.OrderRequest{
 		Symbol:      p.Symbol,
 		Side:        "buy",

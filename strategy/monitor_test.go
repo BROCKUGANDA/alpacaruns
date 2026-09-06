@@ -311,3 +311,140 @@ func TestEquityBracketRebuild(t *testing.T) {
 		}
 	})
 }
+
+// ---- intraday track isolation (Track="intraday" levels) ----
+
+// Intraday crypto levels must be enforced by the intraday pass
+// (TickTrack track="intraday") and left alone by the swing pass —
+// regression for the "intraday:" prefix bug where the swing pass wiped
+// intraday levels every tick because the key never matched the broker
+// symbol, disabling intraday TP/SL entirely.
+func TestIntradayTrackEnforcement(t *testing.T) {
+	dir := t.TempDir()
+	kill := agents.NewKillSwitch()
+	m, fb := mkMonitor(t, dir, kill, defSettings())
+	fb.positions = []tools.Position{{
+		Symbol: "BTC/USD", Qty: "0.5", Side: "long",
+		AvgEntry: "50000", CurrentPrice: "56000",
+	}}
+	_ = m.State.SetLevel(PositionLevels{
+		Symbol: "BTC/USD", EntryPrice: 50000,
+		TakeProfit: 54000, StopLoss: 48000, Qty: "0.5", Crypto: true,
+		Track: "intraday",
+	})
+
+	// Swing pass must NOT touch the intraday level...
+	if _, err := m.Tick(context.Background(), map[string]float64{}, 100000); err != nil {
+		t.Fatal(err)
+	}
+	st, _ := m.State.Load()
+	if _, ok := st.Levels["BTC/USD"]; !ok {
+		t.Fatal("swing pass must not clear an intraday-track level")
+	}
+	if len(fb.placed) != 0 {
+		t.Fatalf("swing pass must not close intraday positions, got %+v", fb.placed)
+	}
+	// ...and CryptoLevels (swing view) must not return it either.
+	swing, err := m.State.CryptoLevels()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(swing) != 0 {
+		t.Fatalf("swing CryptoLevels leaked an intraday level: %+v", swing)
+	}
+
+	// Intraday pass must enforce it: price 56000 >= TP 54000 -> close.
+	if _, err := m.TickTrack(context.Background(), map[string]float64{}, 100000, "intraday"); err != nil {
+		t.Fatal(err)
+	}
+	var close *orderCall
+	for i := range fb.placed {
+		if fb.placed[i].Symbol == "BTC/USD" {
+			close = &fb.placed[i]
+		}
+	}
+	if close == nil {
+		t.Fatalf("intraday pass must close on TP breach, got %+v", fb.placed)
+	}
+	if close.Side != "sell" || close.Type != "market" {
+		t.Fatalf("intraday close wrong: %+v", close)
+	}
+	st, _ = m.State.Load()
+	if _, ok := st.Levels["BTC/USD"]; ok {
+		t.Fatal("intraday level must clear after close")
+	}
+}
+
+// Legacy state files with "intraday:SYM" keys must be migrated on load
+// into plain-symbol Track="intraday" levels so their TP/SL starts
+// enforcing after the upgrade instead of being dead keys.
+func TestMigrateIntradayPrefix(t *testing.T) {
+	dir := t.TempDir()
+	jPath := filepath.Join(dir, "trades.jsonl")
+	st := NewStateStore(jPath)
+	legacy := `{
+		"version": 1,
+		"levels": {
+			"intraday:AAPL": {"symbol": "intraday:AAPL", "entry_price": 100,
+				"take_profit": 108, "stop_loss": 96, "qty": "10", "crypto": false},
+			"BTC/USD": {"symbol": "BTC/USD", "entry_price": 50000,
+				"take_profit": 54000, "stop_loss": 48000, "qty": "0.5", "crypto": true}
+		}
+	}`
+	if err := os.WriteFile(filepath.Join(dir, "strategy-state.json"), []byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lv, ok := got.Levels["AAPL"]
+	if !ok {
+		t.Fatalf("legacy intraday key not migrated, levels: %+v", got.Levels)
+	}
+	if lv.Track != "intraday" || lv.Symbol != "AAPL" {
+		t.Fatalf("migration wrong: %+v", lv)
+	}
+	if _, bad := got.Levels["intraday:AAPL"]; bad {
+		t.Fatal("prefixed key must be removed after migration")
+	}
+	// Swing crypto level untouched.
+	if slv, ok := got.Levels["BTC/USD"]; !ok || slv.Track != "" || !slv.Crypto {
+		t.Fatalf("swing level must survive migration: %+v", slv)
+	}
+	// Persist the migration so the next boot loads the clean shape.
+	if err := st.Save(got); err != nil {
+		t.Fatal(err)
+	}
+	again, err := st.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lv2, ok := again.Levels["AAPL"]; !ok || lv2.Track != "intraday" {
+		t.Fatalf("migration not persisted: %+v", again.Levels)
+	}
+}
+
+// ClearLevelTrack must be surgical: a swing exit must not clear an
+// intraday bracket on the same symbol, and vice versa.
+func TestClearLevelTrackIsolation(t *testing.T) {
+	dir := t.TempDir()
+	jPath := filepath.Join(dir, "trades.jsonl")
+	st := NewStateStore(jPath)
+	_ = st.SetLevel(PositionLevels{Symbol: "AAPL", EntryPrice: 100,
+		TakeProfit: 108, StopLoss: 96, Qty: "10", Track: "intraday"})
+	if err := st.ClearLevelTrack("AAPL", ""); err != nil { // swing clear
+		t.Fatal(err)
+	}
+	got, _ := st.Load()
+	if _, ok := got.Levels["AAPL"]; !ok {
+		t.Fatal("swing clear must not remove an intraday-track level")
+	}
+	if err := st.ClearLevelTrack("AAPL", "intraday"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = st.Load()
+	if _, ok := got.Levels["AAPL"]; ok {
+		t.Fatal("intraday clear must remove the intraday-track level")
+	}
+}

@@ -354,12 +354,34 @@ func (e *Engine) PlanEntryFromReference(ctx context.Context, d Decision, portfol
 		Budget: qr.Budget, Price: price, Crypto: IsCrypto(d.Symbol),
 	}
 	if p.Crypto {
+		// Crypto carries local TP/SL levels even on pre-orders: the
+		// monitor enforces them from strategy-state.json.
+		if lv, err := ComputeBrackets(price, e.tpPct, e.slPct); err == nil {
+			p.Brackets = lv
+		}
 		return p, nil
 	}
-	lv, err := ComputeBrackets(price, e.tpPct, e.slPct)
+	// Bracket mode applies to pre-orders too: ATR mode scales TP/SL off
+	// the same reference bar series (the daily bars we already fetched),
+	// falling back to pct when ATR14 is unavailable — same contract as
+	// the live-entry path so a pre-order's protection matches the book.
+	lv, err := e.bracketsFromCloses(d.Symbol, price, bs)
 	if err != nil {
 		return EntryPlan{}, err
 	}
 	p.Brackets = lv
 	return p, nil
+}
+
+// bracketsFromCloses computes TP/SL from an already-fetched bar series,
+// honoring the engine's bracket mode (ATR where possible, pct fallback).
+func (e *Engine) bracketsFromCloses(symbol string, entry float64, bars []tools.Bar) (BracketLevels, error) {
+	if e.bracketMode == "atr" {
+		if atr, ok := ATR14(bars); ok && atr > 0 {
+			return ComputeATRBrackets(entry, atr, e.atrMultTP, e.atrMultSL)
+		}
+		e.log.Printf("[strategy] %s: ATR unavailable on reference bars (%d); falling back to pct brackets",
+			symbol, len(bars))
+	}
+	return ComputeBrackets(entry, e.tpPct, e.slPct)
 }

@@ -214,6 +214,13 @@ func buildAutoLoop(ctx context.Context, cfg *config.Config, set strategy.Setting
 		},
 		Sizing: strategy.Sizing{PositionPct: set.PositionPct, MaxPositionUSD: cfg.MaxPositionUSD},
 		TPPct:  set.TPPct, SLPct: set.SLPct,
+		// Bracket mode is a per-engine strategy knob: the swing engine
+		// must honor BRACKET_MODE=atr exactly like the intraday engine —
+		// previously only the intraday engine received these fields, so
+		// ATR-based breathing stops silently never applied to the main
+		// swing book (it always ran fixed pct brackets).
+		BracketMode: set.BracketMode,
+		ATRMultTP:   set.ATRMultTP, ATRMultSL: set.ATRMultSL,
 	})
 	if err != nil {
 		log.Printf("engine: %v", err)
@@ -543,6 +550,23 @@ func (l *autoLoop) tickIntraday(ctx context.Context, pfv float64) error {
 		return nil
 	}
 
+	// Intraday-book enforcement pass: local crypto TP/SL + bracket
+	// verification restricted to Track="intraday" levels. Previously
+	// intraday levels were never enforced at all (the prefixed key
+	// never matched the broker symbol, so the swing monitor wiped them
+	// on the first tick). Halt evaluation stays on the swing pass.
+	intraPrices := map[string]float64{}
+	if intraHeld := l.intraHeldSymbols(); len(intraHeld) > 0 {
+		for sym := range intraHeld {
+			if px, err := l.intra.PriceOf(ctx, sym); err == nil {
+				intraPrices[sym] = px
+			}
+		}
+		if _, err := l.monitor.TickTrack(ctx, intraPrices, 0, "intraday"); err != nil {
+			log.Printf("[intraday] monitor tick: %v", err)
+		}
+	}
+
 	intraHeld := l.intraHeldSymbols()
 	for _, dec := range l.intra.RunTick(ctx, l.set.IntradaySymbols, intraHeld) {
 		switch dec.Signal {
@@ -582,19 +606,24 @@ func (l *autoLoop) intraEntry(ctx context.Context, dec strategy.Decision, pfv fl
 		log.Printf("[intraday] %s entry rejected/failed: %v", plan.Symbol, err)
 		return
 	}
+	// Levels are stored under the PLAIN symbol with Track="intraday".
+	// The old "intraday:"-prefixed key never matched the broker symbol
+	// in the monitor's position lookup, so the level was wiped on the
+	// first monitor tick after entry — disabling intraday TP/SL and
+	// emptying the held-map (which allowed immediate re-buys).
 	_ = l.State().SetLevel(strategy.PositionLevels{
-		Symbol: "intraday:" + plan.Symbol, EntryPrice: plan.Price,
+		Symbol: plan.Symbol, EntryPrice: plan.Price,
 		TakeProfit: plan.Brackets.TakeProfit, StopLoss: plan.Brackets.StopLoss,
 		Qty: trimNum(float64(plan.Qty)), Since: time.Now().UTC(),
+		Track: "intraday",
 	})
 }
 
 // intraExit closes an intraday position by symbol (live mode only).
 func (l *autoLoop) intraExit(ctx context.Context, dec strategy.Decision, why string) {
-	key := "intraday:" + dec.Symbol
 	qty, err := positionQtyFor(ctx, l.client, dec.Symbol)
 	if err != nil || qty <= 0 {
-		_ = l.State().ClearLevel(key)
+		_ = l.State().ClearLevelTrack(dec.Symbol, "intraday")
 		return
 	}
 	autoJournal(l.journal, fmt.Sprintf("intraday-sell %s qty=%s (%s)", dec.Symbol, trimNum(qty), why),
@@ -614,7 +643,7 @@ func (l *autoLoop) intraExit(ctx context.Context, dec strategy.Decision, why str
 		return
 	}
 	log.Printf("[intraday] EXIT %s qty=%s placed (%s)", dec.Symbol, trimNum(qty), why)
-	_ = l.State().ClearLevel(key)
+	_ = l.State().ClearLevelTrack(dec.Symbol, "intraday")
 }
 
 // flattenIntraday closes every open intraday-book position (EOD).
@@ -623,12 +652,11 @@ func (l *autoLoop) flattenIntraday(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	for sym := range st.Levels {
-		if !strings.HasPrefix(sym, "intraday:") {
+	for sym, lv := range st.Levels {
+		if lv.Track != "intraday" {
 			continue
 		}
-		base := strings.TrimPrefix(sym, "intraday:")
-		l.intraExit(ctx, strategy.Decision{Symbol: base}, "EOD flatten")
+		l.intraExit(ctx, strategy.Decision{Symbol: sym}, "EOD flatten")
 	}
 	return nil
 }
@@ -640,9 +668,9 @@ func (l *autoLoop) intraHeldSymbols() map[string]bool {
 	if err != nil {
 		return held
 	}
-	for sym := range st.Levels {
-		if strings.HasPrefix(sym, "intraday:") {
-			held[strings.TrimPrefix(sym, "intraday:")] = true
+	for sym, lv := range st.Levels {
+		if lv.Track == "intraday" {
+			held[sym] = true
 		}
 	}
 	return held
@@ -831,7 +859,7 @@ func (l *autoLoop) timeBasedClose(ctx context.Context, maxHours float64) {
 	}
 	cutoff := time.Now().UTC().Add(-time.Duration(maxHours * float64(time.Hour)))
 	for sym, lv := range st.Levels {
-		if strings.HasPrefix(sym, "intraday:") {
+		if lv.Track == "intraday" {
 			continue // intraday book has its own EOD flatten
 		}
 		if lv.Since.IsZero() || lv.Since.After(cutoff) {
@@ -1004,7 +1032,7 @@ func (l *autoLoop) handleBuy(ctx context.Context, dec strategy.Decision, pfv, co
 				log.Printf("[auto] DRY-RUN option entry %s x%d (%s)", leg.OCC, leg.Contracts, dec.Symbol)
 				return
 			}
-			if err := placeOptionEntry(ctx, l.client, leg); err != nil {
+			if err := l.exec.ExecuteOptionEntry(ctx, leg, conf); err != nil {
 				log.Printf("[auto] option entry %s failed: %v", leg.OCC, err)
 				return
 			}
@@ -1063,7 +1091,7 @@ func (l *autoLoop) preOrder(ctx context.Context, dec strategy.Decision, pfv, con
 				dec.Symbol, "buy", conf)
 			if l.dryRun {
 				log.Printf("[auto] DRY-RUN PRE-ORDER option %s x%d (%s)", leg.OCC, leg.Contracts, dec.Symbol)
-			} else if err := placeOptionEntry(ctx, l.client, leg); err != nil {
+			} else if err := l.exec.ExecuteOptionEntry(ctx, leg, conf); err != nil {
 				log.Printf("[auto] pre-order option %s failed: %v", leg.OCC, err)
 			} else {
 				log.Printf("[auto] PRE-ORDER OPTION %s x%d for %s", leg.OCC, leg.Contracts, dec.Symbol)
@@ -1115,18 +1143,6 @@ func (l *autoLoop) handleSell(ctx context.Context, dec strategy.Decision) {
 }
 
 // ---- small helpers ----
-
-func placeOptionEntry(ctx context.Context, c *tools.Client, leg *strategy.OptionLeg) error {
-	req := tools.OrderRequest{
-		Symbol:      leg.OCC,
-		Qty:         strconv.Itoa(leg.Contracts),
-		Side:        "buy",
-		Type:        "market",
-		TimeInForce: "day", // options require day|gtc
-	}
-	_, err := c.PlaceOrder(ctx, req)
-	return err
-}
 
 func positionQtyFor(ctx context.Context, c *tools.Client, symbol string) (float64, error) {
 	ps, err := c.GetPositions(ctx)

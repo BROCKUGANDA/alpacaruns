@@ -82,7 +82,10 @@ func (p *OptionPlanner) Plan(ctx context.Context, underlying string, portfolioVa
 	var cands []cand
 	bandMid := (p.DeltaMin + p.DeltaMax) / 2
 	for _, c := range contracts {
-		if !c.Tradable || strings.ToUpper(c.Type) != "call" {
+		// Compare like-for-like: uppercasing the field but not the
+		// literal rejected EVERY candidate ("CALL" != "call"), so the
+		// overlay silently never traded in production.
+		if !c.Tradable || strings.ToUpper(c.Type) != "CALL" {
 			continue
 		}
 		snaps, err := p.Opts.GetSnapshots(ctx, []string{c.Symbol})
@@ -110,15 +113,20 @@ func (p *OptionPlanner) Plan(ctx context.Context, underlying string, portfolioVa
 	sort.Slice(cands, func(i, j int) bool { return cands[i].dist < cands[j].dist })
 
 	best := cands[0]
-	qr := p.Sizing.SizeOptionContract(portfolioValue, best.mid)
+	// Option quotes are PER SHARE; one contract controls 100 shares. The
+	// sizing math needs the per-CONTRACT premium outlay (quote x 100) —
+	// passing the raw per-share mid would size ~100x too many contracts
+	// and blow straight past MAX_POSITION_USD on the premium spent.
+	perContract := best.mid * 100
+	qr := p.Sizing.SizeOptionContract(portfolioValue, perContract)
 	if qr.Qty < 1 {
 		return nil, qr.Skip
 	}
-	p.Log.Printf("[strategy] option overlay %s: %d x %s delta=%.2f premium=%.2f",
-		underlying, qr.Qty, best.c.Symbol, best.delta, best.mid)
+	p.Log.Printf("[strategy] option overlay %s: %d x %s delta=%.2f premium=%.2f/contract (%.2f total)",
+		underlying, qr.Qty, best.c.Symbol, best.delta, perContract, perContract*float64(qr.Qty))
 	return &OptionLeg{
 		OCC: best.c.Symbol, Type: "call", Delta: best.delta,
-		Premium: best.mid, Contracts: qr.Qty, Expiry: best.c.ExpirationDate,
+		Premium: perContract, Contracts: qr.Qty, Expiry: best.c.ExpirationDate,
 	}, ""
 }
 

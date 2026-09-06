@@ -74,35 +74,50 @@ type MonitorResult struct {
 // Tick runs one enforcement pass. prices resolves current marks; clock is
 // injectable for tests (time.Now in production).
 func (m *PositionMonitor) Tick(ctx context.Context, prices map[string]float64, equity float64) (*MonitorResult, error) {
+	return m.TickTrack(ctx, prices, equity, "")
+}
+
+// TickTrack runs one enforcement pass restricted to one book: "" = swing
+// (the default pass the auto loop has always run), "intraday" = the
+// intraday book. Each pass enforces only its own TP/SL levels and equity
+// bracket rebuilds so a swing exit never closes an intraday position
+// through an intraday bracket, and vice versa. Drawdown halts stay
+// global (shared kill switch) — they are evaluated on the swing pass.
+func (m *PositionMonitor) TickTrack(ctx context.Context, prices map[string]float64, equity float64, track string) (*MonitorResult, error) {
 	res := &MonitorResult{}
-	closed, err := m.enforceTPSL(ctx, prices)
+	closed, err := m.enforceTPSL(ctx, prices, track)
 	if err != nil {
 		return res, err
 	}
 	res.Closed = closed
-	if err := m.verifyEquityBrackets(ctx); err != nil {
+	if err := m.verifyEquityBrackets(ctx, track); err != nil {
 		m.log().Printf("[monitor] bracket verification warning: %v", err)
 	}
-	halts := m.checkDrawdown(equity)
-	res.HaltReasons = halts
-	res.HaltEngaged = len(halts) > 0
-	if res.HaltEngaged {
-		m.Kill.Halt()
-		for _, h := range halts {
-			m.log().Printf("[monitor] KILL SWITCH ENGAGED: %s", h)
+	if track != "intraday" {
+		// Drawdown halts engage the SHARED kill switch; running them on
+		// every track pass would double-log the same breach.
+		halts := m.checkDrawdown(equity)
+		res.HaltReasons = halts
+		res.HaltEngaged = len(halts) > 0
+		if res.HaltEngaged {
+			m.Kill.Halt()
+			for _, h := range halts {
+				m.log().Printf("[monitor] KILL SWITCH ENGAGED: %s", h)
+			}
 		}
 	}
 	return res, nil
 }
 
-// enforceTPSL compares open crypto positions against stored levels.
-func (m *PositionMonitor) enforceTPSL(ctx context.Context, prices map[string]float64) ([]string, error) {
+// enforceTPSL compares open crypto positions against stored levels for
+// the given track.
+func (m *PositionMonitor) enforceTPSL(ctx context.Context, prices map[string]float64, track string) ([]string, error) {
 	b := m.broker()
 	var closed []string
 	if b == nil {
 		return closed, nil // test/disabled mode: no broker to close with
 	}
-	levels, err := m.State.CryptoLevels()
+	levels, err := m.State.CryptoLevelsForTrack(track)
 	if err != nil {
 		return nil, fmt.Errorf("load state: %w", err)
 	}
@@ -118,8 +133,9 @@ func (m *PositionMonitor) enforceTPSL(ctx context.Context, prices map[string]flo
 			continue
 		}
 		if pos == nil || pos.Qty <= 0 {
-			// Position already gone; drop stale levels.
-			_ = m.State.ClearLevel(lv.Symbol)
+			// Position already gone; drop stale levels (of THIS track —
+			// the other book may still hold the symbol).
+			_ = m.State.ClearLevelTrack(lv.Symbol, lv.Track)
 			continue
 		}
 		price := pos.Price
@@ -164,7 +180,10 @@ func (m *PositionMonitor) enforceTPSL(ctx context.Context, prices map[string]flo
 		m.log().Printf("[monitor] %s hit %s at %.2f (levels tp=%.2f sl=%.2f): closing order %s",
 			lv.Symbol, reason, price, lv.TakeProfit, lv.StopLoss, o.ID)
 		closed = append(closed, lv.Symbol)
-		_ = m.State.ClearLevel(lv.Symbol)
+		// Clear with the level's OWN track so an intraday close removes
+		// the intraday bracket (and a swing close the swing bracket)
+		// even when both books hold the same symbol.
+		_ = m.State.ClearLevelTrack(lv.Symbol, lv.Track)
 	}
 	sort.Strings(closed)
 	return closed, nil
@@ -173,7 +192,8 @@ func (m *PositionMonitor) enforceTPSL(ctx context.Context, prices map[string]flo
 // verifyEquityBrackets confirms each open equity position with stored
 // levels still has a protective (stop/stop_limit) order open; rebuild a
 // missing one like the reference architecture does after restarts.
-func (m *PositionMonitor) verifyEquityBrackets(ctx context.Context) error {
+// track filters the pass to one book ("" = swing, "intraday").
+func (m *PositionMonitor) verifyEquityBrackets(ctx context.Context, track string) error {
 	b := m.broker()
 	if b == nil {
 		return nil
@@ -195,6 +215,9 @@ func (m *PositionMonitor) verifyEquityBrackets(ctx context.Context) error {
 	}
 	syms := make([]string, 0, len(st.Levels))
 	for sym, lv := range st.Levels {
+		if lv.Track != track {
+			continue
+		}
 		if !lv.Crypto && lv.StopLoss > 0 {
 			syms = append(syms, sym)
 		}
@@ -211,7 +234,7 @@ func (m *PositionMonitor) verifyEquityBrackets(ctx context.Context) error {
 			continue
 		}
 		if pos == nil || pos.Qty <= 0 {
-			_ = m.State.ClearLevel(sym)
+			_ = m.State.ClearLevelTrack(sym, lv.Track)
 			continue
 		}
 		stopPrice := round2(lv.StopLoss)

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -22,6 +23,14 @@ type PositionLevels struct {
 	Qty        string    `json:"qty"`    // broker-side qty string at entry
 	Crypto     bool      `json:"crypto"` // locally-enforced when true
 	Since      time.Time `json:"since"`
+	// Track distinguishes the intraday book from the swing book when
+	// both hold the same symbol. Levels are keyed by the PLAIN symbol
+	// (no prefix): broker positions, the monitor's TP/SL matcher and the
+	// dashboard's since-lookup all match on the venue symbol, and a
+	// prefixed key ("intraday:BTC/USD") never matched any of them —
+	// which silently disabled intraday TP/SL enforcement and wiped the
+	// intraday held-map on every monitor tick. Empty = swing (default).
+	Track string `json:"track,omitempty"`
 }
 
 // State is the persisted strategy-state.json document.
@@ -90,7 +99,31 @@ func (s *StateStore) load() (*State, error) {
 		// rewrite will downgrade to what we know.
 		st.Version = stateVersion
 	}
+	migrateIntradayPrefix(&st)
 	return &st, nil
+}
+
+// migrateIntradayPrefix rewrites legacy "intraday:SYM" level keys into
+// plain-symbol keys with Track="intraday" (the pre-track layout never
+// matched broker symbols in the monitor, so those TP/SL levels were
+// dead). Runs on every load; the rewrite is idempotent and the next
+// Save persists it.
+func migrateIntradayPrefix(st *State) {
+	for key, lv := range st.Levels {
+		if !strings.HasPrefix(key, "intraday:") {
+			continue
+		}
+		base := strings.TrimPrefix(key, "intraday:")
+		delete(st.Levels, key)
+		if base == "" {
+			continue
+		}
+		if lv != nil {
+			lv.Symbol = base
+			lv.Track = "intraday"
+		}
+		st.Levels[base] = lv
+	}
 }
 
 // Save atomically writes the state file (write temp + rename).
@@ -135,13 +168,23 @@ func (s *StateStore) SetLevel(lv PositionLevels) error {
 
 // ClearLevel removes levels for a symbol (after exit fills).
 func (s *StateStore) ClearLevel(symbol string) error {
+	return s.ClearLevelTrack(symbol, "")
+}
+
+// ClearLevelTrack removes levels for a symbol ONLY when they belong to
+// the given track ("" = swing, "intraday"). A swing exit must not clear
+// an intraday bracket on the same symbol, and vice versa; the plain
+// ClearLevel keeps its historical swing-only semantics.
+func (s *StateStore) ClearLevelTrack(symbol, track string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	st, err := s.load()
 	if err != nil {
 		return err
 	}
-	delete(st.Levels, symbol)
+	if lv, ok := st.Levels[symbol]; ok && lv.Track == track {
+		delete(st.Levels, symbol)
+	}
 	return s.saveLocked(st)
 }
 
@@ -163,15 +206,29 @@ func (s *StateStore) Heartbeat(tickNum int64) error {
 }
 
 // CryptoLevels returns locally-enforced levels for every open crypto
-// position, sorted by symbol for deterministic iteration.
+// position, sorted by symbol for deterministic iteration. Intraday-track
+// levels are EXCLUDED from the swing monitor pass: the intraday book
+// flattens EOD and manages its own exits; a shared pass would close a
+// swing position through an intraday bracket (or vice versa).
 func (s *StateStore) CryptoLevels() ([]*PositionLevels, error) {
+	return s.cryptoLevelsByTrack("")
+}
+
+// CryptoLevelsForTrack returns locally-enforced crypto levels for one
+// track: "" = swing, "intraday" = the intraday book. Used by the
+// per-track monitor passes so each book enforces only its own brackets.
+func (s *StateStore) CryptoLevelsForTrack(track string) ([]*PositionLevels, error) {
+	return s.cryptoLevelsByTrack(track)
+}
+
+func (s *StateStore) cryptoLevelsByTrack(track string) ([]*PositionLevels, error) {
 	st, err := s.Load()
 	if err != nil {
 		return nil, err
 	}
 	var out []*PositionLevels
 	for _, lv := range st.Levels {
-		if lv.Crypto {
+		if lv.Crypto && lv.Track == track {
 			out = append(out, lv)
 		}
 	}

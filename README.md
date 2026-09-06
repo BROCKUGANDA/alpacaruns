@@ -188,6 +188,21 @@ pass:
 | Production | One `/positions` fetch per tick (shared across all per-symbol cap checks) instead of one per buy decision — keeps the Alpaca rate budget for the price/bar fetches that matter. |
 | Crypto TP/SL test | Updated to assert the intended behavior (local TP/SL levels persisted for `PositionMonitor` enforcement), un-doing a stale pre-fix expectation. |
 
+### Hardening pass 2: balance-aware entries + TP/SL for both books (2026-09-06)
+
+Every order path is now balance-aware, and TP/SL enforcement is
+track-correct for swing and intraday:
+
+| Area | Fix |
+|---|---|
+| Pre-orders | `ExecutePreOrder` checks buying power BEFORE resting the limit order (a fill at open would otherwise draw on funds the account may not have). Fail closed on account errors. |
+| Option overlay sizing | Option quotes are per SHARE; one contract = 100 shares. The planner now sizes contracts against the per-CONTRACT premium (quote x 100). Previously the raw per-share mid was used, sizing ~100x too many contracts ($10/share -> 500 contracts on a $5k budget = $500k exposure). |
+| Option overlay gating | Option entries went straight to `PlaceOrder`, bypassing the risk gate AND the balance check. New `ExecuteOptionEntry` runs the same validator (OCC notional = qty x 100 x mark) and confirms buying power covers the premium outlay. |
+| Option overlay dead filter | `strings.ToUpper(c.Type) != "call"` compared "CALL" to "call" — every candidate was rejected, so the overlay NEVER traded in production despite `OPTIONS_ENABLED=true`. Fixed to compare like-for-like; covered by regression test. |
+| Swing ATR brackets | `BRACKET_MODE=atr` was wired only into the intraday engine; the swing book silently ran fixed pct brackets. Both engines now honor the mode; pre-order brackets follow it too (ATR off the reference series, pct fallback). |
+| Intraday TP/SL | Intraday levels were stored under `"intraday:SYM"` keys that never matched the broker symbol in the monitor — the swing monitor wiped them on the first tick after entry, so intraday TP/SL never fired and the held-map emptied (allowing instant re-buys). Levels are now stored under the plain symbol with a `track` field; the monitor enforces per-track (`TickTrack`), and legacy prefixed state files are migrated on load. |
+| Track isolation | A swing exit no longer clears an intraday bracket on the same symbol (and vice versa); each book's monitor pass enforces only its own levels. Drawdown halts stay global. |
+
 ## Deployment
 
 See [`deploy/DEPLOY.md`](deploy/DEPLOY.md) for the full 24/7
