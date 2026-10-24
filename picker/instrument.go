@@ -198,6 +198,46 @@ func (r *Registry) Symbols(classes ...Class) []string {
 	return out
 }
 
+// TradableSymbols returns the configured symbols the broker will actually
+// accept an order for.
+//
+// Symbols() returns the classified universe as configured, which is what the
+// picker page should show; this is what the trading loop should SCORE.
+// Without the distinction a delisted, halted or renamed ticker keeps being
+// scored and sized every tick, and only the broker's rejection reveals it —
+// one rejected order per poll, with the level bookkeeping still treating the
+// symbol as live.
+func (r *Registry) TradableSymbols(classes ...Class) []string {
+	want := map[Class]bool{}
+	for _, c := range classes {
+		want[c] = true
+	}
+	var out []string
+	for _, i := range r.instruments {
+		if !i.Tradable {
+			continue
+		}
+		if len(want) == 0 || want[i.Class] {
+			out = append(out, i.Symbol)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// Untradable lists the configured instruments the broker will not trade, so
+// a caller can say why the universe shrank instead of silently trading less.
+func (r *Registry) Untradable() []Instrument {
+	var out []Instrument
+	for _, i := range r.instruments {
+		if !i.Tradable {
+			out = append(out, i)
+		}
+	}
+	sort.Slice(out, func(a, b int) bool { return out[a].Symbol < out[b].Symbol })
+	return out
+}
+
 // Build classifies the configured universe. The broker's asset
 // catalogue supplies the metadata (exchange, tradability, fractional,
 // shortable, and whether a name is a fund); a symbol the catalogue does

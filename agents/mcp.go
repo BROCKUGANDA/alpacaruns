@@ -28,8 +28,8 @@ import (
 // session gets the trading toolsets, whose order tools are wrapped by
 // the deterministic risk gate.
 const (
-	DataToolsetEnv   = "stock-data,crypto-data,options-data,news"
-	ExecToolsetEnv   = "trading,account,assets"
+	DataToolsetEnv = "stock-data,crypto-data,options-data,news"
+	ExecToolsetEnv = "trading,account,assets"
 )
 
 // alpacaToolset connects to Alpaca's official MCP server over stdio
@@ -42,7 +42,8 @@ const (
 // so a live base URL can never be silently downgraded to paper (or the
 // other way round) behind the config's I_ALPACA_LIVE acknowledgement.
 func alpacaToolset(cfg *config.Config, requireConfirmation bool, toolsets string) (tool.Toolset, func(), error) {
-	cmd := exec.Command("uvx", "alpaca-mcp-server")
+	spec := mcpServerSpec(cfg)
+	cmd := exec.Command("uvx", spec)
 	cmd.Env = append(cmd.Environ(),
 		"ALPACA_API_KEY="+cfg.AlpacaKeyID,
 		"ALPACA_SECRET_KEY="+cfg.AlpacaSecret,
@@ -53,6 +54,12 @@ func alpacaToolset(cfg *config.Config, requireConfirmation bool, toolsets string
 	if toolsets != "" {
 		cmd.Env = append(cmd.Env, "ALPACA_TOOLSETS="+toolsets)
 	}
+	// The spec is logged because the guard's whole safety story is a
+	// classification of tool NAMES: an unpinned `uvx alpaca-mcp-server`
+	// silently upgrades to a build whose tool surface nobody reviewed, and
+	// a renamed mutation tool is denied only if its name is recognised as
+	// unknown rather than mistaken for a read.
+	log.Printf("[mcp] launching %s (toolsets=%s, paper=%t)", spec, orNoneToolset(toolsets), isPaperVenue(cfg.AlpacaBaseURL))
 	ts, err := mcptoolset.New(mcptoolset.Config{
 		Transport:           &mcp.CommandTransport{Command: cmd},
 		RequireConfirmation: requireConfirmation,
@@ -301,11 +308,11 @@ func NewValidator(kill risk.HaltSource, cfg *config.Config) *risk.Validator {
 // closed for crypto (acceptable for the manual `trade` path).
 func NewValidatorWithScorer(kill risk.HaltSource, cfg *config.Config, scorer risk.FactorScorer) *risk.Validator {
 	return &risk.Validator{
-		Cfg:      cfg,
-		Kill:     kill,
-		Clock:    marketClock{cfg: cfg},
+		Cfg:       cfg,
+		Kill:      kill,
+		Clock:     marketClock{cfg: cfg},
 		Portfolio: func() (risk.Portfolio, error) { return accountSnapshot(cfg) },
-		Factors:  scorer,
+		Factors:   scorer,
 	}
 }
 
@@ -436,4 +443,27 @@ func accountSnapshot(cfg *config.Config) (risk.Portfolio, error) {
 	equity, _ := strconv.ParseFloat(acct.Equity, 64)
 	pv, _ := strconv.ParseFloat(acct.PortfolioValue, 64)
 	return risk.Portfolio{Equity: equity, PortfolioValue: pv}, nil
+}
+
+// DefaultMCPServerSpec pins the Alpaca MCP server the agents talk to. The
+// version is part of the supply chain, not a detail: the risk guard decides
+// what an agent may do by classifying tool names, so an unannounced upgrade
+// changes the surface the guard was written against. Bump this deliberately
+// after reading the new tool manifest.
+const DefaultMCPServerSpec = "alpaca-mcp-server==2.4.0"
+
+// mcpServerSpec returns the pinned uvx spec, overridable for a deliberate
+// upgrade without a rebuild.
+func mcpServerSpec(cfg *config.Config) string {
+	if cfg != nil && strings.TrimSpace(cfg.AlpacaMCPSpec) != "" {
+		return strings.TrimSpace(cfg.AlpacaMCPSpec)
+	}
+	return DefaultMCPServerSpec
+}
+
+func orNoneToolset(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "(none)"
+	}
+	return s
 }

@@ -134,7 +134,20 @@ func (x *Executor) ExecuteEntry(ctx context.Context, p EntryPlan, conf float64) 
 	x.journalIntent(req, p.Price, score)
 	o, err := x.placeWithBrackets(ctx, req, p)
 	if err != nil {
-		return fmt.Errorf("place %s entry: %w", p.Symbol, err)
+		// A failed POST is not proof the order was not accepted. Ask the
+		// broker by the id we already journalled: if it is there, this was a
+		// lost response, not a lost order — and treating it as failure would
+		// invite a retry that opens a second position.
+		if found, ok := x.resolveSubmission(ctx, req.ClientOrderID, err); ok {
+			x.log().Printf("[strategy] %s: submission outcome resolved to order %s (status %s) — not retrying",
+				p.Symbol, found.ID, found.Status)
+			_ = x.journalAudit("strategy:resolved", p.Symbol, "buy",
+				fmt.Sprintf("submission error resolved by client_order_id %s to order %s (status %s): %v",
+					req.ClientOrderID, found.ID, found.Status, err))
+			o = found
+		} else {
+			return fmt.Errorf("place %s entry: %w", p.Symbol, err)
+		}
 	}
 	x.log().Printf("[strategy] ENTRY %s qty=%s notional=%.2f @~%.4f budget=%.2f crypto=%v tp=%.4f sl=%.4f order=%s",
 		p.Symbol, req.Qty, p.Notional, p.Price, p.Budget, p.Crypto, p.Brackets.TakeProfit, p.Brackets.StopLoss, o.ID)
@@ -386,15 +399,15 @@ func (x *Executor) ExecuteReduce(ctx context.Context, symbol, reason string) (bo
 
 	o, err := x.Client.PlaceOrder(ctx, req)
 	if err != nil {
-		if tools.IsDuplicateClientOrderID(err) {
-			// The broker already holds this exact intent. That is the
-			// idempotency the deterministic id buys: the previous attempt
-			// was submitted and its response was lost. Reporting failure
-			// here would invite a retry with a NEW id, which is how a
-			// double-sell and an unintended short are born.
-			x.log().Printf("[exit] %s: intent %s already at the broker; awaiting reconciliation", symbol, req.ClientOrderID)
+		if found, ok := x.resolveSubmission(ctx, req.ClientOrderID, err); ok {
+			// The broker already holds this exact intent: either it rejected
+			// the id as a duplicate, or the order is there under the id we
+			// journalled. Reporting failure would invite a retry with a NEW
+			// id, which is how a double-sell and an unintended short are born.
+			x.log().Printf("[exit] %s: intent %s already at the broker (order %s, status %s); awaiting reconciliation",
+				symbol, req.ClientOrderID, found.ID, found.Status)
 			_ = x.journalAudit("exit:idempotent", symbol, side, fmt.Sprintf(
-				"duplicate client_order_id %s — the close is already submitted", req.ClientOrderID))
+				"submission resolved to existing order %s (status %s) — the close is already submitted", found.ID, found.Status))
 			return true, nil
 		}
 		return false, fmt.Errorf("place %s exit: %w", symbol, err)
@@ -416,6 +429,29 @@ func (x *Executor) ExecuteReduce(ctx context.Context, symbol, reason string) (bo
 // against a clock it cannot move.
 func exitIntentID(symbol, side, qty, day string) string {
 	return fmt.Sprintf("alp-exit-%s-%s-%s-%s", sanitizeForID(symbol), side, sanitizeForID(qty), day)
+}
+
+// resolveSubmission decides whether a failed order POST was actually a
+// submission that succeeded and lost its response.
+//
+// Both signals are consulted: the broker's duplicate-id rejection (which
+// says "this id already exists") and a lookup by that id (which says "here
+// it is"). Anything else — no id on the request, no match at the broker — is
+// a real failure, and the caller should NOT retry blindly.
+func (x *Executor) resolveSubmission(ctx context.Context, clientOrderID string, postErr error) (*tools.Order, bool) {
+	if x.Client == nil || strings.TrimSpace(clientOrderID) == "" {
+		return nil, false
+	}
+	o, err := x.Client.FindOrderByClientOrderID(ctx, clientOrderID)
+	if err != nil || o == nil {
+		return nil, false
+	}
+	if tools.IsDuplicateClientOrderID(postErr) {
+		return o, true
+	}
+	// A submitted order exists under our id. The POST error may have been a
+	// timeout after the broker had already accepted it.
+	return o, true
 }
 
 // journalAudit writes one exit-path decision row under the given source.
@@ -471,7 +507,12 @@ func (x *Executor) ExecuteOptionEntry(ctx context.Context, leg *OptionLeg, conf 
 	}
 	o, err := x.Client.PlaceOrder(ctx, req)
 	if err != nil {
-		return fmt.Errorf("place %s option entry: %w", leg.OCC, err)
+		if found, ok := x.resolveSubmission(ctx, req.ClientOrderID, err); ok {
+			x.log().Printf("[strategy] %s: option submission resolved to order %s (status %s)", leg.OCC, found.ID, found.Status)
+			o = found
+		} else {
+			return fmt.Errorf("place %s option entry: %w", leg.OCC, err)
+		}
 	}
 	x.log().Printf("[strategy] OPTION ENTRY %s x%d premium=%.2f/contract outlay=%.2f order=%s",
 		leg.OCC, leg.Contracts, leg.Premium, outlay, o.ID)
@@ -575,7 +616,12 @@ func (x *Executor) ExecutePreOrder(ctx context.Context, p EntryPlan, conf float6
 	}
 	o, err := x.placeWithBrackets(ctx, req, p)
 	if err != nil {
-		return fmt.Errorf("place %s pre-order: %w", p.Symbol, err)
+		if found, ok := x.resolveSubmission(ctx, req.ClientOrderID, err); ok {
+			x.log().Printf("[strategy] %s: pre-order submission resolved to order %s (status %s)", p.Symbol, found.ID, found.Status)
+			o = found
+		} else {
+			return fmt.Errorf("place %s pre-order: %w", p.Symbol, err)
+		}
 	}
 	x.log().Printf("[strategy] PRE-ORDER %s qty=%d @limit %.4f budget=%.2f tp=%.4f sl=%.4f order=%s (resting until open)",
 		p.Symbol, p.Qty, p.Price, p.Budget, p.Brackets.TakeProfit, p.Brackets.StopLoss, o.ID)

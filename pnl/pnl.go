@@ -50,12 +50,12 @@ type Record struct {
 	// order was submitted with. Reconciliation uses it to find the intent
 	// (and therefore the entry score) behind a fill the broker reported
 	// after the submitting response was lost.
-	ClientOrderID string  `json:"client_order_id,omitempty"`
-	Symbol        string  `json:"symbol,omitempty"`
-	Side          string  `json:"side,omitempty"` // buy | sell
-	Qty           string  `json:"qty,omitempty"`
-	Price         string  `json:"price,omitempty"`
-	Status        string  `json:"status,omitempty"`
+	ClientOrderID string `json:"client_order_id,omitempty"`
+	Symbol        string `json:"symbol,omitempty"`
+	Side          string `json:"side,omitempty"` // buy | sell
+	Qty           string `json:"qty,omitempty"`
+	Price         string `json:"price,omitempty"`
+	Status        string `json:"status,omitempty"`
 
 	// Decision fields (kind=decision).
 	Confidence *float64 `json:"confidence,omitempty"`
@@ -346,6 +346,20 @@ type book struct {
 	dir   int // +1 long, -1 short, 0 flat
 	lots  []lot
 	stats *SymbolStats
+	// closes records each realised close with the time it happened, so a
+	// window (a day, a week) can ask "what did I actually realise?" instead
+	// of guessing from cash flow. Only populated by RealizedCloses.
+	closes []CloseEvent
+}
+
+// CloseEvent is one realised close: the moment it happened and the P/L the
+// FIFO matching produced. A partially closed lot produces one event per
+// closing FILL, not per lot slice, because that is the unit an account
+// reports.
+type CloseEvent struct {
+	Closed time.Time
+	Symbol string
+	PnL    float64
 }
 
 // Compute replays fills (chronologically; sorted here if timestamps
@@ -378,7 +392,7 @@ func Compute(fills []Record) Stats {
 			b = &book{stats: &SymbolStats{Symbol: r.Symbol}}
 			books[r.Symbol] = b
 		}
-		b.apply(side, qty, price)
+		b.apply(side, qty, price, time.Time{})
 	}
 
 	for _, b := range books {
@@ -395,7 +409,7 @@ func Compute(fills []Record) Stats {
 	return st
 }
 
-func (b *book) apply(side string, qty, price float64) {
+func (b *book) apply(side string, qty, price float64, at time.Time) {
 	b.stats.Fills++
 	sign := 1 // +1 = position-opening direction of this fill
 	if side == "sell" {
@@ -426,6 +440,9 @@ func (b *book) apply(side string, qty, price float64) {
 			}
 		}
 		b.stats.Realized += net
+		if !at.IsZero() {
+			b.closes = append(b.closes, CloseEvent{Closed: at, Symbol: b.stats.Symbol, PnL: net})
+		}
 		if net > 0 {
 			b.stats.Wins++
 		} else if net < 0 {
@@ -649,4 +666,60 @@ func ComparePositions(local map[string]float64, broker map[string]float64) []Dri
 	}
 	sort.Slice(out, func(i, k int) bool { return out[i].Symbol < out[k].Symbol })
 	return out
+}
+
+// RealizedCloses replays the fills through the same FIFO book Compute uses
+// and returns one event per realised close, stamped with the CLOSING fill's
+// time.
+//
+// This exists because a drawdown window must measure realised profit, not
+// cash flow: opening a position moves cash out and moves nothing else, while
+// a naive sum over fills reads it as a same-day loss and can halt the bot on
+// a day of profitable entries. The FIFO is shared with Compute deliberately
+// — two implementations of "what did this trade make" would drift.
+func RealizedCloses(fills []Record) []CloseEvent {
+	books := map[string]*book{}
+	ordered := make([]Record, len(fills))
+	copy(ordered, fills)
+	sort.SliceStable(ordered, func(i, k int) bool {
+		return ordered[i].TS.Before(ordered[k].TS)
+	})
+	for _, r := range ordered {
+		if r.Kind != KindFill {
+			continue
+		}
+		qty, errQ := strconv.ParseFloat(strings.TrimSpace(r.Qty), 64)
+		price, errP := strconv.ParseFloat(strings.TrimSpace(r.Price), 64)
+		side := strings.ToLower(strings.TrimSpace(r.Side))
+		if errQ != nil || errP != nil || qty <= 0 || price < 0 ||
+			(side != "buy" && side != "sell") || strings.TrimSpace(r.Symbol) == "" {
+			continue
+		}
+		b := books[r.Symbol]
+		if b == nil {
+			b = &book{stats: &SymbolStats{Symbol: r.Symbol}}
+			books[r.Symbol] = b
+		}
+		b.apply(side, qty, price, r.TS)
+	}
+	out := make([]CloseEvent, 0)
+	for _, b := range books {
+		out = append(out, b.closes...)
+	}
+	sort.SliceStable(out, func(i, k int) bool { return out[i].Closed.Before(out[k].Closed) })
+	return out
+}
+
+// RealizedBetween sums the realised P/L of closes in [from, to).
+func RealizedBetween(closes []CloseEvent, from, to time.Time) (float64, int) {
+	var sum float64
+	n := 0
+	for _, c := range closes {
+		if c.Closed.Before(from) || !c.Closed.Before(to) {
+			continue
+		}
+		sum += c.PnL
+		n++
+	}
+	return sum, n
 }

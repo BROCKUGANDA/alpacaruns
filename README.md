@@ -874,21 +874,23 @@ orders ungated") are not listed, because they were already true.
 | Cancels assumed | A 2xx from DELETE was treated as cancelled — **measured: 204 returned while the order still listed as accepted** | Cancellation is confirmed by re-reading the order; unconfirmed is an error, and self-heal no longer reports it "repaired" |
 | Sizing truncation | `int(budget/price)` dropped a unit whenever the division landed a hair under an integer | Epsilon-aware floor |
 
+| Drawdown used cash flow | Daily/weekly halts summed fill cash flow, so a BUY read as a same-day loss and a busy entry day could halt the bot without one losing trade | Realised P/L per window from closed round-trips, sharing the FIFO with `pnl.Compute`; unrealised risk stays in the marked-equity total halt |
+| Unknown submission outcome | A timeout after the broker accepted an order was treated as failure, inviting a retry that opens a second position | Every submission is resolved by its journalled `client_order_id` before it can be retried; not found means a real error |
+| Non-tradable symbols | The picker recorded `tradable` but the trading universe ignored it, so delisted/halted/renamed tickers were scored and rejected once per poll | The loop scores `TradableSymbols()` and logs what it excluded |
+| Unpinned MCP server | `uvx alpaca-mcp-server` floated to whatever build PyPI served; the guard classifies tool names, so an unannounced upgrade changes the surface it was written against | Pinned to `alpaca-mcp-server==2.4.0` (override with `ALPACA_MCP_SPEC`), and the spec is logged at launch |
+
 Still open, and deliberately not attempted here: migrating the JSON/JSONL
 state to SQLite (the single-writer split removes the corruption class
-without a rewrite); a full OMS with replace/cancel-replace chains; an
-experiment registry and walk-forward harness (no backtester exists — nothing
-in this repo has ever been validated out-of-sample); reference-data
-versioning for corporate actions and delistings; per-actor operator
-identity; and pinning the Alpaca MCP server version.
-
-One verified defect is knowingly left open, because fixing it changes halt
-semantics and deserves its own pass: the **daily and weekly drawdown halts
-sum fill cash flow, not realized P/L** (`fillPL` returns `-qty*price` for a
-buy), so deploying cash into a new position reads as a same-day loss. The
-total-drawdown halt is unaffected — it uses marked equity. Until this is
-fixed, a day of heavy entry activity can engage the daily halt without a
-single losing trade.
+without a rewrite that would touch every reader while a monitor is live);
+a full OMS with replace/cancel-replace chains (the bot cancels and re-places
+by design, and the ambiguity that matters — a lost response — is now
+resolved by id); an experiment registry and walk-forward harness (no
+backtester exists, so nothing here has been validated out-of-sample, and a
+credible one is its own project); corporate-action metadata beyond
+tradability (splits are handled in the data, but symbol changes, mergers and
+delistings still have no reference-data versioning); per-actor operator
+identity (one shared token, so attribution is by IP and revocation is a
+global rotation); and prompt-injection hardening for news/tool text.
 
 ---
 

@@ -35,10 +35,14 @@ const DefaultOxloModel = "gpt-oss-20b"
 
 // Config holds all runtime settings.
 type Config struct {
-	AlpacaKeyID          string
-	AlpacaSecret         string
-	AlpacaBaseURL        string // trading API; paper by default
-	AlpacaDataURL        string // market data API
+	AlpacaKeyID   string
+	AlpacaSecret  string
+	AlpacaBaseURL string // trading API; paper by default
+	AlpacaDataURL string // market data API
+	// AlpacaMCPSpec overrides the pinned uvx spec for the Alpaca MCP server
+	// (default: agents.DefaultMCPServerSpec). Changing it changes which tools
+	// the risk guard is classifying, so it is an explicit act.
+	AlpacaMCPSpec        string
 	GeminiAPIKey         string
 	Mode                 Mode
 	PollSeconds          int     // monitoring loop interval
@@ -123,6 +127,7 @@ func Load(envFile string) (*Config, error) {
 		AlpacaSecret:  os.Getenv("ALPACA_SECRET_KEY"),
 		AlpacaBaseURL: getEnv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets/v2"),
 		AlpacaDataURL: getEnv("ALPACA_DATA_URL", "https://data.alpaca.markets/v2"),
+		AlpacaMCPSpec: strings.TrimSpace(os.Getenv("ALPACA_MCP_SPEC")),
 		GeminiAPIKey:  os.Getenv("GEMINI_API_KEY"),
 		Mode:          Mode(getEnv("MODE", string(ModeSupervised))),
 	}

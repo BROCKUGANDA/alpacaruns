@@ -146,7 +146,7 @@ func (l *autoLoop) universe(ctx context.Context) []string {
 		out = append(out, l.set.CryptoSymbols...)
 		return out
 	}
-	return reg.Symbols()
+	return reg.TradableSymbols()
 }
 
 // refreshRegistry returns the classified universe, rebuilding it when
@@ -167,6 +167,17 @@ func (l *autoLoop) refreshRegistry(ctx context.Context) (*picker.Registry, error
 	}
 	l.registry = reg
 	l.registryAt = time.Now()
+	// A symbol the broker will not trade is dropped from scoring, and said
+	// out loud: a configured ticker that has been delisted, halted or
+	// renamed otherwise just stops appearing in decisions, which looks
+	// identical to "no signal today".
+	if bad := reg.Untradable(); len(bad) > 0 {
+		names := make([]string, 0, len(bad))
+		for _, i := range bad {
+			names = append(names, i.Symbol)
+		}
+		log.Printf("[auto] excluded %d configured symbol(s) the broker will not trade: %v", len(bad), names)
+	}
 	return reg, nil
 }
 

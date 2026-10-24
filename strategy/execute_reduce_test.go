@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -28,8 +29,12 @@ type exitBroker struct {
 	events    []string         // "GET /positions", "DELETE id", "POST side qty"
 	placeErr  int              // when non-zero, POST returns this status
 	placeBody string           // body to return with placeErr
-	posted    int              // number of POSTs received
-	onPost    func()           // observed at the moment the POST arrives
+	// orderExists lists the order even when the POST errors: a lost response
+	// after the broker accepted it.
+	orderExists bool
+	posted      int              // number of POSTs received
+	bodies      []map[string]any // POST bodies, for the status=all listing
+	onPost      func()           // observed at the moment the POST arrives
 }
 
 func (b *exitBroker) handler(w http.ResponseWriter, r *http.Request) {
@@ -41,6 +46,20 @@ func (b *exitBroker) handler(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(b.positions)
 	case r.Method == http.MethodGet && r.URL.Path == "/orders":
 		b.events = append(b.events, "GET /orders?"+r.URL.RawQuery)
+		if r.URL.Query().Get("status") == "all" {
+			// The broker's own record of what was submitted — this is what
+			// an ambiguous submission is resolved against.
+			list := make([]map[string]any, 0, len(b.bodies))
+			for i, body := range b.bodies {
+				list = append(list, map[string]any{
+					"id": "ord-" + strconv.Itoa(i+1), "client_order_id": body["client_order_id"],
+					"symbol": body["symbol"], "side": body["side"], "qty": body["qty"],
+					"status": "accepted", "filled_qty": "0",
+				})
+			}
+			_ = json.NewEncoder(w).Encode(list)
+			return
+		}
 		if r.URL.Query().Get("status") == "open" {
 			// The protective pair resting on this symbol, which the exit
 			// must clear before selling into it.
@@ -56,6 +75,12 @@ func (b *exitBroker) handler(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		b.events = append(b.events, "POST "+stringOr(body["side"])+" "+stringOr(body["qty"]))
 		b.posted++
+		// Only record what the broker actually holds: a 500 means the order
+		// does not exist, while a 422 duplicate means an earlier submission of
+		// the same id does.
+		if b.placeErr == 0 || b.placeErr == http.StatusUnprocessableEntity || b.orderExists {
+			b.bodies = append(b.bodies, body)
+		}
 		if b.onPost != nil {
 			b.onPost()
 		}
@@ -406,5 +431,48 @@ func TestExecuteReduceWritesIntentBeforeSubmitting(t *testing.T) {
 	}
 	if intentAtCall != 1 {
 		t.Fatalf("at the moment the order was submitted the journal held %d intent rows; a lost response would leave this trade unexplainable", intentAtCall)
+	}
+}
+
+// A timeout after the broker accepted the order is the case that turns one
+// intent into two positions if the caller retries. The response is a failure;
+// the order exists; the correct answer is "already submitted".
+func TestExecuteReduceResolvesLostResponse(t *testing.T) {
+	x, broker, _, j, _ := newExitSetup(t, []map[string]any{pos("NVDA", "3", "900")})
+	broker.mu.Lock()
+	broker.placeErr = http.StatusGatewayTimeout
+	broker.placeBody = `{"message":"gateway timeout"}`
+	broker.orderExists = true // the broker DID accept it; the response was lost
+	broker.mu.Unlock()
+
+	done, err := x.ExecuteReduce(context.Background(), "NVDA", "exit")
+	if err != nil {
+		t.Fatalf("a lost response must not read as a failed close: %v", err)
+	}
+	if !done {
+		t.Fatal("an existing order was reported as nothing to do")
+	}
+	recs, _ := j.Records()
+	var resolved bool
+	for _, r := range recs {
+		if strings.Contains(r.Detail, "already submitted") || strings.Contains(r.Detail, "resolved to existing order") {
+			resolved = true
+		}
+	}
+	if !resolved {
+		t.Fatalf("the resolution was not journalled: %+v", recs)
+	}
+}
+
+// And when the order genuinely does not exist, the caller must see the error
+// rather than a silent success.
+func TestExecuteReduceReportsRealFailure(t *testing.T) {
+	x, broker, _, _, _ := newExitSetup(t, []map[string]any{pos("NVDA", "3", "900")})
+	broker.mu.Lock()
+	broker.placeErr = http.StatusInternalServerError
+	broker.placeBody = `{"message":"boom"}`
+	broker.mu.Unlock()
+	if done, err := x.ExecuteReduce(context.Background(), "NVDA", "exit"); err == nil || done {
+		t.Fatalf("a real failure was reported as done=%v err=%v", done, err)
 	}
 }

@@ -1057,6 +1057,32 @@ func (c *Client) ListRecentOrders(ctx context.Context, limit int) ([]Order, erro
 	return os, nil
 }
 
+// FindOrderByClientOrderID looks for an order by the local identifier it was
+// submitted with, scanning recent broker history.
+//
+// This is how a caller resolves an UNKNOWN submission outcome: a timeout or a
+// dropped connection does not mean the order was not accepted. The alternative
+// — assume failure and retry — is how one intent becomes two orders. A scan
+// is used rather than a dedicated lookup endpoint because the order list is
+// already exercised by reconciliation and its shape is measured against the
+// live paper API.
+func (c *Client) FindOrderByClientOrderID(ctx context.Context, clientOrderID string) (*Order, error) {
+	want := strings.TrimSpace(clientOrderID)
+	if want == "" {
+		return nil, nil
+	}
+	orders, err := c.ListRecentOrders(ctx, 500)
+	if err != nil {
+		return nil, err
+	}
+	for i := range orders {
+		if strings.TrimSpace(orders[i].ClientOrderID) == want {
+			return &orders[i], nil
+		}
+	}
+	return nil, nil
+}
+
 // IsDuplicateClientOrderID reports whether err is Alpaca rejecting a
 // client_order_id that already exists.
 //

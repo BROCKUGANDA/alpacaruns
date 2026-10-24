@@ -78,9 +78,9 @@ func (m *PositionMonitor) broker() BrokerOps {
 type MonitorResult struct {
 	// Adopted lists positions the reconciliation pass newly protected
 	// (or re-anchored to the broker's real average entry).
-	Adopted []string
-	Closed  []string // symbols closed via local TP/SL (crypto, options)
-	Rebuilt []string // equity protective orders re-placed
+	Adopted     []string
+	Closed      []string // symbols closed via local TP/SL (crypto, options)
+	Rebuilt     []string // equity protective orders re-placed
 	HaltEngaged bool
 	HaltReasons []string
 }
@@ -260,15 +260,15 @@ func (m *PositionMonitor) checkDrawdown(equity float64) []string {
 	dayAgo := now.AddDate(0, 0, -1)
 	weekStart := now.AddDate(0, 0, -int(now.Weekday())) // Sunday 00:00 UTC anchor
 
-	realizedDay, realizedWeek := 0.0, 0.0
-	for _, f := range fills {
-		if f.TS.After(dayAgo) {
-			realizedDay += fillPL(f)
-		}
-		if f.TS.After(weekStart) {
-			realizedWeek += fillPL(f)
-		}
-	}
+	// Realised P/L per window, from closed round-trips — not cash flow.
+	// Summing fill cash flow made every BUY read as a same-day loss (it is
+	// money going out, not money lost), so a day of deploying capital could
+	// engage the daily halt without a single losing trade. A position still
+	// open contributes nothing here: its risk shows up in the total-drawdown
+	// number below, which is marked equity.
+	closes := pnl.RealizedCloses(fills)
+	realizedDay, _ := pnl.RealizedBetween(closes, dayAgo, now.Add(time.Minute))
+	realizedWeek, _ := pnl.RealizedBetween(closes, weekStart, now.Add(time.Minute))
 
 	var reasons []string
 	check := func(label string, dd, limit float64) {
@@ -373,18 +373,9 @@ func (m *PositionMonitor) log() *log.Logger {
 	return m.Log
 }
 
-// fillPL approximates per-fill P/L contribution for drawdown math:
-// negative buys reduce cash (risk outlay), positive sells return it.
-// Realized accuracy lives in pnl.Compute; this only needs sign/magnitude.
-func fillPL(r pnl.Record) float64 {
-	q, _ := strconv.ParseFloat(r.Qty, 64)
-	p, _ := strconv.ParseFloat(r.Price, 64)
-	v := q * p
-	if r.Side == "buy" {
-		return -v
-	}
-	return v
-}
+// fillPL was removed with the cash-flow drawdown math: it treated a buy as a
+// loss, which is how a profitable day halted trading. Realised P/L now comes
+// from pnl.RealizedCloses, which shares the FIFO with pnl.Compute.
 
 func trimFloat(f float64) string {
 	return strconv.FormatFloat(f, 'f', -1, 64)
