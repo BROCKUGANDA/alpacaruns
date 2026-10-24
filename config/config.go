@@ -35,22 +35,22 @@ const DefaultOxloModel = "gpt-oss-20b"
 
 // Config holds all runtime settings.
 type Config struct {
-	AlpacaKeyID         string
-	AlpacaSecret        string
-	AlpacaBaseURL       string // trading API; paper by default
-	AlpacaDataURL       string // market data API
-	GeminiAPIKey        string
-	Mode                Mode
-	PollSeconds         int     // monitoring loop interval
-	MinConfidence       float64 // autonomous mode gate
-	MaxPositionUSD      float64 // per-trade cap for equities
+	AlpacaKeyID          string
+	AlpacaSecret         string
+	AlpacaBaseURL        string // trading API; paper by default
+	AlpacaDataURL        string // market data API
+	GeminiAPIKey         string
+	Mode                 Mode
+	PollSeconds          int     // monitoring loop interval
+	MinConfidence        float64 // autonomous mode gate
+	MaxPositionUSD       float64 // per-trade cap for equities
 	CryptoMaxPositionUSD float64 // per-trade cap for crypto notional (BTC/ETH need bigger)
-	MaxPortfolioPct     float64 // max % of portfolio in one position
+	MaxPortfolioPct      float64 // max % of portfolio in one position
 
-	ExtendedHours   bool    // default extended_hours=true on agent orders
-	PreOrders       bool    // queue resting limit/GTC bracket pre-orders while market closed
-	StreamFeed      string  // market-data stream feed: iex | sip
-	TradeLog        string  // path to the JSONL trade log
+	ExtendedHours bool   // default extended_hours=true on agent orders
+	PreOrders     bool   // queue resting limit/GTC bracket pre-orders while market closed
+	StreamFeed    string // market-data stream feed: iex | sip
+	TradeLog      string // path to the JSONL trade log
 
 	// Local LLM (llama.cpp llama-server). When LLMBaseURL is set it takes
 	// precedence over Gemini.
@@ -79,6 +79,13 @@ type Config struct {
 	A2AMode         string   // default ramp position: off | shadow | on
 	A2AMaxNotional  float64  // per-signal USD cap
 	A2AShadowPasses int      // shadow evaluations needed before ramp-on
+	// A2APeerTokens binds a credential to one agent id (agent -> token),
+	// parsed from A2A_PEER_TOKENS=agent:token,agent2:token2. With one
+	// shared token any holder can claim ANY allow-listed agent id —
+	// including one ramped ON, whose signals execute. A peer with its own
+	// token can only be impersonated by someone holding that token; agents
+	// without an entry keep using the shared one.
+	A2APeerTokens map[string]string
 
 	// Learning: the bot recalibrates its own entry bar, sizing and stops
 	// from realized results once enough trades have closed. Every bound
@@ -339,8 +346,17 @@ func Load(envFile string) (*Config, error) {
 	} else {
 		c.A2AShadowPasses = sp
 	}
-	if c.A2AEnabled && strings.TrimSpace(c.A2AToken) == "" {
-		return nil, fmt.Errorf("A2A_ENABLED requires A2A_TOKEN to be set")
+	// Per-peer credentials, "agent:token,agent2:token2". Malformed entries
+	// are an error rather than silently skipped: a peer the operator
+	// believed was bound to its own token but was not would keep accepting
+	// the shared group token.
+	peers, err := parsePeerTokens(os.Getenv("A2A_PEER_TOKENS"))
+	if err != nil {
+		return nil, err
+	}
+	c.A2APeerTokens = peers
+	if c.A2AEnabled && strings.TrimSpace(c.A2AToken) == "" && len(c.A2APeerTokens) == 0 {
+		return nil, fmt.Errorf("A2A_ENABLED requires A2A_TOKEN (or A2A_PEER_TOKENS) to be set: the ingress has no anonymous mode")
 	}
 	c.TradeLog = getEnv("TRADE_LOG", "data/trades.jsonl")
 	feed := strings.ToLower(strings.TrimSpace(getEnv("STREAM_FEED", "iex")))
@@ -398,6 +414,42 @@ func splitCSV(v string) []string {
 		}
 	}
 	return out
+}
+
+// parsePeerTokens reads "agent:token,agent2:token2" into a map.
+//
+// An entry without a colon, or with an empty agent or token, is an error:
+// the whole point of a per-peer credential is that it cannot be silently
+// absent, and quietly dropping the entry would leave that agent accepting
+// the shared token while the operator believes otherwise. A duplicate agent
+// is ambiguous for the same reason and is also rejected.
+func parsePeerTokens(v string) (map[string]string, error) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return nil, nil
+	}
+	out := map[string]string{}
+	for _, part := range strings.Split(v, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		i := strings.Index(part, ":")
+		if i <= 0 || i == len(part)-1 {
+			return nil, fmt.Errorf("A2A_PEER_TOKENS entry %q is not agent:token", part)
+		}
+		agent := strings.TrimSpace(part[:i])
+		token := strings.TrimSpace(part[i+1:])
+		if agent == "" || token == "" {
+			return nil, fmt.Errorf("A2A_PEER_TOKENS entry %q has an empty agent or token", part)
+		}
+		key := strings.ToLower(agent)
+		if _, dup := out[key]; dup {
+			return nil, fmt.Errorf("A2A_PEER_TOKENS lists agent %q twice", agent)
+		}
+		out[key] = token
+	}
+	return out, nil
 }
 
 func getEnv(k, def string) string {

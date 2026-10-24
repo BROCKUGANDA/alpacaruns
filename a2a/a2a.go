@@ -128,13 +128,59 @@ type AgentState struct {
 	LastReason string `json:"last_reason,omitempty"`
 }
 
+// SeenEntry is one signal id's dedupe record.
+//
+// Stamping the payload alongside the id is what makes dedupe mean
+// something: a peer that replays a used id with a DIFFERENT symbol,
+// side or size is not sending the same signal twice, and dropping that
+// silently hides either an authoring bug or an attack. Fingerprint is
+// the hash of the fields that matter (see Fingerprint) — never the
+// payload itself, so the state file holds nothing tradeable.
+//
+// A record whose Fingerprint is empty predates fingerprinting (or came
+// from a state file written by an older binary): the bridge cannot tell
+// whether the payload changed, so it keeps the old behaviour and treats
+// the id as simply used.
+type SeenEntry struct {
+	// At is when the id was first accepted; the retention window prunes
+	// on it.
+	At time.Time `json:"at"`
+	// Fingerprint identifies the payload that arrived with this id.
+	Fingerprint string `json:"fp,omitempty"`
+}
+
+// UnmarshalJSON accepts both the current object form and the legacy
+// form, where a seen id mapped straight to a timestamp. Without it an
+// existing state file would fail to parse and the bridge would refuse
+// everything after an upgrade.
+func (e *SeenEntry) UnmarshalJSON(data []byte) error {
+	var when time.Time
+	if err := json.Unmarshal(data, &when); err == nil {
+		e.At = when
+		e.Fingerprint = ""
+		return nil
+	}
+	type plain SeenEntry
+	var v plain
+	if err := json.Unmarshal(data, &v); err != nil {
+		return fmt.Errorf("seen entry: %w", err)
+	}
+	*e = SeenEntry(v)
+	return nil
+}
+
 // State is the persisted bridge state.
 type State struct {
 	Version int                    `json:"version"`
 	Agents  map[string]*AgentState `json:"agents"`
-	// Seen maps a signal id to the time it was accepted, so a replayed
-	// signal is dropped instead of traded twice.
-	Seen map[string]time.Time `json:"seen"`
+	// Seen maps a signal id to its dedupe record, so a replayed signal is
+	// dropped instead of traded twice, and an id reused for a different
+	// payload is refused instead of quietly swallowed.
+	Seen map[string]SeenEntry `json:"seen"`
+	// Windows holds the accepted-signal timestamps inside the rolling
+	// rate-limit window, per agent. It is the quota's memory: the count
+	// comes from those timestamps, not from a counter that only climbs.
+	Windows map[string][]time.Time `json:"windows,omitempty"`
 	// Pending holds the accepted-but-not-yet-evaluated signals. The bot
 	// drains it once per tick; the dashboard API only reads it.
 	Pending []Signal `json:"pending,omitempty"`
@@ -169,7 +215,7 @@ func (s *Store) loadLocked() (*State, error) {
 	b, err := os.ReadFile(s.path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return &State{Version: 1, Agents: map[string]*AgentState{}, Seen: map[string]time.Time{}}, nil
+			return &State{Version: 1, Agents: map[string]*AgentState{}, Seen: map[string]SeenEntry{}}, nil
 		}
 		return nil, fmt.Errorf("read %s: %w", s.path, err)
 	}
@@ -181,7 +227,7 @@ func (s *Store) loadLocked() (*State, error) {
 		st.Agents = map[string]*AgentState{}
 	}
 	if st.Seen == nil {
-		st.Seen = map[string]time.Time{}
+		st.Seen = map[string]SeenEntry{}
 	}
 	return &st, nil
 }
@@ -199,7 +245,7 @@ func (s *Store) saveLocked(st *State) error {
 		st.Agents = map[string]*AgentState{}
 	}
 	if st.Seen == nil {
-		st.Seen = map[string]time.Time{}
+		st.Seen = map[string]SeenEntry{}
 	}
 	b, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
@@ -262,9 +308,44 @@ func agentState(st *State, id string) *AgentState {
 // pruneSeen drops signal ids older than the retention window so the
 // dedupe map cannot grow without bound.
 func pruneSeen(st *State, olderThan time.Time) {
-	for id, ts := range st.Seen {
-		if ts.Before(olderThan) {
+	for id, entry := range st.Seen {
+		if entry.At.Before(olderThan) {
 			delete(st.Seen, id)
 		}
 	}
+}
+
+// windowHits returns how many of an agent's accepted signals still fall
+// inside the rolling window, pruning the stamps that have aged out. The
+// count is read off the stamps rather than a counter that only ever goes
+// up, which is what makes the limit a window instead of a lifetime cap.
+func windowHits(st *State, agent string, window time.Duration, now time.Time) int {
+	hits := st.Windows[agent]
+	if len(hits) == 0 {
+		return 0
+	}
+	keep := hits[:0:0]
+	for _, at := range hits {
+		if now.Sub(at) < window {
+			keep = append(keep, at)
+		}
+	}
+	if st.Windows == nil {
+		st.Windows = map[string][]time.Time{}
+	}
+	if len(keep) == 0 {
+		delete(st.Windows, agent)
+	} else {
+		st.Windows[agent] = keep
+	}
+	return len(keep)
+}
+
+// stampAccepted records that an agent had a signal accepted at now, so
+// the rolling window can count it.
+func stampAccepted(st *State, agent string, now time.Time) {
+	if st.Windows == nil {
+		st.Windows = map[string][]time.Time{}
+	}
+	st.Windows[agent] = append(st.Windows[agent], now)
 }

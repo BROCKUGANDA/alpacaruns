@@ -18,6 +18,7 @@ import (
 	"errors"
 	"log"
 	"strconv"
+	"time"
 
 	"github.com/BROCKUGANDA/alpacaruns/pnl"
 	"github.com/BROCKUGANDA/alpacaruns/selfheal"
@@ -47,7 +48,11 @@ func (b selfHealBroker) Cancel(ctx context.Context, orderID string) error {
 	if b.client == nil {
 		return context.Canceled
 	}
-	return b.client.CancelOrder(ctx, orderID)
+	// Confirmed, not acknowledged: a 204 from DELETE does not mean the
+	// order stopped resting (measured on the paper account — it still
+	// listed as accepted). Marking a repair "done" on the status code is
+	// how a healer reports an orphan it left in place.
+	return b.client.CancelOrderConfirmed(ctx, orderID, 3*time.Second)
 }
 
 // maybeHeal runs one pass when the tick cadence says so, journals every

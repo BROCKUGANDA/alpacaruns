@@ -77,7 +77,15 @@ type ServerSettings struct {
 	// Path to the JSONL trade log (default data/trades.jsonl).
 	TradeLog string
 	// Path to the JSON state file (default data/strategy-state.json).
+	// READ-ONLY for this process: the bot owns it. Config writes go to
+	// ConfigOverridesFile below.
 	StateFile string
+	// ConfigOverridesFile is the dashboard-owned document the UI's risk
+	// knobs are persisted to (default: config-overrides.json next to
+	// StateFile). The API is its only writer and the bot's next tick
+	// reads it, which is what keeps the two processes from
+	// read-modify-writing one file.
+	ConfigOverridesFile string
 	// Path to the pause flag (default data/paused). File contents
 	// "true" => paused, anything else (including missing) => running.
 	PauseFlag string
@@ -123,13 +131,14 @@ type ServerSettings struct {
 // current working directory.
 func DefaultSettings() ServerSettings {
 	return ServerSettings{
-		Port:        8080,
-		CORSOrigin:  "*",
-		TradeLog:    "data/trades.jsonl",
-		StateFile:   "data/strategy-state.json",
-		PauseFlag:   "data/paused",
-		AllowStep:   true,
-		AllowPause:  true,
+		Port:                8080,
+		CORSOrigin:          "*",
+		TradeLog:            "data/trades.jsonl",
+		StateFile:           "data/strategy-state.json",
+		ConfigOverridesFile: "data/config-overrides.json",
+		PauseFlag:           "data/paused",
+		AllowStep:           true,
+		AllowPause:          true,
 	}
 }
 
@@ -144,6 +153,11 @@ func New(cfg *config.Config, client *tools.Client, set ServerSettings, strat *st
 	}
 	if set.StateFile == "" {
 		set.StateFile = "data/strategy-state.json"
+	}
+	if set.ConfigOverridesFile == "" {
+		// Derive it from the state path so an existing deployment needs no
+		// new flag: data/strategy-state.json -> data/config-overrides.json.
+		set.ConfigOverridesFile = strategy.ConfigOverridesPath(set.StateFile)
 	}
 	if set.PauseFlag == "" {
 		set.PauseFlag = "data/paused"

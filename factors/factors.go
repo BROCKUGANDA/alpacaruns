@@ -16,6 +16,8 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
+	"time"
 
 	"github.com/BROCKUGANDA/alpacaruns/config"
 	"github.com/BROCKUGANDA/alpacaruns/risk"
@@ -124,6 +126,15 @@ func (e *Engine) Score(ctx context.Context, symbol string) (Result, error) {
 		closes[i] = b.Close
 	}
 
+	// Freshness is part of validity. A halted or delisted symbol still
+	// returns its last bars, and a fetch that silently serves a three-week-old
+	// close would let the bot size a BUY off a price nobody is trading at.
+	// The window is per timeframe because "stale" means something different
+	// for a daily bar and a 15-minute one.
+	if err := checkBarFreshness(symbol, daily, e.opts.Timeframe); err != nil {
+		return Result{}, err
+	}
+
 	// Trend and volatility need SMA50 / a 20-return window respectively;
 	// without enough history we cannot judge — report an error rather
 	// than silently scoring blind.
@@ -139,7 +150,16 @@ func (e *Engine) Score(ctx context.Context, symbol string) (Result, error) {
 
 	// Sentiment proxy is best-effort by design: a dead or empty news feed
 	// yields a neutral 0.5 and never fails the whole score.
-	res.Factors["sentiment"] = scoreSentiment(ctx, e.news, symbol)
+	//
+	// With NO source at all the factor is left out of the average rather
+	// than contributing its weight at a neutral 0.5. The deterministic loop
+	// constructs the engine with news=nil, so the second behaviour — which
+	// silently shrank every composite by the sentiment weight — was the
+	// only behaviour production ever saw. A missing factor is not a neutral
+	// observation, and weight that no evidence supports must not vote.
+	if e.news != nil {
+		res.Factors["sentiment"] = scoreSentiment(ctx, e.news, symbol)
+	}
 
 	var num, den float64
 	for name, fr := range res.Factors {
@@ -160,6 +180,55 @@ func (e *Engine) Score(ctx context.Context, symbol string) (Result, error) {
 	}
 	res.Passed = res.Composite >= e.minScore
 	return res, nil
+}
+
+// barFreshnessWindow is how old the most recent bar may be before the
+// series is treated as unusable rather than merely quiet.
+//
+// The daily window covers a long weekend plus a holiday: Friday's close is
+// still the last observation on a Tuesday morning, and refusing that would
+// stop the bot every Monday. Anything older is a halted, delisted or
+// broken-feed symbol, not a market that has not traded yet.
+func barFreshnessWindow(timeframe string) time.Duration {
+	switch strings.ToLower(strings.TrimSpace(timeframe)) {
+	case "", "1day", "1d", "day":
+		return 96 * time.Hour
+	case "1hour", "60min", "1h":
+		return 6 * time.Hour
+	case "15min", "5min", "1min":
+		return 2 * time.Hour
+	}
+	return 96 * time.Hour
+}
+
+// checkBarFreshness refuses a series whose newest bar is too old to trade
+// on. It fails closed like every other data problem in this package: the
+// gate turns a scorer error into a rejection, so a stale symbol is skipped
+// instead of traded at a forgotten price.
+func checkBarFreshness(symbol string, bars []tools.Bar, timeframe string) error {
+	if len(bars) == 0 {
+		return fmt.Errorf("factor scoring %s: no bars returned", symbol)
+	}
+	// tools.Bar carries the venue's epoch-seconds timestamp.
+	stamp := bars[len(bars)-1].Time
+	if stamp <= 0 {
+		return fmt.Errorf("factor scoring %s: newest bar has no timestamp", symbol)
+	}
+	newest := time.Unix(stamp, 0).UTC()
+	age := time.Since(newest)
+	limit := barFreshnessWindow(timeframe)
+	if age > limit {
+		return fmt.Errorf("factor scoring %s: newest %s bar is %s old (limit %s); refusing to score stale data",
+			symbol, orNone(timeframe), age.Round(time.Minute), limit)
+	}
+	return nil
+}
+
+func orNone(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "daily"
+	}
+	return s
 }
 
 // scoreTrend compares the latest close against SMA20/SMA50 of daily

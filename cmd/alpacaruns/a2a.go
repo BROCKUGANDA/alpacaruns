@@ -39,8 +39,24 @@ func (l *autoLoop) processA2A(ctx context.Context, pfv float64) {
 	if len(sigs) == 0 {
 		return
 	}
+	consumed := make([]string, 0, len(sigs))
 	for _, sig := range sigs {
 		l.evaluateA2A(ctx, sig, pfv)
+		consumed = append(consumed, sig.ID)
+	}
+	// Acknowledge everything this tick evaluated. Drain is at-least-once,
+	// so without this a still-valid signal is re-executed on every tick
+	// until it expires — three buys for one 15-minute signal at a 5-minute
+	// poll, and a shadow streak that advances itself.
+	if len(consumed) > 0 {
+		n, err := l.bridge.Ack(consumed...)
+		if err != nil {
+			log.Printf("[a2a] ack failed for %d signal(s); they will be re-evaluated: %v", len(consumed), err)
+			return
+		}
+		if n > 0 {
+			log.Printf("[a2a] consumed %d signal(s) from the bridge queue", n)
+		}
 	}
 }
 
@@ -53,6 +69,15 @@ func (l *autoLoop) evaluateA2A(ctx context.Context, sig a2a.Signal, pfv float64)
 	}
 	if mode == a2a.ModeOff {
 		l.bridge.RecordOutcome(sig.Agent, false, "agent is ramped off")
+		return
+	}
+	// A halt closes new risk to peer agents exactly as it does to the
+	// bot's own signals. The refusal is fed back into the bridge so the
+	// agent's shadow streak does not silently advance while the account is
+	// frozen.
+	if l.exec != nil && l.exec.Kill != nil && l.exec.Kill.Halted() {
+		l.journalA2A(sig, "REJECTED", "kill switch halted: no new exposure accepted")
+		l.bridge.RecordOutcome(sig.Agent, false, "halted: no new exposure accepted")
 		return
 	}
 
@@ -120,6 +145,11 @@ func (l *autoLoop) evaluateA2A(ctx context.Context, sig a2a.Signal, pfv float64)
 	}
 	// Override the sized quantity with the agent's requested budget.
 	plan.Budget = budget
+	// The broker intent is keyed to the SIGNAL id, not to a fresh random
+	// one: if this tick dies after the order is submitted and the signal is
+	// redelivered, the broker refuses the second attempt as a duplicate
+	// client_order_id instead of filling it twice.
+	plan.IntentID = fmt.Sprintf("alp-a2a-%s", sanitizeForOrderID(sig.ID))
 	if plan.Price > 0 {
 		plan.Qty = int(budget / plan.Price)
 		if plan.Qty < 1 {
@@ -162,7 +192,7 @@ func (l *autoLoop) evaluateA2A(ctx context.Context, sig a2a.Signal, pfv float64)
 		l.bridge.RecordOutcome(sig.Agent, true, "dry-run")
 		return
 	}
-	if err := l.exec.ExecuteEntry(ctx, plan, sig.Confidence); err != nil {
+	if err := l.submitEntry(ctx, plan, sig.Confidence); err != nil {
 		l.journalA2A(sig, "REJECTED", "entry failed: "+err.Error())
 		l.bridge.RecordOutcome(sig.Agent, false, "entry failed: "+err.Error())
 		return
@@ -193,12 +223,12 @@ func (l *autoLoop) journalA2A(sig a2a.Signal, risk string, detail string) {
 // riskProposalFor builds the risk-gate proposal for an A2A entry.
 func riskProposalFor(plan strategy.EntryPlan, confidence float64) risk.Proposal {
 	return risk.Proposal{
-		Symbol:     plan.Symbol,
-		Side:       "buy",
-		Qty:        strconv.Itoa(plan.Qty),
-		Notional:   strconv.FormatFloat(plan.Budget, 'f', 2, 64),
-		Confidence: &confidence,
-		OrderType:  "market",
+		Symbol:      plan.Symbol,
+		Side:        "buy",
+		Qty:         strconv.Itoa(plan.Qty),
+		Notional:    strconv.FormatFloat(plan.Budget, 'f', 2, 64),
+		Confidence:  &confidence,
+		OrderType:   "market",
 		TimeInForce: "day",
 	}
 }

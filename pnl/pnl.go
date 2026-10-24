@@ -29,6 +29,14 @@ const (
 	KindFill      = "fill"
 	KindDecision  = "decision"
 	KindReconcile = "reconcile"
+	// KindIntent is written BEFORE an order is submitted, and carries the
+	// client_order_id the submission will use. It exists because broker
+	// acceptance is not a fill: a response lost to a timeout or a crash
+	// leaves an order at the broker with no local record at all. The intent
+	// row is what lets reconciliation match a later fill to the decision
+	// that caused it — including the score, so a recovered trade is still
+	// evidence and not just cash.
+	KindIntent = "intent"
 )
 
 // Record is one line of the JSONL trade log.
@@ -38,11 +46,16 @@ type Record struct {
 
 	// Fill fields (kind=fill).
 	OrderID string `json:"order_id,omitempty"`
-	Symbol  string `json:"symbol,omitempty"`
-	Side    string `json:"side,omitempty"` // buy | sell
-	Qty     string `json:"qty,omitempty"`
-	Price   string `json:"price,omitempty"`
-	Status  string `json:"status,omitempty"`
+	// ClientOrderID ties a fill or an intent to the local identifier the
+	// order was submitted with. Reconciliation uses it to find the intent
+	// (and therefore the entry score) behind a fill the broker reported
+	// after the submitting response was lost.
+	ClientOrderID string  `json:"client_order_id,omitempty"`
+	Symbol        string  `json:"symbol,omitempty"`
+	Side          string  `json:"side,omitempty"` // buy | sell
+	Qty           string  `json:"qty,omitempty"`
+	Price         string  `json:"price,omitempty"`
+	Status        string  `json:"status,omitempty"`
 
 	// Decision fields (kind=decision).
 	Confidence *float64 `json:"confidence,omitempty"`
@@ -122,6 +135,72 @@ func (j *Journal) KnownOrder(orderID string) bool {
 	return ok
 }
 
+// FilledByOrder returns the cumulative quantity already journalled per
+// broker order id.
+//
+// Reconciliation compares this against what the broker says has ACTUALLY
+// filled and journals only the difference. Cumulative quantity — rather
+// than "have I seen this order id" — is what makes the pass idempotent
+// across restarts and correct across partial fills: an order that filled
+// 3 of 10 shares yesterday and 7 today must contribute two rows, not one,
+// and re-running the pass on a settled order must add nothing.
+func (j *Journal) FilledByOrder() (map[string]float64, error) {
+	recs, err := j.Records()
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]float64{}
+	for _, r := range recs {
+		if r.Kind != KindFill || r.OrderID == "" {
+			continue
+		}
+		q, err := strconv.ParseFloat(strings.TrimSpace(r.Qty), 64)
+		if err != nil || q <= 0 {
+			continue
+		}
+		out[r.OrderID] += q
+	}
+	return out, nil
+}
+
+// IntentScore returns the entry score recorded on the intent for a
+// client_order_id, so a fill recovered later still carries the number the
+// bot acted on. Absent (or zero) means unattributed: the learner is built
+// to refuse to invent a score.
+func (j *Journal) IntentScore(clientOrderID string) (float64, bool) {
+	if strings.TrimSpace(clientOrderID) == "" {
+		return 0, false
+	}
+	m, err := j.IntentsByClientOrderID()
+	if err != nil {
+		return 0, false
+	}
+	s, ok := m[clientOrderID]
+	return s, ok
+}
+
+// IntentsByClientOrderID indexes every journalled intent's score by its
+// client_order_id. One pass over the log serves a whole reconciliation
+// tick, which would otherwise re-read the file per recovered fill.
+// Intents with no score are deliberately ABSENT: a recovered fill must not
+// be handed a fabricated 0.00 to calibrate against.
+func (j *Journal) IntentsByClientOrderID() (map[string]float64, error) {
+	recs, err := j.Records()
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]float64{}
+	for _, r := range recs {
+		if r.Kind != KindIntent || r.ClientOrderID == "" {
+			continue
+		}
+		if r.Confidence != nil && *r.Confidence > 0 {
+			out[r.ClientOrderID] = *r.Confidence
+		}
+	}
+	return out, nil
+}
+
 // Records returns every record in the log, oldest first.
 func (j *Journal) Records() ([]Record, error) {
 	j.mu.Lock()
@@ -170,25 +249,68 @@ func readRecords(path string) ([]Record, error) {
 	}
 	defer f.Close()
 	var recs []Record
-	sc := bufio.NewScanner(f)
-	// Same 1 MiB cap as api/journal.go: ensemble decision rows embed the
-	// full per-expert vote trail and can exceed the scanner's 64 KiB
-	// default, which would fail every subsequent read of the log.
-	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	lineNo := 0
-	for sc.Scan() {
-		lineNo++
-		line := strings.TrimSpace(sc.Text())
+	// A crash mid-append leaves a partial FINAL line. Every reader
+	// tolerates that shape, but this one used to fail loudly — and it
+	// runs from Open(), so a single torn row made the trading bot refuse
+	// to start at all: no monitoring, no TP/SL, no halts. Only the last
+	// line is forgiven, and only when the file genuinely lacks a trailing
+	// newline; corruption anywhere else still errors out.
+	lines, err := scanLines(f, path)
+	if err != nil {
+		return recs, err
+	}
+	truncatedTail := fileEndsWithoutNewline(path)
+	for i, raw := range lines {
+		line := strings.TrimSpace(raw)
 		if line == "" {
 			continue
 		}
 		var r Record
 		if err := json.Unmarshal([]byte(line), &r); err != nil {
-			return recs, fmt.Errorf("%s:%d: corrupt record: %w", path, lineNo, err)
+			isLast := i == len(lines)-1
+			if truncatedTail && isLast {
+				break // incomplete tail from an interrupted append: drop it
+			}
+			return recs, fmt.Errorf("%s:%d: corrupt record: %w", path, i+1, err)
 		}
 		recs = append(recs, r)
 	}
-	return recs, sc.Err()
+	return recs, nil
+}
+
+// scanLines reads the log with the same 1 MiB line cap the API reader
+// uses: ensemble decision rows embed the full per-expert vote trail and
+// exceed the scanner's 64 KiB default, which would fail every later read.
+func scanLines(f *os.File, path string) ([]string, error) {
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	var out []string
+	for sc.Scan() {
+		out = append(out, sc.Text())
+	}
+	if err := sc.Err(); err != nil {
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+	return out, nil
+}
+
+// fileEndsWithoutNewline reports whether the file's last byte is not a
+// newline, which is the signature of an interrupted append.
+func fileEndsWithoutNewline(path string) bool {
+	st, err := os.Stat(path)
+	if err != nil || st.Size() == 0 {
+		return false
+	}
+	f, err := os.OpenFile(path, os.O_RDONLY, 0)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	last := make([]byte, 1)
+	if _, err := f.ReadAt(last, st.Size()-1); err != nil {
+		return false
+	}
+	return last[0] != '\n'
 }
 
 // ---- P/L math (pure, unit-testable) ----

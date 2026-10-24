@@ -931,15 +931,19 @@ func TestPostConfigUpdatesAndPersists(t *testing.T) {
 		t.Fatalf("after update max_portfolio_pct = %v, want 0.25", cr.MaxPortfolioPct)
 	}
 
-	// Persisted state file should also reflect the change.
-	// json.MarshalIndent uses "key: value" with a space, so the
-	// substring includes the space.
-	b, err := os.ReadFile(s.settings.StateFile)
+	// The knob write lands in the dashboard's own config-overrides.json,
+	// never in the bot's strategy-state.json. json.MarshalIndent uses
+	// "key: value" with a space, so the substring includes the space.
+	overridesPath := strategy.ConfigOverridesPath(s.settings.StateFile)
+	b, err := os.ReadFile(overridesPath)
 	if err != nil {
-		t.Fatalf("read state file: %v", err)
+		t.Fatalf("read config-overrides file: %v", err)
 	}
 	if !strings.Contains(string(b), `"max_position_usd": 9000`) {
-		t.Fatalf("state file missing new value; got %s", string(b))
+		t.Fatalf("overrides file missing new value; got %s", string(b))
+	}
+	if _, err := os.Stat(s.settings.StateFile); !os.IsNotExist(err) {
+		t.Fatalf("the dashboard must not create or rewrite the bot's state file: %v", err)
 	}
 }
 

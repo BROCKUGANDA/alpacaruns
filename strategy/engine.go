@@ -8,11 +8,11 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/BROCKUGANDA/alpacaruns/factors"
 	"github.com/BROCKUGANDA/alpacaruns/tools"
 )
-
 
 // priceFetcher returns a live mark for one symbol. Production backs it
 // with Alpaca snapshots; tests inject fakes.
@@ -149,7 +149,7 @@ type EngineConfig struct {
 	Sizing        Sizing
 	TPPct         float64
 	SLPct         float64
-	BracketMode   string  // "" | "pct" | "atr" ("" and "pct" are equivalent)
+	BracketMode   string // "" | "pct" | "atr" ("" and "pct" are equivalent)
 	ATRMultTP     float64
 	ATRMultSL     float64
 	Log           *log.Logger
@@ -224,7 +224,15 @@ type EntryPlan struct {
 	// the bot acted on; without it outcomes cannot be mapped to decisions
 	// and nothing is learnable from them.
 	Score float64
+	// IntentID overrides the minted client_order_id with a caller-chosen
+	// stable identifier. The A2A path uses it: a peer's signal carries its
+	// own id, so keying the broker intent to that id means a redelivery
+	// after a mid-tick crash is refused by the broker as a duplicate
+	// instead of becoming a second order. Entries with no IntentID mint a
+	// fresh one, because two legitimate same-day entries must not collide.
+	IntentID string
 }
+
 // PlanEntry sizes an equity/crypto BUY at mark price and computes bracket
 // levels. Crypto brackets are enforced locally (see PositionMonitor)
 // because Alpaca rejects order_class=bracket on crypto orders.
@@ -342,8 +350,27 @@ func (e *Engine) PlanEntryFromReference(ctx context.Context, d Decision, portfol
 		return EntryPlan{}, fmt.Errorf("reference price %s: %w", d.Symbol, err)
 	}
 	bs := bars[d.Symbol]
+	// Sort before trusting the last element. The live factor path sorts; this
+	// reference path took whatever landed last, so an unsorted or paged
+	// response could price a pre-order off an arbitrary bar.
+	sort.Slice(bs, func(i, j int) bool { return bs[i].Time < bs[j].Time })
 	if len(bs) == 0 || bs[len(bs)-1].Close <= 0 {
 		return EntryPlan{}, fmt.Errorf("reference price %s: no recent daily bar", d.Symbol)
+	}
+	// Even the off-hours reference price has a limit. A pre-order is a
+	// resting order that fills on the next open, so a bar from a fortnight
+	// ago would anchor a limit at a price the market left long behind.
+	// Seven days covers a long weekend plus a closure; older is a broken
+	// feed or a delisted symbol, and either way not a price to size on.
+	// A bar with no timestamp cannot be shown fresh, so it is refused too
+	// rather than waved through by the `> 0` guard.
+	stamp := bs[len(bs)-1].Time
+	if stamp <= 0 {
+		return EntryPlan{}, fmt.Errorf("reference price %s: last daily bar has no timestamp", d.Symbol)
+	}
+	if age := time.Since(time.Unix(stamp, 0)); age > 7*24*time.Hour {
+		return EntryPlan{}, fmt.Errorf("reference price %s: last daily bar is %s old; refusing to anchor a pre-order on it",
+			d.Symbol, age.Round(time.Hour))
 	}
 	price := bs[len(bs)-1].Close
 	sizing := e.sizing

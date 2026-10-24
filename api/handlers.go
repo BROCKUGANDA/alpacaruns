@@ -29,6 +29,7 @@ import (
 	"github.com/BROCKUGANDA/alpacaruns/options"
 	"github.com/BROCKUGANDA/alpacaruns/pnl"
 	"github.com/BROCKUGANDA/alpacaruns/risk"
+	"github.com/BROCKUGANDA/alpacaruns/strategy"
 	"github.com/BROCKUGANDA/alpacaruns/tools"
 )
 
@@ -889,14 +890,14 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 // handlePostConfig updates the bot's risk knobs in-process and
-// persists them to the strategy-state file so the bot's next tick
+// persists them to config-overrides.json so the bot's next tick
 // picks up the new values. Validation: extra-forbid (unknown
 // fields 400), out-of-range values 400. Empty body is a 400 — every
 // endpoint that mutates state should require an explicit payload.
 //
 // `?dry_run=true` makes the endpoint validate and return the
 // would-be state WITHOUT persisting — same shape as the live POST,
-// but the strategy-state file is not written and the in-memory cfg
+// but config-overrides.json is not written and the in-memory cfg
 // is left alone. The frontend uses this for a "Preview changes"
 // button that shows operators what a preset would do to the live
 // knobs without committing the change.
@@ -928,7 +929,7 @@ func (s *Server) handlePostConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// dry-run: validate + return the would-be snapshot, do not mutate
-	// the live cfg / strat / strategy-state file. Frontend uses this
+	// the live cfg / strat / config-overrides file. Frontend uses this
 	// for the "Preview changes" button.
 	if r.URL.Query().Get("dry_run") == "true" {
 		writeJSON(w, http.StatusOK, s.snapshotConfigWith(req))
@@ -1031,7 +1032,8 @@ func (s *Server) snapshotConfig() ConfigResponse {
 }
 
 // applyConfigUpdate mutates the live cfg + strat and persists them
-// to the strategy-state file. Validation ranges are deliberately
+// to the dashboard's config-overrides.json (never to the bot's
+// strategy-state.json). Validation ranges are deliberately
 // permissive — we accept anything the bot would accept at startup —
 // but reject negatives, NaN/Inf, and percentages outside [0, 1].
 // A nil cfg/strat means the dashboard brought up without the bot;
@@ -1087,7 +1089,7 @@ func (s *Server) applyConfigUpdate(req ConfigUpdateRequest) error {
 		}
 	}
 	s.cfgMu.Unlock()
-	if s.settings.StateFile != "" {
+	if s.configOverridesPath() != "" {
 		if err := s.persistConfig(); err != nil {
 			log.Printf("[api] persist config: %v", err)
 			return fmt.Errorf("could not persist config: %w", err)
@@ -1096,45 +1098,52 @@ func (s *Server) applyConfigUpdate(req ConfigUpdateRequest) error {
 	return nil
 }
 
-// persistConfig writes the live cfg+strat knobs back to the state
-// file so the bot's next tick reads the new values. Uses merge+write
-// (read existing JSON, overwrite the known keys, write atomically).
-// A missing file is treated as an empty object.
-func (s *Server) persistConfig() error {
-	if err := ensureDataDir(s.settings.StateFile); err != nil {
-		return err
+// configOverridesPath resolves the file the dashboard's knob writes go to.
+// The explicit setting wins; otherwise it is derived from the state path
+// (data/strategy-state.json -> data/config-overrides.json) so existing
+// deployments need no new flag. Empty only when neither is configured.
+func (s *Server) configOverridesPath() string {
+	if p := strings.TrimSpace(s.settings.ConfigOverridesFile); p != "" {
+		return p
 	}
-	cur := map[string]any{}
-	if b, err := os.ReadFile(s.settings.StateFile); err == nil && len(b) > 0 {
-		// A file containing the literal "null" unmarshals into a nil map;
-		// writing to it panics. Start from an empty map in that case.
-		_ = json.Unmarshal(b, &cur)
-		if cur == nil {
-			cur = map[string]any{}
-		}
+	if p := strings.TrimSpace(s.settings.StateFile); p != "" {
+		return strategy.ConfigOverridesPath(p)
+	}
+	return ""
+}
+
+// persistConfig writes the live cfg+strat knobs to the dashboard's OWN
+// config-overrides.json, atomically and whole.
+//
+// It deliberately never reads or writes strategy-state.json. The old
+// version did a cross-process read-modify-write of the bot's document:
+// read it at T0, the bot wrote a crypto TP/SL level or the drawdown peak
+// at T1, this process renamed its stale T0 snapshot over it at T2 — and
+// the bot's CryptoLevelsForTrack enforcement then found nothing to
+// enforce. One writer per file removes that window entirely.
+func (s *Server) persistConfig() error {
+	path := s.configOverridesPath()
+	if path == "" {
+		return nil
+	}
+	if err := ensureDataDir(path); err != nil {
+		return err
 	}
 	s.cfgMu.RLock()
-	defer s.cfgMu.RUnlock()
+	ov := strategy.ConfigOverrides{}
 	if s.cfg != nil {
-		cur["max_position_usd"] = s.cfg.MaxPositionUSD
-		cur["max_portfolio_pct"] = s.cfg.MaxPortfolioPct
-		cur["crypto_max_position_usd"] = s.cfg.CryptoMaxPositionUSD
-		cur["min_confidence"] = s.cfg.MinConfidence
+		ov.MaxPositionUSD = s.cfg.MaxPositionUSD
+		ov.MaxPortfolioPct = s.cfg.MaxPortfolioPct
+		ov.CryptoMaxPositionUSD = s.cfg.CryptoMaxPositionUSD
+		ov.MinConfidence = s.cfg.MinConfidence
 	}
 	if s.strat != nil {
-		cur["daily_dd_halt"] = s.strat.DailyDD
-		cur["weekly_dd_halt"] = s.strat.WeeklyDD
-		cur["total_dd_halt"] = s.strat.TotalDD
+		ov.DailyDDHalt = s.strat.DailyDD
+		ov.WeeklyDDHalt = s.strat.WeeklyDD
+		ov.TotalDDHalt = s.strat.TotalDD
 	}
-	b, err := json.MarshalIndent(cur, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmp := s.settings.StateFile + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, s.settings.StateFile)
+	s.cfgMu.RUnlock()
+	return strategy.SaveConfigOverrides(path, ov)
 }
 
 func validPositive(v, max float64) bool {
@@ -1204,6 +1213,16 @@ func (s *Server) handleTradeExecute(w http.ResponseWriter, r *http.Request) {
 	if err := validateProposalShape(req); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_input", err.Error())
 		return
+	}
+	// Prove the account belongs to the venue the URL claims before a manual
+	// order goes out. A paper URL plus live keys is the failure mode this
+	// closes: every other check in the process would pass while the order
+	// landed in the live account.
+	if s.client != nil && s.cfg != nil {
+		if _, err := s.client.VerifyVenue(r.Context(), tools.ExpectPaperVenue(s.cfg.AlpacaBaseURL)); err != nil {
+			writeError(w, http.StatusServiceUnavailable, "venue_mismatch", err.Error())
+			return
+		}
 	}
 	verdict := s.validateProposal(req)
 
@@ -1294,16 +1313,18 @@ func validateProposalShape(req TradeProposalRequest) error {
 // to enforce portfolio-percentage and kill-switch rules, and those
 // only exist when the strategy engine is loaded alongside the cfg.
 // When the dashboard is running cold (no strategy yet, e.g. before
-// the bot has booted, or during a serve-only bring-up), we fall
-// through to shape-only validation so the UI can still demo
-// the simulate/execute flow without a panic.
+// the bot has booted, or during a serve-only bring-up), this used to
+// return Approved — a fail-OPEN gate on the one endpoint that places a
+// real order from the dashboard. The comment justified it with "the bot's
+// own validator guards the auto path", which is true of the bot's path and
+// irrelevant to a manual order placed here. An approval nobody computed is
+// not a check: it is the absence of one, wearing the same struct.
 func (s *Server) validateProposal(req TradeProposalRequest) riskVerdict {
 	if s.cfg == nil || s.strat == nil {
-		// Cold-start bring-up: no live validator wired. Approve when
-		// the input shape is valid; this is intentionally permissive
-		// because the server-side fail-closed guarantee comes from
-		// the bot's own validator on the auto path.
-		return riskVerdict{Approved: true, Notional: 0}
+		return riskVerdict{
+			Approved: false,
+			Reasons:  []string{"risk configuration is not loaded in this process; refusing to approve an order no validator examined"},
+		}
 	}
 	v := s.buildValidator(priceFromRequest(req))
 	proposal := risk.Proposal{
@@ -1351,9 +1372,9 @@ type riskVerdict struct {
 func (s *Server) buildValidator(fallbackPrice float64) *risk.Validator {
 	halt := &serverHaltSource{paused: &s.pauseFlag}
 	v := &risk.Validator{
-		Cfg:   s.cfg,
-		Kill:  halt,
-		Clock: s.marketClock(),
+		Cfg:    s.cfg,
+		Kill:   halt,
+		Clock:  s.marketClock(),
 		Prices: apiPriceSource{client: s.client, fallback: fallbackPrice},
 	}
 	// Portfolio hook: when a real Alpaca client is wired, validate

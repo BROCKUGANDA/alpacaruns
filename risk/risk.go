@@ -60,6 +60,11 @@ type PriceSource interface {
 // multiplier: one contract controls 100 shares.
 const OptionContractMultiplier = 100.0
 
+// reduceQtyEpsilon absorbs float noise when comparing a reducing order's
+// quantity against the live holding. It sits far below any tradable size,
+// so a difference this small means "same number", never "still owed".
+const reduceQtyEpsilon = 1e-9
+
 // Proposal is one candidate order awaiting validation. OrderType and
 // TimeInForce feed the extended-hours session check; empty values are
 // treated as a plain market/gtc order.
@@ -72,6 +77,18 @@ type Proposal struct {
 	OrderType     string // market | limit | stop | ...
 	TimeInForce   string // day | gtc | ioc | fop | ...
 	ExtendedHours bool   // caller explicitly requested extended hours
+	// Reducing asserts that this order closes or shrinks exposure the
+	// account already holds rather than creating new exposure. It is not a
+	// permission slip: when set, the validator PROVES it against a live
+	// position read through Holdings, and refuses the order if the
+	// quantity would oversell the position or flip its sign.
+	//
+	// The exemptions it does buy are the ones that must never apply to
+	// risk reduction: the kill switch, the confidence floor, the factor
+	// gate and the exposure caps. A halt exists to stop the bot taking
+	// more risk; blocking the flatten while halted leaves the position
+	// unprotected by the very control meant to protect it.
+	Reducing bool
 }
 
 // Verdict is the outcome of validating a proposal. Factors is nil
@@ -113,11 +130,46 @@ type Validator struct {
 	Kill      HaltSource
 	Clock     MarketClock      // optional: nil disables the market-hours check
 	Positions ExistingPosition // optional: nil treats existing exposure as zero
+	// Exposure is the fail-closed form of Positions: it reports whether the
+	// book could be read at all. When set, an unreadable book REFUSES the
+	// order instead of sizing it against zero — the difference between a
+	// cap and a guess. It takes precedence over Positions.
+	Exposure func(symbol string) (float64, error)
+	// Holdings returns the SIGNED live quantity held in a symbol (+long,
+	// -short). It is what makes a Reducing assertion provable rather than
+	// self-declared. When Reducing is asserted with no Holdings source
+	// wired, the order is REJECTED: an exit that cannot be shown to be
+	// reducing is indistinguishable from a short sale.
+	Holdings  func(symbol string) (float64, error)
 	Portfolio func() (Portfolio, error)
 	Prices    PriceSource  // optional: nil uses Alpaca snapshots; fails closed on error
 	Factors   FactorScorer // optional: nil keeps single-confidence behavior; when set BOTH gates must pass
 
 	ctx context.Context // per-call context for price fetches; Background when unset
+}
+
+// existingExposure returns the USD already committed to a symbol.
+//
+// Preference order is a safety choice, not style: the error-returning
+// Exposure source wins because it can say "unknown", and unknown must
+// reject. The plain Positions source is kept for callers that predate it;
+// when NEITHER is wired the caller gets an error rather than a silent zero,
+// because a cap evaluated against a book nobody looked at is decoration.
+func (v *Validator) existingExposure(symbol string) (float64, error) {
+	if symbol == "" {
+		return 0, nil
+	}
+	if v.Exposure != nil {
+		usd, err := v.Exposure(symbol)
+		if err != nil {
+			return 0, err
+		}
+		return math.Abs(usd), nil
+	}
+	if v.Positions != nil {
+		return math.Abs(v.Positions(symbol)), nil
+	}
+	return 0, fmt.Errorf("no exposure source wired")
 }
 
 // priceSource returns the configured source, constructing the default
@@ -212,8 +264,9 @@ func (v *Validator) Validate(p Proposal) Verdict {
 		}
 	}
 
-	// 1. Kill switch: nothing trades while halted.
-	if v.Kill != nil && v.Kill.Halted() {
+	// 1. Kill switch: nothing trades while halted — except an order that
+	// reduces risk, which the halt must never block (see Proposal.Reducing).
+	if !p.Reducing && v.Kill != nil && v.Kill.Halted() {
 		reasons = append(reasons, "kill switch engaged")
 	}
 
@@ -260,14 +313,46 @@ func (v *Validator) Validate(p Proposal) Verdict {
 	qty := parsePositive(p.Qty)
 	notional := parsePositive(p.Notional)
 
-	// 3b. Multi-factor gate: when a FactorScorer is wired in, the proposal
+	// 3b. Proving a reducing order. The claim is the caller's; the position
+	// is the broker's. Every exemption below rests on this being true, so
+	// an unprovable "reducing" assertion is refused outright.
+	if p.Reducing {
+		switch {
+		case v.Holdings == nil:
+			reasons = append(reasons, "reducing order refused: no live holdings source wired, cannot prove it reduces exposure")
+		default:
+			live, err := v.Holdings(sym)
+			held := math.Abs(live)
+			switch {
+			case err != nil:
+				reasons = append(reasons, fmt.Sprintf("reducing order refused: position unreadable (%v)", err))
+			case live == 0:
+				reasons = append(reasons, fmt.Sprintf("reducing order refused: no %s position to reduce", sym))
+			case side == "sell" && live < 0:
+				reasons = append(reasons, fmt.Sprintf("reducing sell refused: %s is short %.6f, selling would ADD exposure", sym, live))
+			case side == "buy" && live > 0:
+				reasons = append(reasons, fmt.Sprintf("reducing buy refused: %s is long %.6f, buying would ADD exposure", sym, live))
+			case qty <= 0:
+				reasons = append(reasons, "reducing order must carry a positive qty")
+			case qty > held+reduceQtyEpsilon:
+				reasons = append(reasons, fmt.Sprintf(
+					"reducing order oversells: qty %.6f exceeds the %.6f held in %s", qty, held, sym))
+			}
+		}
+	}
+
+	// 3c. Multi-factor gate: when a FactorScorer is wired in, the proposal
 	// must clear BOTH the LLM confidence threshold AND the composite
 	// factor score (FACTOR_MIN_SCORE). Rejection reasons name every
 	// failing factor with its score. Scorer errors reject — fail closed.
 	// The gate runs BEFORE the confidence check so that a proposal with
 	// no self-reported confidence can inherit the deterministic score.
+	//
+	// Skipped for a proven reducing order: the factor score decides whether
+	// to TAKE exposure. It has no bearing on whether to close exposure, and
+	// a stale or failing scorer must not be able to hold a position shut.
 	var factorRes *FactorResult
-	if v.Factors != nil {
+	if v.Factors != nil && !p.Reducing {
 		fr, err := v.Factors.ScoreFactors(v.contextOrBackground(), sym)
 		if err != nil {
 			reasons = append(reasons, fmt.Sprintf("factor scoring unavailable (%v)", err))
@@ -290,10 +375,26 @@ func (v *Validator) Validate(p Proposal) Verdict {
 	// has no confidence parameter), so the MCP guard derives it from the
 	// deterministic factor composite before validating. With no
 	// confidence at all there is nothing to judge, so reject.
-	if p.Confidence == nil {
-		reasons = append(reasons, "missing confidence score")
-	} else if *p.Confidence < v.Cfg.MinConfidence {
-		reasons = append(reasons, fmt.Sprintf("confidence %.2f < minimum %.2f", *p.Confidence, v.Cfg.MinConfidence))
+	//
+	// Skipped for a proven reducing order: an exit is not a bet, and a
+	// missing confidence number must never strand a position.
+	if !p.Reducing {
+		if p.Confidence == nil {
+			reasons = append(reasons, "missing confidence score")
+		} else if *p.Confidence < v.Cfg.MinConfidence {
+			reasons = append(reasons, fmt.Sprintf("confidence %.2f < minimum %.2f", *p.Confidence, v.Cfg.MinConfidence))
+		}
+	}
+
+	// 4b. A proven reducing order stops here. The remaining steps size and
+	// cap NEW exposure, and both need a live price and a live account read
+	// to do it — a snapshot outage or an account-echo failure must not be
+	// able to strand a position that the account already agrees should be
+	// closed. The reducing proof above is what makes leaving early safe:
+	// the order cannot oversell, cannot flip the position's sign, and adds
+	// no exposure by construction.
+	if p.Reducing {
+		return Verdict{Approved: len(reasons) == 0, Reasons: reasons, Notional: 0, Factors: factorRes}
 	}
 
 	// 5. Sizing. The USD exposure of the order must be computed from real
@@ -330,7 +431,7 @@ func (v *Validator) Validate(p Proposal) Verdict {
 		reasons = append(reasons, fmt.Sprintf("account unavailable (%v)", err))
 		return Verdict{Approved: false, Reasons: reasons}
 	}
-	if notional > 0 {
+	if notional > 0 && !p.Reducing {
 		perCap := v.Cfg.MaxPositionUSD
 		if isCrypto {
 			perCap = v.Cfg.CryptoMaxPositionUSD
@@ -351,9 +452,15 @@ func (v *Validator) Validate(p Proposal) Verdict {
 				reasons = append(reasons, fmt.Sprintf("notional %.2f is %.1f%% of portfolio, exceeds cap %.1f%%",
 					notional, 100*notional/base, 100*v.Cfg.MaxPortfolioPct))
 			}
-			// Additive exposure: existing stake in this symbol plus the new order.
-			if v.Positions != nil && sym != "" {
-				existing := math.Abs(v.Positions(sym))
+			// Additive exposure: existing stake in this symbol plus the new
+			// order. With only a per-order percentage, N positions each
+			// under the cap produce a book far above it, so this check is
+			// the portfolio-level half of the gate rather than a refinement.
+			existing, err := v.existingExposure(sym)
+			switch {
+			case err != nil:
+				reasons = append(reasons, fmt.Sprintf("existing exposure unreadable (%v); cannot size against an unknown book", err))
+			case existing > 0 || sym != "":
 				if (existing+notional)/base > v.Cfg.MaxPortfolioPct {
 					reasons = append(reasons, fmt.Sprintf("combined exposure %.2f (%.1f%% of portfolio) exceeds cap %.1f%%",
 						existing+notional, 100*(existing+notional)/base, 100*v.Cfg.MaxPortfolioPct))
@@ -364,7 +471,6 @@ func (v *Validator) Validate(p Proposal) Verdict {
 
 	return Verdict{Approved: len(reasons) == 0, Reasons: reasons, Notional: notional, Factors: factorRes}
 }
-
 
 // sortedFactorNames returns factor names in deterministic order so
 // rejection reasons are stable for logs and tests.

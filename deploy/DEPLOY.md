@@ -14,16 +14,22 @@ Config refuses to start a live-URL session without that acknowledgement.
     running (`[monitor] recovered from panic: ...` in the logs).
   - On boot it reconciles local books against live Alpaca positions and
     appends a `reconcile` record (with any drift) to the trade log.
-  - Two live streams run alongside the monitor loop: the market-data
+  - Two live streams run alongside the **`monitor`** loop: the market-data
     stream (feed per `STREAM_FEED`, standard watchlist) ingests
     trades/quotes/bars into the logs, and the account trade_updates
     stream journals each order fill to the trade log the moment it
-    arrives — P/L is live without waiting for `pl`'s backfill. Fill
-    journaling deduplicates by Alpaca order ID, so fills already recorded
-    by a cycle or an earlier backfill are never double-counted. A stream
-    that fails to connect or dies permanently is logged and skipped; the
-    monitor loop keeps running and `pl --since ...` backfill remains the
-    safety net.
+    arrives. Fill journaling deduplicates by Alpaca order ID, so fills
+    already recorded by a cycle or an earlier backfill are never
+    double-counted. A stream that fails to connect or dies permanently is
+    logged and skipped; the monitor loop keeps running and `pl --since ...`
+    backfill remains the safety net.
+  - **`auto` (the shipped production unit) runs no streams.** It polls REST
+    every `POLL_SECONDS`, and it closes the fill gap a different way: every
+    intent is journalled before the order is submitted, and each tick
+    reconciles the broker's order list against the journal, writing any
+    fill the journal is missing (measured before this pass: two filled
+    entry orders at the broker, zero fill rows in the log). Do not expect
+    `trade_updates` lines from the `auto` unit.
 - `alpacaruns auto` — the deterministic no-LLM trading loop (see
   [Deterministic auto mode](#deterministic-auto-mode-no-llm) below).
   Runs 24/7 like `monitor`; SIGINT/SIGTERM stops it cleanly and the

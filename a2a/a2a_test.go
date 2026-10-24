@@ -14,11 +14,16 @@ func testBridge(t *testing.T, cfg Config) *Bridge {
 
 func sampleSignal() Signal {
 	return Signal{
-		ID:         "sig-1",
-		Agent:      "research",
-		Symbol:     "AAPL",
-		Side:       "buy",
-		Qty:        "10",
+		ID:     "sig-1",
+		Agent:  "research",
+		Symbol: "AAPL",
+		Side:   "buy",
+		Qty:    "10",
+		// The bridge will not accept a qty-only signal while a notional
+		// cap is configured (it cannot price one — see parseNotional),
+		// so the shared fixture carries the exposure the cap is checked
+		// against. Ramp tests are about the ramp, not the cap.
+		Notional:   "500",
 		Confidence: 0.8,
 		Reason:     "momentum",
 	}

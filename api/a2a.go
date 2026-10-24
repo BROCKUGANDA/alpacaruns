@@ -1,7 +1,6 @@
 package api
 
 import (
-	"crypto/subtle"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -72,9 +71,11 @@ func (s *Server) handleA2ASignal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// The bearer token is mandatory: an unauthenticated signal endpoint
-	// is an open order pipeline.
-	auth := strings.TrimSpace(r.Header.Get("Authorization"))
-	if auth == "" {
+	// is an open order pipeline. This first gate only asks "is this
+	// caller a peer at all" — the group token or any peer's own token —
+	// so an unknown token is refused before a single byte of the body is
+	// parsed.
+	if strings.TrimSpace(r.Header.Get("Authorization")) == "" {
 		writeError(w, http.StatusUnauthorized, "unauthorized", "a2a signals require a bearer token")
 		return
 	}
@@ -90,6 +91,16 @@ func (s *Server) handleA2ASignal(w http.ResponseWriter, r *http.Request) {
 	var req A2ASignalRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_json", "signal body is not valid JSON")
+		return
+	}
+	// An agent id in the body is a CLAIM, not an identity. Now that the
+	// claim is known, check it against the credential that is allowed to
+	// make it: a peer with its own token may only be spoken for by that
+	// token, so one shared bridge token can no longer post as an agent
+	// ramped on.
+	bearer, _ := bearerToken(r)
+	if !s.validA2AIdentity(req.Agent, bearer) {
+		writeError(w, http.StatusUnauthorized, "unauthorized", "a2a token does not belong to this agent")
 		return
 	}
 	sig := a2a.Signal{
@@ -170,18 +181,31 @@ func truncateText(s string, n int) string {
 }
 
 // a2aConfig builds the bridge configuration from the loaded config.
+//
+// Two fields are deliberately not read from config here:
+//   - MaxPending: a2a.NewBridge supplies the default cap, so every bridge
+//     construction path (this API and the bot's loop) gets the same queue
+//     bound without each caller having to remember it.
+//   - PeerTokens: per-peer credentials would need an env/config key, and
+//     config parsing belongs to another workstream. Until that key
+//     exists, PeerTokens stays nil and the bridge keeps today's
+//     single-token behaviour. Set it here once the config carries it —
+//     the enforcement in validA2AIdentity already works either way.
 func a2aConfig(cfg *config.Config) a2a.Config {
 	if cfg == nil {
 		return a2a.Config{}
 	}
 	return a2a.Config{
-		Enabled:         cfg.A2AEnabled,
-		Token:           cfg.A2AToken,
-		Agents:          cfg.A2AAgents,
-		DefaultMode:     a2a.Mode(cfg.A2AMode),
-		ShadowPasses:    cfg.A2AShadowPasses,
-		MaxNotional:     cfg.A2AMaxNotional,
+		Enabled:           cfg.A2AEnabled,
+		Token:             cfg.A2AToken,
+		Agents:            cfg.A2AAgents,
+		DefaultMode:       a2a.Mode(cfg.A2AMode),
+		ShadowPasses:      cfg.A2AShadowPasses,
+		MaxNotional:       cfg.A2AMaxNotional,
 		MaxSignalsPerHour: 60,
+		// Peer tokens bind a credential to one agent id, so a shared
+		// group token cannot post as an agent ramped ON.
+		PeerTokens: cfg.A2APeerTokens,
 	}
 }
 
@@ -190,26 +214,44 @@ func parseRFC3339(s string) (time.Time, error) {
 	return time.Parse(time.RFC3339, strings.TrimSpace(s))
 }
 
-// validA2AToken compares the request's bearer token against the
-// bridge's own token. The bridge has its own credential: peer agents
-// must not need the dashboard's operator token, and the dashboard's
-// token must not be handed to another system.
+// validA2AToken reports whether the request carries ANY credential the
+// bridge accepts: the shared group token, or one peer's own token. It is
+// the pre-body gate, so it deliberately does not decide which agent the
+// caller may speak for — validA2AIdentity does that once the body is
+// known.
 func (s *Server) validA2AToken(r *http.Request) bool {
-	want := strings.TrimSpace(s.a2aCfg.Token)
-	if want == "" {
+	bearer, ok := bearerToken(r)
+	if !ok {
 		return false
 	}
+	return s.a2aCfg.MatchAnyToken(bearer)
+}
+
+// validA2AIdentity binds the sender to the credential. The claimed agent
+// is checked against the bridge's configuration (a2a.Config.Authenticate):
+// an agent that has a peer token of its own may only be posted as with
+// that token, and the shared group token is refused for it. When no
+// per-peer tokens are configured the group token still carries every
+// allow-listed agent, which is today's behaviour.
+func (s *Server) validA2AIdentity(agent, bearer string) bool {
+	return s.a2aCfg.Authenticate(agent, bearer)
+}
+
+// bearerToken pulls the bearer credential out of the Authorization
+// header. ok is false when the header is missing, not a bearer scheme,
+// or carries an empty token.
+func bearerToken(r *http.Request) (string, bool) {
 	h := r.Header.Get("Authorization")
 	if h == "" {
-		return false
+		return "", false
 	}
 	parts := strings.SplitN(h, " ", 2)
 	if len(parts) != 2 || !strings.EqualFold(strings.TrimSpace(parts[0]), "bearer") {
-		return false
+		return "", false
 	}
 	got := strings.TrimSpace(parts[1])
 	if got == "" {
-		return false
+		return "", false
 	}
-	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+	return got, true
 }

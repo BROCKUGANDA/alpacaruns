@@ -2,8 +2,10 @@ package strategy
 
 import (
 	"context"
+	"crypto/rand"
 	"fmt"
 	"log"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -117,6 +119,19 @@ func (x *Executor) ExecuteEntry(ctx context.Context, p EntryPlan, conf float64) 
 	if !verdict.Approved {
 		return fmt.Errorf("risk gate rejected %s entry: %s", p.Symbol, strings.Join(verdict.Reasons, "; "))
 	}
+	// The intent is written BEFORE the order is submitted, and carries the
+	// client_order_id the submission will use.
+	//
+	// Broker acceptance is not a fill, and a lost response is not a
+	// failure: an order can be accepted and filled after the HTTP call
+	// times out or the process dies. Without a durable intent the only
+	// record of that trade is a position the bot cannot explain — no fill
+	// row, so the drawdown halts see zero realized P/L and the learner has
+	// no evidence. With one, the reconciliation pass can match the broker's
+	// order back to this decision, including the score that justified it.
+	score := entryScoreOf(p.Score, conf)
+	req.ClientOrderID = x.newIntentID(p, score)
+	x.journalIntent(req, p.Price, score)
 	o, err := x.placeWithBrackets(ctx, req, p)
 	if err != nil {
 		return fmt.Errorf("place %s entry: %w", p.Symbol, err)
@@ -124,9 +139,9 @@ func (x *Executor) ExecuteEntry(ctx context.Context, p EntryPlan, conf float64) 
 	x.log().Printf("[strategy] ENTRY %s qty=%s notional=%.2f @~%.4f budget=%.2f crypto=%v tp=%.4f sl=%.4f order=%s",
 		p.Symbol, req.Qty, p.Notional, p.Price, p.Budget, p.Crypto, p.Brackets.TakeProfit, p.Brackets.StopLoss, o.ID)
 	if x.Journal != nil {
-		score := entryScoreOf(p.Score, conf)
 		rec := pnl.Record{
 			Kind: pnl.KindDecision, Source: "strategy:auto", Risk: "APPROVED",
+			ClientOrderID: req.ClientOrderID,
 			Detail: fmt.Sprintf("entry %s qty=%s notional=%.2f price=%.4f tp=%.4f sl=%.4f crypto=%t order=%s",
 				p.Symbol, req.Qty, p.Notional, p.Price, p.Brackets.TakeProfit, p.Brackets.StopLoss, p.Crypto, o.ID),
 		}
@@ -135,6 +150,10 @@ func (x *Executor) ExecuteEntry(ctx context.Context, p EntryPlan, conf float64) 
 			rec.Confidence = &sc
 		}
 		_ = x.Journal.Append(rec)
+		// Optimistic path: the response already carries the fill. When it
+		// does not (accepted, or partially filled), reconciliation recovers
+		// the rest — journalFill is deliberately not the only way a fill
+		// reaches the ledger.
 		x.journalFill(o, score)
 	}
 	if p.Crypto {
@@ -184,20 +203,230 @@ func (x *Executor) journalFill(o *tools.Order, entryScore float64) {
 		return
 	}
 	rec := pnl.Record{
-		Kind:    pnl.KindFill,
-		OrderID: o.ID,
-		Symbol:  o.Symbol,
-		Side:    strings.ToLower(o.Side),
-		Qty:     o.FilledQty,
-		Price:   price,
-		Status:  o.Status,
-		TS:      time.Now().UTC(),
+		Kind:          pnl.KindFill,
+		OrderID:       o.ID,
+		ClientOrderID: o.ClientOrderID,
+		Symbol:        o.Symbol,
+		Side:          strings.ToLower(o.Side),
+		Qty:           o.FilledQty,
+		Price:         price,
+		Status:        o.Status,
+		TS:            time.Now().UTC(),
 	}
 	if entryScore > 0 {
 		sc := entryScore
 		rec.Confidence = &sc
 	}
 	_ = x.Journal.Append(rec)
+}
+
+// newIntentID returns the client_order_id for one intended submission.
+//
+// A plan that carries its own IntentID keeps it: the A2A path keys the
+// intent to the peer's signal id, so a redelivery after a crash is refused
+// by the broker as a duplicate instead of filling twice.
+//
+// Otherwise the id is unique per intent, not derived from the order's
+// content: two identical entries on the same day are legitimate (the crypto
+// book scales in), and a content hash would have the broker reject the
+// second one. Stability across a single attempt is what matters — the id is
+// journalled before the POST, so a lost response is still traceable, and
+// Alpaca enforces uniqueness (measured: a reused id returns HTTP 422 code
+// 42210000), so the same intent can never be submitted twice.
+func (x *Executor) newIntentID(p EntryPlan, score float64) string {
+	if id := strings.TrimSpace(p.IntentID); id != "" {
+		return id
+	}
+	const kind = "entry"
+	var b [6]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// A clock fallback is still unique enough in practice: it is
+		// combined with the symbol, and the broker will refuse a collision
+		// rather than double-fill.
+		return fmt.Sprintf("alp-%s-%s-%d", kind, sanitizeForID(p.Symbol), time.Now().UnixNano())
+	}
+	return fmt.Sprintf("alp-%s-%s-%d-%x", kind, sanitizeForID(p.Symbol), time.Now().Unix(), b)
+}
+
+// sanitizeForID makes a symbol safe to embed in a client_order_id
+// (Alpaca allows alphanumerics, dash and underscore, up to 128 chars).
+func sanitizeForID(s string) string {
+	var out strings.Builder
+	for _, r := range strings.ToUpper(strings.TrimSpace(s)) {
+		switch {
+		case r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			out.WriteRune(r)
+		default:
+			out.WriteRune('-')
+		}
+	}
+	id := out.String()
+	if len(id) > 32 {
+		id = id[:32]
+	}
+	return id
+}
+
+// journalIntent writes the durable record of an intended submission.
+func (x *Executor) journalIntent(req tools.OrderRequest, markPrice, score float64) {
+	if x.Journal == nil {
+		return
+	}
+	rec := pnl.Record{
+		Kind:          pnl.KindIntent,
+		Source:        "strategy:auto",
+		ClientOrderID: req.ClientOrderID,
+		Symbol:        req.Symbol,
+		Side:          strings.ToLower(req.Side),
+		Qty:           req.Qty,
+		Price:         strconv.FormatFloat(markPrice, 'f', 4, 64),
+		Detail:        fmt.Sprintf("intent %s %s qty=%s notional=%s @~%.4f", req.Side, req.Symbol, req.Qty, req.Notional, markPrice),
+	}
+	if score > 0 {
+		sc := score
+		rec.Confidence = &sc
+	}
+	_ = x.Journal.Append(rec)
+}
+
+// ExecuteReduce places ONE risk-reducing order: the whole position (or the
+// whole short) in a symbol, proven against a fresh broker read.
+//
+// This is the exit authority. Every path that wants a position gone — the
+// signal-driven sell, the max-hold close, the profit-target rebalancer,
+// the intraday flatten — calls here instead of assembling an order by hand,
+// because the four things this function does in order are exactly what the
+// hand-built versions kept getting wrong:
+//
+//  1. the quantity comes from a FRESH position read, never from a cached
+//     tick snapshot or a stored level (a stale number here is an oversold
+//     account and an unintended short);
+//  2. resting protection is cancelled BEFORE the exit, because a surviving
+//     bracket or OCO leg fires against a flat account and reopens exposure
+//     on the other side;
+//  3. the order is validated by the same gate as an entry, but asserted
+//     Reducing — which proves it cannot oversell and exempts it from the
+//     policies that exist to stop new risk, not to stop risk leaving;
+//  4. the client_order_id is deterministic on (symbol, side, qty, UTC day),
+//     so a retry after a lost response is refused by the broker as a
+//     duplicate instead of becoming a second sell.
+func (x *Executor) ExecuteReduce(ctx context.Context, symbol, reason string) (bool, error) {
+	if x.Client == nil {
+		return false, fmt.Errorf("no broker client wired")
+	}
+	positions, err := x.Client.GetPositions(ctx)
+	if err != nil {
+		return false, fmt.Errorf("live positions: %w", err)
+	}
+	var held float64
+	var mark float64
+	var found bool
+	for _, p := range positions {
+		if !tools.SameSymbol(p.Symbol, symbol) {
+			continue
+		}
+		q, err := strconv.ParseFloat(strings.TrimSpace(p.Qty), 64)
+		if err != nil {
+			return false, fmt.Errorf("unreadable position qty for %s: %q", symbol, p.Qty)
+		}
+		if q == 0 {
+			continue
+		}
+		held, found = q, true
+		mark, _ = strconv.ParseFloat(strings.TrimSpace(p.CurrentPrice), 64)
+		symbol = p.Symbol // trade the broker's own symbol form
+		break
+	}
+	if !found {
+		// Nothing to close. Clearing the level is the useful action: a
+		// stored level with no position behind it is what makes the monitor
+		// chase a ghost every tick.
+		if x.State != nil {
+			_ = x.State.ClearLevel(symbol)
+		}
+		return false, nil
+	}
+	side := "sell"
+	if held < 0 {
+		side = "buy"
+	}
+	qty := math.Abs(held)
+	qtyStr := strconv.FormatFloat(qty, 'f', -1, 64)
+
+	// Protection first. A failure here is logged and carried on past: the
+	// exit is the risk-reducing action, and the reconcile pass re-places
+	// protection for any position left exposed by a failed close.
+	if n, err := x.Client.CancelOrdersForSymbol(ctx, symbol); err != nil {
+		x.log().Printf("[exit] %s: resting protection could not be cleared (%v); exiting anyway — reconcile will re-protect if this close fails", symbol, err)
+		_ = x.journalAudit("exit:protect", symbol, side, fmt.Sprintf(
+			"protection not cancelled before %s close (%v); reconcile pass will re-derive", reason, err))
+	} else if n > 0 {
+		x.log().Printf("[exit] %s: cleared %d resting protective order(s) before the close", symbol, n)
+		_ = x.journalAudit("exit:protect", symbol, side, fmt.Sprintf(
+			"cancelled %d resting protective order(s) before close (%s)", n, reason))
+	}
+
+	tif := "gtc"
+	if tools.IsOCCSymbol(symbol) {
+		tif = "day" // options reject other values
+	}
+	req := tools.OrderRequest{
+		Symbol: symbol, Side: side, Type: "market", TimeInForce: tif, Qty: qtyStr,
+		ClientOrderID: exitIntentID(symbol, side, qtyStr, time.Now().UTC().Format("20060102")),
+	}
+	verdict := x.Validator.Validate(risk.Proposal{
+		Symbol: symbol, Side: side, Qty: qtyStr,
+		OrderType: req.Type, TimeInForce: req.TimeInForce,
+		Reducing: true, // proven, not asserted: see risk.Validator.Holdings
+	})
+	if !verdict.Approved {
+		return false, fmt.Errorf("risk gate refused the %s exit: %s", symbol, strings.Join(verdict.Reasons, "; "))
+	}
+	x.journalIntent(req, mark, 0)
+
+	o, err := x.Client.PlaceOrder(ctx, req)
+	if err != nil {
+		if tools.IsDuplicateClientOrderID(err) {
+			// The broker already holds this exact intent. That is the
+			// idempotency the deterministic id buys: the previous attempt
+			// was submitted and its response was lost. Reporting failure
+			// here would invite a retry with a NEW id, which is how a
+			// double-sell and an unintended short are born.
+			x.log().Printf("[exit] %s: intent %s already at the broker; awaiting reconciliation", symbol, req.ClientOrderID)
+			_ = x.journalAudit("exit:idempotent", symbol, side, fmt.Sprintf(
+				"duplicate client_order_id %s — the close is already submitted", req.ClientOrderID))
+			return true, nil
+		}
+		return false, fmt.Errorf("place %s exit: %w", symbol, err)
+	}
+	x.log().Printf("[exit] %s %s qty=%s order=%s (%s)", symbol, side, qtyStr, o.ID, reason)
+	_ = x.journalAudit("exit:approved", symbol, side, fmt.Sprintf(
+		"%s qty=%s order=%s reason=%q", symbol, qtyStr, o.ID, reason))
+	if x.State != nil {
+		_ = x.State.ClearLevel(symbol)
+	}
+	x.journalFill(o, 0) // the synchronous fast path; reconciliation owns the late half
+	return true, nil
+}
+
+// exitIntentID is deterministic on (symbol, side, qty, UTC day) so a repeat
+// of the same close dedupes at the broker rather than becoming a second
+// sell. The day is a parameter rather than a hidden clock read: the whole
+// value of the id is its stability, and a test cannot assert stability
+// against a clock it cannot move.
+func exitIntentID(symbol, side, qty, day string) string {
+	return fmt.Sprintf("alp-exit-%s-%s-%s-%s", sanitizeForID(symbol), side, sanitizeForID(qty), day)
+}
+
+// journalAudit writes one exit-path decision row under the given source.
+func (x *Executor) journalAudit(source, symbol, side, detail string) error {
+	if x.Journal == nil {
+		return nil
+	}
+	return x.Journal.Append(pnl.Record{
+		Kind: pnl.KindDecision, Source: source, Risk: "APPROVED",
+		Symbol: symbol, Side: side, Detail: detail,
+	})
 }
 
 // ExecuteOptionEntry places a deep-ITM call entry through the SAME risk

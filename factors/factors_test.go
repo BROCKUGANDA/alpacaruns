@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"testing"
+	"time"
 
 	"github.com/BROCKUGANDA/alpacaruns/config"
 	"github.com/BROCKUGANDA/alpacaruns/tools"
@@ -54,7 +55,10 @@ func dailyBars(closes []float64, vol int64) []tools.Bar {
 		}
 		price = c
 		bars[i] = tools.Bar{
-			Time: int64(i) * testDay,
+			// Fresh fixtures: the scorer refuses a series whose newest bar is
+			// older than the freshness window, so a fixed 1970 epoch would
+			// test the rejection path instead of the maths under test.
+			Time: time.Now().Add(-time.Duration(len(closes)-1-i) * 24 * time.Hour).Unix(),
 			Open: c, High: c, Low: c, Close: c,
 			Volume: vol,
 		}

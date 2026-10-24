@@ -3,6 +3,7 @@ package strategy
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/BROCKUGANDA/alpacaruns/tools"
 )
@@ -24,10 +25,10 @@ func (f refBarsFake) GetBars(_ context.Context, symbols []string, _, _, _ string
 // last daily close when snapshots are unusable (off-hours pre-orders).
 func TestPlanEntryFromReference(t *testing.T) {
 	e, err := NewEngine(EngineConfig{
-		Scorer:        fakeScorer{},
-		Prices:        fakePrices{px: map[string]float64{}}, // snapshots empty off-hours
+		Scorer: fakeScorer{},
+		Prices: fakePrices{px: map[string]float64{}}, // snapshots empty off-hours
 		ReferenceBars: refBarsFake{bars: map[string][]tools.Bar{
-			"AAPL": {{Close: 200}, {Close: 202.5}},
+			"AAPL": {{Time: time.Now().Add(-24 * time.Hour).Unix(), Close: 200}, {Time: time.Now().Unix(), Close: 202.5}},
 		}},
 		Sizing: Sizing{PositionPct: 0.05, MaxPositionUSD: 10000},
 		TPPct:  0.08, SLPct: 0.04,
@@ -74,7 +75,8 @@ func TestPlanEntryFromReferenceATRMode(t *testing.T) {
 		if i >= 58 {
 			c = 200 + 0.5*float64(i-57) // 200, 200.5, 201
 		}
-		bars[i] = tools.Bar{Time: int64(i) * 86400, Open: c, High: c + 0.1, Low: c - 0.1, Close: c, Volume: 1000}
+		bars[i] = tools.Bar{Time: time.Now().Add(-time.Duration(len(bars)-1-i) * 24 * time.Hour).Unix(),
+			Open: c, High: c + 0.1, Low: c - 0.1, Close: c, Volume: 1000}
 	}
 	e, err := NewEngine(EngineConfig{
 		Scorer:        fakeScorer{},
@@ -82,8 +84,8 @@ func TestPlanEntryFromReferenceATRMode(t *testing.T) {
 		ReferenceBars: refBarsFake{bars: map[string][]tools.Bar{"AAPL": bars}},
 		Sizing:        Sizing{PositionPct: 0.05, MaxPositionUSD: 10000},
 		TPPct:         0.08, SLPct: 0.04,
-		BracketMode:   "atr",
-		ATRMultTP:     3.0, ATRMultSL: 2.0,
+		BracketMode: "atr",
+		ATRMultTP:   3.0, ATRMultSL: 2.0,
 	})
 	if err != nil {
 		t.Fatal(err)

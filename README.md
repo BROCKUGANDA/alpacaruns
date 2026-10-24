@@ -300,6 +300,7 @@ A2A_AGENTS=research,scanner # allow-list of peer agent ids
 A2A_MODE=off              # default ramp position for a newly seen agent
 A2A_MAX_NOTIONAL=10000    # per-signal USD cap
 A2A_SHADOW_PASSES=3       # approved shadow evaluations needed to ramp on
+A2A_PEER_TOKENS=research:r-secret,analyst:a-secret  # optional per-agent credentials
 ```
 
 ### Posting a signal
@@ -309,15 +310,29 @@ curl -X POST http://localhost:8080/api/a2a/signals \
   -H "Authorization: Bearer $A2A_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"id":"sig-1","agent":"research","symbol":"AAPL","side":"buy",
-       "qty":"10","confidence":0.82,"reason":"momentum"}'
+       "notional":"3200","confidence":0.82,"reason":"momentum"}'
 ```
 
 ```json
 {"accepted": true, "mode": "shadow", "reason": "accepted in shadow mode; no order will be placed"}
 ```
 
-The `id` is an idempotency key: a replayed signal is dropped, not
-traded twice.
+Send **notional**, not qty. The bridge has no market-data client (pricing
+and sizing belong to the risk gate), so it cannot compute the exposure of a
+qty-only signal — and a cap it cannot evaluate is not a cap. With
+`A2A_MAX_NOTIONAL` set, a qty-only signal is refused rather than waved
+through; the refusal names the reason.
+
+The `id` is an idempotency key bound to the payload: a replayed signal is
+dropped, and the same id carrying *different* fields is refused as a reuse
+rather than silently swallowed. The queue is capped (`MaxPending`, 100), the
+per-agent quota is a rolling hour (not a lifetime counter), and a signal is
+consumed once — the bot acknowledges each one after evaluating it instead of
+re-trading it every tick until it expires.
+
+When an agent has its own credential (`A2A_PEER_TOKENS=agent:token,…`), only
+that token may post as it: the shared group token cannot impersonate an
+agent that has its own, including one ramped `on`.
 
 ### Managing the ramp
 
@@ -831,6 +846,41 @@ order is rejected.
 | Confidence bias | The ledger's winner *discount* was added to the signal's own confidence, which lets a past win push a fresh signal over the risk floor it did not clear. Only the penalty side is applied now. |
 | Multiplier clamp | Rejection-style guards (`x <= 0 || x > 1`) let NaN through as a valid multiplier, and a NaN size factor silently zeroes a position. Every clamp is now an affirmative test, and a corrupt value means "no opinion" (1.0). |
 | Dead threshold | `statsLedger.confidenceRequired` computed a *lowered* threshold for losing symbols under a docstring claiming the opposite, and had no callers. Removed rather than fixed. |
+
+### Second pass — verified against the source, then fixed
+
+An external architecture review of this project was written from the README
+alone. Every claim below was re-checked against the code first; the ones
+that survived are listed with what was actually wrong. Claims that did not
+survive (for example "the risk gate is not shared", "MCP tools can place
+orders ungated") are not listed, because they were already true.
+
+| Finding | Verified defect | Fix |
+|---|---|---|
+| Fills can be lost | A fill was journalled only if it was present in the POST response; `auto` runs no stream and never backfills. **Measured on the live paper account: two filled entry orders, zero fill rows in the journal**, so drawdown halts, the ledger and the learner all computed on an empty book | Durable intent before every submission, and a per-tick reconciliation that journals the delta against cumulative broker fill quantity (partial-fill aware, idempotent) |
+| Exits gated by entry policy | `handleSell` refused to exit outside the **entry** trading window, and skipped any position whose qty was not positive — so a short could never be closed | Exit authority (`ExecuteReduce`) with a `Reducing` proposal the gate *proves* against live holdings, exempt from the kill switch, confidence floor and caps |
+| Ungated mutation paths | `handleSell`, `closePosition`, `intraExit` called the broker directly; `closePosition` read the tick-frozen position cache | All three now go through the exit authority: fresh position read, protection cancelled first, one gate, deterministic id (the old id embedded `UnixNano`, so a retry was *not* deduped — measured: a reused id returns HTTP 422) |
+| Halt stopped protection | The loop exited when the kill switch engaged; with `Restart=always` the unit then cycled every 10s, and nothing enforced TP/SL between exits | A halt suppresses new entries only; monitoring, exits and reconciliation continue |
+| Additive cap was dead | `NewValidatorWithScorer` never set `Positions`, so the combined-exposure check was skipped on exactly the unattended path | Wired to a short-TTL live book, invalidated on every mutation; an unreadable book now refuses instead of reading zero |
+| Two buys, one tick | Per-symbol cap read a frozen tick-start snapshot | Live book invalidated after each submission |
+| Manual order fail-open | `validateProposal` returned `Approved: true` when no config was loaded | Refuses, and names why |
+| Same-origin could be spoofed | Under `TRUSTED_PROXY`, the CSRF host check preferred client-supplied `X-Forwarded-Host` | Compares against `r.Host`, or the configured CORS origin behind a trusted proxy — never a caller header |
+| Paper/live guard was a string | Only the URL was checked: **paper URL + live keys passed every check** | `VerifyVenue` reads the account the credentials resolve to, requires a paper account id, and halts on mismatch (bot) / 503s (dashboard) |
+| A2A identity, quota, queue | Any token holder could post as any agent id; the "hourly" quota was a lifetime counter; the pending queue was unbounded; qty-only signals bypassed the notional cap; `Drain` re-offered every signal so an ON agent's signal executed on every tick until expiry | Per-peer tokens (`A2A_PEER_TOKENS`), rolling-hour window, `MaxPending`, refusal of unmeasurable exposure, payload-fingerprint dedupe, and an ack so each signal is consumed once (the broker intent is keyed to the signal id, so a redelivered retry dedupes) |
+| Three writers on the state file | The API's config save rewrote the bot's document through the **same** temp path, so a dashboard save could revert a TP/SL level or the peak; `starting_equity` was dropped by every typed save, leaving adaptive sizing permanently inert | One writer per file: the API writes `config-overrides.json`, the bot owns `strategy-state.json` (pid-scoped scratch); `StartingEquity` is a typed field and the bot reads the overrides |
+| Stale bars | No freshness check: a halted symbol's three-week-old close still scored and could be bought | Per-timeframe freshness gate, fail-closed |
+| Unadjusted splits | Bars were fetched `raw`, so a split read as a 90% collapse in trend/momentum and inflated ATR stops | `adjustment=split` (verified accepted by the API; `all` also rewrites history for dividends) |
+| Silent factor | The loop passes `news=nil`, so sentiment contributed its full weight at a neutral 0.5 and diluted every composite | A factor with no source is excluded from the weighted mean instead of voting |
+| Cancels assumed | A 2xx from DELETE was treated as cancelled — **measured: 204 returned while the order still listed as accepted** | Cancellation is confirmed by re-reading the order; unconfirmed is an error, and self-heal no longer reports it "repaired" |
+| Sizing truncation | `int(budget/price)` dropped a unit whenever the division landed a hair under an integer | Epsilon-aware floor |
+
+Still open, and deliberately not attempted here: migrating the JSON/JSONL
+state to SQLite (the single-writer split removes the corruption class
+without a rewrite); a full OMS with replace/cancel-replace chains; an
+experiment registry and walk-forward harness (no backtester exists — nothing
+in this repo has ever been validated out-of-sample); reference-data
+versioning for corporate actions and delistings; per-actor operator
+identity; and pinning the Alpaca MCP server version.
 
 ---
 

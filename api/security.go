@@ -123,26 +123,63 @@ func (s *Server) validBearer(r *http.Request) bool {
 	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
 }
 
-// sameOrigin reports whether the request's Origin (preferred) or
-// Referer names the same host the request was sent to. Host
-// comparison ignores port; scheme is irrelevant for authority.
+// sameOrigin reports whether the request's Origin (preferred) or Referer
+// names the host this server is reachable at.
+//
+// The comparison host comes from the request line (r.Host) and from the
+// CONFIGURED public origin — never from a client-supplied header. An
+// earlier version preferred X-Forwarded-Host when TRUSTED_PROXY was set,
+// which turned the CSRF check into a formality: X-Forwarded-Host is not a
+// forbidden request header, so any caller could send
+// `Origin: https://evil.example` plus `X-Forwarded-Host: evil.example` and
+// be judged same-origin. Trusting the proxy is about trusting the proxy,
+// not about trusting whoever reached it.
 func (s *Server) sameOrigin(r *http.Request) bool {
-	host := s.requestHost(r)
-	if host == "" {
-		return false
-	}
+	var originHost string
 	if o := r.Header.Get("Origin"); o != "" {
 		u, err := url.Parse(o)
 		if err != nil {
 			return false
 		}
-		return strings.EqualFold(u.Hostname(), host)
+		originHost = u.Hostname()
+	} else {
+		u, err := url.Parse(r.Header.Get("Referer"))
+		if err != nil {
+			return false
+		}
+		originHost = u.Hostname()
 	}
-	u, err := url.Parse(r.Header.Get("Referer"))
-	if err != nil {
+	if originHost == "" {
 		return false
 	}
-	return strings.EqualFold(u.Hostname(), host)
+	// Same host the request was addressed to.
+	if h := requestHost(r); h != "" && strings.EqualFold(originHost, h) {
+		return true
+	}
+	// Behind a proxy that rewrites Host to the upstream name, the public
+	// host is the operator-configured CORS origin. That value is server
+	// state, so it cannot be forged by the caller.
+	if s.settings.TrustedProxy {
+		if pub := s.configuredOriginHost(); pub != "" && strings.EqualFold(originHost, pub) {
+			return true
+		}
+	}
+	return false
+}
+
+// configuredOriginHost returns the hostname of the configured CORS origin,
+// or "" when it is a wildcard or unparsable. A wildcard can never be a
+// same-origin authority.
+func (s *Server) configuredOriginHost() string {
+	allowed := strings.TrimSpace(s.settings.CORSOrigin)
+	if allowed == "" || allowed == "*" {
+		return ""
+	}
+	u, err := url.Parse(allowed)
+	if err != nil || u.Hostname() == "" {
+		return ""
+	}
+	return u.Hostname()
 }
 
 // untrustedClientKey is the RemoteAddr-only key: no proxy headers,
@@ -154,29 +191,6 @@ func untrustedClientKey(r *http.Request) string {
 		return r.RemoteAddr
 	}
 	return host
-}
-
-// requestHost returns the request's host without port, lowercased by
-// EqualFold callers. When the operator runs behind a trusted proxy
-// (--trusted-proxy / TRUSTED_PROXY=1) the proxy's X-Forwarded-Host is
-// preferred, because a proxy that rewrites Host (Caddy, nginx with a
-// different upstream name) otherwise makes the same-origin CSRF check
-// compare the public hostname against the internal one and reject every
-// control POST.
-func (s *Server) requestHost(r *http.Request) string {
-	if s.settings.TrustedProxy {
-		if fh := strings.TrimSpace(r.Header.Get("X-Forwarded-Host")); fh != "" {
-			// A forwarded host may carry a port and may be a comma list.
-			if i := strings.IndexByte(fh, ','); i > 0 {
-				fh = strings.TrimSpace(fh[:i])
-			}
-			if host, _, err := net.SplitHostPort(fh); err == nil {
-				return host
-			}
-			return fh
-		}
-	}
-	return requestHost(r)
 }
 
 // requestHost returns the request's host without port, lowercased by
@@ -234,21 +248,21 @@ func (s *Server) clientKey(r *http.Request) string {
 // securityHeaders sets the baseline response headers on every
 // response (API + embedded UI alike):
 //
-//   X-Content-Type-Options: nosniff — blocks MIME-sniffing XSS.
-//   X-Frame-Options: DENY — the dashboard is same-origin served and
-//     never embedded; deny clickjacking outright.
-//   Referrer-Policy: no-referrer — trade/account data must not leak
-//     into a Referer header on outbound navigation.
-//   Permissions-Policy — the dashboard needs no camera, mic, or
-//     geolocation; deny them all.
-//   Strict-Transport-Security — sent only when serving TLS directly
-//     (or behind a TLS-terminating proxy the operator has marked as
-//     trusted); HSTS over plaintext HTTP would be ignored anyway.
-//   Content-Security-Policy: default-src 'none'; frame-ancestors
-//     'none' — applied to /api/* JSON responses only. The embedded
-//     Next.js UI needs inline scripts to hydrate, so a strict CSP
-//     there would break the dashboard; JSON endpoints carry no
-//     active content, so locking them down is free.
+//	X-Content-Type-Options: nosniff — blocks MIME-sniffing XSS.
+//	X-Frame-Options: DENY — the dashboard is same-origin served and
+//	  never embedded; deny clickjacking outright.
+//	Referrer-Policy: no-referrer — trade/account data must not leak
+//	  into a Referer header on outbound navigation.
+//	Permissions-Policy — the dashboard needs no camera, mic, or
+//	  geolocation; deny them all.
+//	Strict-Transport-Security — sent only when serving TLS directly
+//	  (or behind a TLS-terminating proxy the operator has marked as
+//	  trusted); HSTS over plaintext HTTP would be ignored anyway.
+//	Content-Security-Policy: default-src 'none'; frame-ancestors
+//	  'none' — applied to /api/* JSON responses only. The embedded
+//	  Next.js UI needs inline scripts to hydrate, so a strict CSP
+//	  there would break the dashboard; JSON endpoints carry no
+//	  active content, so locking them down is free.
 func (s *Server) securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()

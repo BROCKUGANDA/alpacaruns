@@ -210,18 +210,18 @@ type Account struct {
 }
 
 type Position struct {
-	Symbol         string  `json:"symbol"`
-	Qty            string  `json:"qty"`
-	Side           string  `json:"side"`
-	AvgEntry       string  `json:"avg_entry_price"`
-	CurrentPrice   string  `json:"current_price"`
-	MarketValue    string  `json:"market_value"`
+	Symbol       string `json:"symbol"`
+	Qty          string `json:"qty"`
+	Side         string `json:"side"`
+	AvgEntry     string `json:"avg_entry_price"`
+	CurrentPrice string `json:"current_price"`
+	MarketValue  string `json:"market_value"`
 	// Alpaca's /positions endpoint returns numeric fields as JSON
 	// strings (same convention as avg_entry_price). Keep these as
 	// strings and convert in callers to keep the wire format
 	// consistent with the rest of the Position fields.
-	UnrealizedPL   string  `json:"unrealized_pl"`
-	UnrealizedPLPC string  `json:"unrealized_plpc"`
+	UnrealizedPL   string `json:"unrealized_pl"`
+	UnrealizedPLPC string `json:"unrealized_plpc"`
 	// Dashboard API fields (newer; Alpaca added them to /positions).
 	ChangeToday string `json:"change_today"`
 	// AssetClass distinguishes us_equity / us_option / crypto positions
@@ -238,6 +238,54 @@ func (c *Client) GetAccount(ctx context.Context) (*Account, error) {
 		return nil, err
 	}
 	return &a, nil
+}
+
+// paperAccountPrefix is the prefix Alpaca assigns to paper-trading account
+// ids. Live account ids are UUIDs.
+const paperAccountPrefix = "PA"
+
+// VerifyVenue proves that the credentials resolve to the venue the base URL
+// claims, and returns the account it checked.
+//
+// The existing guard only inspects the URL string: a bot configured with
+// ALPACA_BASE_URL=https://paper-api.alpaca.markets/v2 and LIVE keys passes
+// every check in the process while trading the live account under a paper
+// label. "The string looks like paper" and "the account IS paper" are
+// different claims, and only the second one is worth relying on. This reads
+// the account Alpaca actually resolves the credentials to and refuses when
+// it does not look like a paper account.
+//
+// It fails closed: an unreadable or unidentified account is not proof of
+// anything.
+func (c *Client) VerifyVenue(ctx context.Context, expectPaper bool) (*Account, error) {
+	if c == nil {
+		return nil, fmt.Errorf("venue verification: no client")
+	}
+	a, err := c.GetAccount(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("venue verification: account unreadable: %w", err)
+	}
+	if !expectPaper {
+		return a, nil // live mode is gated by the URL + I_ALPACA_LIVE ack
+	}
+	id := strings.ToUpper(strings.TrimSpace(a.ID))
+	num := strings.ToUpper(strings.TrimSpace(a.AccountNumber))
+	switch {
+	case id == "" && num == "":
+		return a, fmt.Errorf("venue verification: account has neither id nor account_number; cannot prove it is a paper account")
+	case strings.HasPrefix(id, paperAccountPrefix), strings.HasPrefix(num, paperAccountPrefix):
+		return a, nil
+	default:
+		return a, fmt.Errorf("venue verification: the base URL claims paper trading but the credentials resolve to account %q (number %q), which does not look like a paper account — refusing to trade",
+			a.ID, a.AccountNumber)
+	}
+}
+
+// ExpectPaperVenue reports whether a trading base URL claims the paper
+// venue. Mirrors the checks in config and the MCP child environment so all
+// three agree on what "paper" means.
+func ExpectPaperVenue(baseURL string) bool {
+	return strings.Contains(strings.ToLower(baseURL), "paper-api")
 }
 
 // GetAccountRawField returns one extra field on the /v2/account
@@ -332,6 +380,16 @@ func (c *Client) GetBars(ctx context.Context, symbols []string, timeframe, start
 	q := url.Values{}
 	q.Set("symbols", join(symbols))
 	q.Set("timeframe", orDefaultStr(timeframe, "1Day"))
+	// Split-adjusted by default. Alpaca's documented default is `raw`, which
+	// makes a 10-for-1 split look like a 90% one-day collapse: the trend and
+	// momentum factors read it as a crash, and ATR-scaled stops widen to the
+	// size of the artefact. Dividends are deliberately NOT adjusted in:
+	// price-series continuity is what these factors need, and `all` also
+	// rewrites history for payouts, which changes the levels a decision was
+	// made against.
+	if q.Get("adjustment") == "" {
+		q.Set("adjustment", "split")
+	}
 	if start == "" {
 		// Alpaca returns an EMPTY page when `start` is omitted — inject
 		// a ~8-month daily lookback by default (same workaround as
@@ -488,16 +546,16 @@ func (c *Client) GetCryptoSnapshots(ctx context.Context, symbols []string) (map[
 // and "fractional_tradable"), so the JSON tags below match the wire
 // format exactly.
 type Asset struct {
-	ID         string `json:"id"`
-	Symbol     string `json:"symbol"`
-	Name       string `json:"name"`
-	Exchange   string `json:"exchange"`
-	AssetClass string `json:"class"`
-	Status     string `json:"status"`
-	Tradable   bool   `json:"tradable"`
-	Fractional bool   `json:"fractionable"`
-	Marginable bool   `json:"marginable"`
-	Shortable  bool   `json:"shortable"`
+	ID          string `json:"id"`
+	Symbol      string `json:"symbol"`
+	Name        string `json:"name"`
+	Exchange    string `json:"exchange"`
+	AssetClass  string `json:"class"`
+	Status      string `json:"status"`
+	Tradable    bool   `json:"tradable"`
+	Fractional  bool   `json:"fractionable"`
+	Marginable  bool   `json:"marginable"`
+	Shortable   bool   `json:"shortable"`
 	MinOrderQty string `json:"min_order_qty"`
 }
 
@@ -569,10 +627,10 @@ type Quote struct {
 // forms Alpaca uses for quote timestamps.
 func (q *Quote) UnmarshalJSON(data []byte) error {
 	type alias struct {
-		BidPrice float64       `json:"bp"`
-		AskPrice float64       `json:"ap"`
-		BidSize  int           `json:"bs"`
-		AskSize  int           `json:"as"`
+		BidPrice float64         `json:"bp"`
+		AskPrice float64         `json:"ap"`
+		BidSize  int             `json:"bs"`
+		AskSize  int             `json:"as"`
 		TS       json.RawMessage `json:"t"`
 	}
 	var a alias
@@ -746,6 +804,24 @@ type Order struct {
 	// so a re-anchored position would keep protecting at the old prices.
 	LimitPrice string `json:"limit_price"`
 	StopPrice  string `json:"stop_price"`
+	// ClientOrderID is the local identifier the order was submitted with.
+	// It is what lets a fill that arrives AFTER the submitting response be
+	// traced back to the intent that created it — and therefore to the
+	// score that justified the trade. Without it the reconciliation pass can
+	// recover the money but not the evidence.
+	ClientOrderID string `json:"client_order_id"`
+	// GroupID and GroupRole identify bracket/OCO CHILD orders. Alpaca only
+	// returns them under status=all: a `stop_loss` leg sits in status
+	// "held" until its entry fills, so a listing that omits grouped orders
+	// silently hides the protection the bot believes is resting.
+	GroupID   string `json:"group_id"`
+	GroupRole string `json:"group_role"`
+	// PositionIntent distinguishes sell_to_close from sell_to_open. A
+	// reducing order and a short-sale instruction look identical in every
+	// other field, and treating the second as the first is how a bot
+	// opens exposure it never intended.
+	PositionIntent string    `json:"position_intent"`
+	SubmittedAt    time.Time `json:"submitted_at"`
 }
 
 // PlaceOrder submits an order, defaulting time_in_force to gtc when unset.
@@ -852,11 +928,21 @@ func (c *Client) CancelOrdersForSymbol(ctx context.Context, symbol string) (int,
 		return 0, err
 	}
 	n := 0
+	var unconfirmed []string
 	for _, o := range os {
-		if err := c.CancelOrder(ctx, o.ID); err != nil {
-			return n, fmt.Errorf("cancel %s: %w", o.ID, err)
+		if err := c.CancelOrderConfirmed(ctx, o.ID, 2*time.Second); err != nil {
+			// Report what was not confirmed instead of counting a 2xx as a
+			// cancellation. The caller re-places protection; doing that on
+			// top of a pair that is still resting is how a position ends up
+			// with two live exits.
+			unconfirmed = append(unconfirmed, o.ID+": "+err.Error())
+			continue
 		}
 		n++
+	}
+	if len(unconfirmed) > 0 {
+		return n, fmt.Errorf("cancel not confirmed for %d of %d order(s): %s",
+			len(unconfirmed), len(os), strings.Join(unconfirmed, "; "))
 	}
 	return n, nil
 }
@@ -871,6 +957,49 @@ func (c *Client) GetOrderStatus(ctx context.Context, orderID string) (*Order, er
 
 func (c *Client) CancelOrder(ctx context.Context, orderID string) error {
 	return c.do(ctx, http.MethodDelete, c.BaseURL+"/orders/"+url.PathEscape(orderID), nil, nil, nil)
+}
+
+// CancelOrderConfirmed asks the broker to cancel an order and then verifies
+// that it actually reached a terminal state.
+//
+// A 2xx from DELETE is an ACKNOWLEDGEMENT, not a cancellation: measured on
+// the live paper account, DELETE returned 204 while the order still listed
+// as "accepted". Callers that treated the status code as the outcome marked
+// protective orders "cancelled" while they were still resting — and a live
+// protective leg over a closed position is a short sale in waiting.
+//
+// The poll is bounded and short. "Not confirmed yet" is reported as an
+// error rather than assumed either way.
+func (c *Client) CancelOrderConfirmed(ctx context.Context, orderID string, wait time.Duration) error {
+	if err := c.CancelOrder(ctx, orderID); err != nil {
+		return err
+	}
+	if wait <= 0 {
+		wait = 3 * time.Second
+	}
+	deadline := time.Now().Add(wait)
+	for {
+		o, err := c.GetOrderStatus(ctx, orderID)
+		if err != nil {
+			return fmt.Errorf("cancel %s: confirmation read failed: %w", orderID, err)
+		}
+		switch strings.ToLower(strings.TrimSpace(o.Status)) {
+		case "canceled", "cancelled", "expired", "rejected", "failed", "filled":
+			// filled is terminal too: a cancel that raced a fill did not
+			// cancel anything, but it is no longer resting either. The
+			// caller sees the status and decides what to do about the fill.
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("cancel %s: still %q after %s (request acknowledged, cancellation not confirmed)",
+				orderID, o.Status, wait)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
 }
 
 // ---- Clock ----
@@ -905,6 +1034,45 @@ func (c *Client) ListOrders(ctx context.Context, status string, limit int) ([]Or
 	var os []Order
 	err := c.do(ctx, http.MethodGet, c.BaseURL+"/orders", q, nil, &os)
 	return os, err
+}
+
+// ListRecentOrders returns every order in the broker's recent history,
+// including bracket and OCO CHILD orders.
+//
+// status=all is not a courtesy: measured against the live paper account,
+// `status=open` lists only the OCO parents, and the stop leg — the one
+// that actually protects the position — is visible only as a `held` child
+// under status=all. Code that reasons about protection from status=open
+// alone believes a stop is missing when it is resting.
+func (c *Client) ListRecentOrders(ctx context.Context, limit int) ([]Order, error) {
+	q := url.Values{}
+	q.Set("status", "all")
+	if limit > 0 {
+		q.Set("limit", strconv.Itoa(limit))
+	}
+	var os []Order
+	if err := c.do(ctx, http.MethodGet, c.BaseURL+"/orders", q, nil, &os); err != nil {
+		return nil, err
+	}
+	return os, nil
+}
+
+// IsDuplicateClientOrderID reports whether err is Alpaca rejecting a
+// client_order_id that already exists.
+//
+// Measured: a second POST with a used id returns HTTP 422 with code
+// 42210000 "client_order_id must be unique". That is the broker's
+// idempotency guarantee, so a caller retrying an intent whose response was
+// lost must read this as "your order is already in", not as a failure —
+// treating it as a failure is how a retry loop ends up placing a second
+// order under a fresh id.
+func IsDuplicateClientOrderID(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "42210000") ||
+		(strings.Contains(s, "http 422") && strings.Contains(s, "client_order_id"))
 }
 
 // ---- helpers ----

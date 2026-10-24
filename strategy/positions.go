@@ -37,6 +37,11 @@ import (
 // on a two-decimal price is below any meaningful move.
 const levelEntryTolerance = 0.005
 
+// qtyEpsilonProtect treats a residue smaller than this as "flat". It is far
+// below any tradable size, so it only ever absorbs float noise from a
+// partially filled crypto lot (8 decimal places) — never a real position.
+const qtyEpsilonProtect = 1e-9
+
 // Reconcile adopts every open broker position into the protection book
 // and makes sure an equity position is actually protected at the broker,
 // not just in local state. It runs before the enforcement passes so
@@ -336,9 +341,51 @@ func (m *PositionMonitor) ensureBrokerProtection(lv *PositionLevels, openOrders 
 	if lv.IsShort() {
 		side = "buy"
 	}
+	// The protective pair must be sized to what is ACTUALLY held. lv.Qty is
+	// bookkeeping: it is written at derive time, and an exit or a partial
+	// fill since then leaves it larger than the position. A pair sized from
+	// the stale number can sell more than exists — the oversell this whole
+	// protection scheme exists to prevent. The live read wins whenever it
+	// disagrees, and a flat position places nothing at all.
+	if b != nil {
+		if live, err := b.Positions(context.Background()); err == nil {
+			var found bool
+			for _, p := range live {
+				if !tools.SameSymbol(p.Symbol, lv.Symbol) {
+					continue
+				}
+				q, err := strconv.ParseFloat(strings.TrimSpace(p.Qty), 64)
+				if err != nil || q == 0 {
+					continue
+				}
+				found = true
+				if math.Abs(q) <= qtyEpsilonProtect {
+					found = false
+					break
+				}
+				if math.Abs(q) != qty {
+					m.log().Printf("[protect] %s: sizing protection from the live position (%.6f) instead of the stored level (%.6f)",
+						lv.Symbol, math.Abs(q), qty)
+				}
+				qty = math.Abs(q)
+				side = "sell"
+				if q < 0 {
+					side = "buy"
+				}
+				break
+			}
+			if !found {
+				m.log().Printf("[protect] %s: no live position to protect; skipping the pair", lv.Symbol)
+				return false
+			}
+		} else {
+			m.log().Printf("[protect] %s: live position unreadable (%v); not placing protection sized from stored state", lv.Symbol, err)
+			return false
+		}
+	}
 	req := tools.OCOClose{
 		Symbol:      lv.Symbol,
-		Qty:         lv.Qty,
+		Qty:         strconv.FormatFloat(qty, 'f', -1, 64),
 		Side:        side,
 		TimeInForce: "gtc",
 		TakeProfit:  lv.TakeProfit,

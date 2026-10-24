@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -59,6 +60,13 @@ func (p *PositionLevels) LocallyEnforced() bool {
 }
 
 // State is the persisted strategy-state.json document.
+//
+// WRITE OWNERSHIP: this document belongs to the trading bot. `alpacaruns
+// auto` is the only process that writes it; the dashboard API reads it and
+// writes its own knobs to config-overrides.json (see ConfigOverrides).
+// Sharing a read-modify-write of this file across two processes lost
+// TP/SL levels and the drawdown peak whenever the API renamed a stale
+// snapshot over a fresher bot write — there is no flock between them.
 type State struct {
 	Version int                        `json:"version"`
 	Levels  map[string]*PositionLevels `json:"levels"`
@@ -76,8 +84,28 @@ type State struct {
 	// LastTick is the UTC timestamp of the most recent completed bot
 	// tick. Zero until the bot's first tick writes it.
 	LastTick time.Time `json:"last_tick,omitempty"`
+	// StartingEquity is the adaptive-sizing baseline (the account equity
+	// first seen with ADAPTIVE_SIZING on) and the P&L reference the
+	// dashboard plots against. It is a real field, not a side-channel
+	// key: the bot used to patch it into the file with a raw map write,
+	// and the next typed Save — the per-tick Heartbeat — marshalled the
+	// struct and dropped it, resetting the baseline every tick. The JSON
+	// key name is unchanged ("starting_equity") because the live file on
+	// the server already carries it and api/journal.go reads it.
+	StartingEquity float64 `json:"starting_equity,omitempty"`
+
+	// unknownKeys holds top-level keys this build cannot decode, captured
+	// verbatim by load() and re-attached verbatim by marshalState(). It is
+	// unexported so encoding/json never treats it as part of the schema.
+	unknownKeys map[string]json.RawMessage
+	// diskVersion is the "version" stamp found on disk. marshalState keeps
+	// it when it is newer than stateVersion instead of downgrading.
+	diskVersion int
 }
 
+// stateVersion is the schema version this build writes for a fresh file.
+// Additive fields do not need a bump — unknown keys and a newer stamp on
+// disk are preserved through a rewrite (see load + marshalState).
 const stateVersion = 1
 
 // StateStore persists strategy state to a small JSON file (default
@@ -119,13 +147,89 @@ func (s *StateStore) load() (*State, error) {
 	if st.Levels == nil {
 		st.Levels = map[string]*PositionLevels{}
 	}
-	if st.Version != stateVersion && st.Version != 0 {
-		// Unknown future version: keep loading (fields are additive) but
-		// rewrite will downgrade to what we know.
-		st.Version = stateVersion
-	}
+	// Unknown (future) version: load it and keep every key we cannot decode
+	// (marshalState re-attaches them verbatim). Erroring would stop TP/SL
+	// enforcement over a field this build merely does not know, and the old
+	// silent downgrade deleted data on rewrite.
+	st.unknownKeys = unknownTopLevelKeys(b)
+	st.diskVersion = st.Version
 	migrateLevelKeys(&st)
 	return &st, nil
+}
+
+// stateJSONKeys is the set of top-level keys this build's State knows how
+// to decode, derived from the struct tags so a newly added field is
+// automatically "known" and never re-emitted as an opaque blob.
+var stateJSONKeys = func() map[string]bool {
+	t := reflect.TypeOf(State{})
+	out := make(map[string]bool, t.NumField())
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		if f.PkgPath != "" { // unexported — never part of the document
+			continue
+		}
+		name := strings.Split(f.Tag.Get("json"), ",")[0]
+		if name == "" || name == "-" {
+			continue
+		}
+		out[name] = true
+	}
+	return out
+}()
+
+// unknownTopLevelKeys returns every top-level key of the raw document that
+// stateJSONKeys does not cover, with its original bytes. A document that
+// is not a JSON object (or that has no extras) yields nil.
+func unknownTopLevelKeys(b []byte) map[string]json.RawMessage {
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(b, &doc); err != nil {
+		return nil
+	}
+	var out map[string]json.RawMessage
+	for k, raw := range doc {
+		if stateJSONKeys[k] {
+			continue
+		}
+		if out == nil {
+			out = map[string]json.RawMessage{}
+		}
+		out[k] = raw
+	}
+	return out
+}
+
+// marshalState renders a State for disk. Keys this build does not know are
+// re-attached verbatim, and the version stamp is only ever raised to what
+// is already on disk — an older binary rewriting a newer file must lose
+// nothing.
+func marshalState(st *State) ([]byte, error) {
+	version := stateVersion
+	if st.diskVersion > version {
+		version = st.diskVersion
+	}
+	st.Version = version
+	if len(st.unknownKeys) == 0 {
+		return json.MarshalIndent(st, "", "  ")
+	}
+	base, err := json.Marshal(st)
+	if err != nil {
+		return nil, err
+	}
+	doc := map[string]json.RawMessage{}
+	if err := json.Unmarshal(base, &doc); err != nil {
+		return nil, err
+	}
+	for k, raw := range st.unknownKeys {
+		if _, claimed := doc[k]; !claimed {
+			doc[k] = raw
+		}
+	}
+	vb, err := json.Marshal(version)
+	if err != nil {
+		return nil, err
+	}
+	doc["version"] = vb
+	return json.MarshalIndent(doc, "", "  ")
 }
 
 // levelKey is the map key for a position's TP/SL levels. The swing book
@@ -179,22 +283,36 @@ func (s *StateStore) Save(st *State) error {
 
 // saveLocked writes the file; caller must hold s.mu.
 func (s *StateStore) saveLocked(st *State) error {
-	st.Version = stateVersion
 	if st.Levels == nil {
 		st.Levels = map[string]*PositionLevels{}
 	}
-	b, err := json.MarshalIndent(st, "", "  ")
+	b, err := marshalState(st)
 	if err != nil {
 		return err
 	}
-	tmp := s.path + ".tmp"
+	tmp := s.tmpPath()
 	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
 		return err
 	}
 	if err := os.WriteFile(tmp, b, 0o644); err != nil {
 		return err
 	}
-	return os.Rename(tmp, s.path)
+	if err := os.Rename(tmp, s.path); err != nil {
+		// Never leave a half-written scratch file behind: the next
+		// process would have no way to tell it from a live one.
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+// tmpPath is the scratch file the atomic rename publishes from. It is
+// process-scoped (".state-<pid>.tmp") rather than the shared
+// "<path>.tmp" the dashboard used to write the same document through —
+// two processes renaming through one temp name is how a stale snapshot
+// landed on top of a fresh one.
+func (s *StateStore) tmpPath() string {
+	return fmt.Sprintf("%s.state-%d.tmp", s.path, os.Getpid())
 }
 
 // SetLevel records/updates one position's TP/SL levels.
@@ -290,6 +408,54 @@ func (s *StateStore) Heartbeat(tickNum int64) error {
 	return s.saveLocked(st)
 }
 
+// ReadStartingEquity returns the persisted adaptive-sizing baseline, or 0
+// when none is stored. Read through the typed store so it can never drift
+// from what the next Save re-emits.
+func (s *StateStore) ReadStartingEquity() (float64, error) {
+	st, err := s.Load()
+	if err != nil {
+		return 0, err
+	}
+	return st.StartingEquity, nil
+}
+
+// SetStartingEquity records the adaptive-sizing baseline (the equity the
+// P&L curve and the adaptive cap are measured against). It goes through
+// the typed StateStore, so the value is part of every later Save — the old
+// raw map patch in `cmd/alpacaruns auto` wrote a key the struct did not
+// have, and the next typed Save (the per-tick Heartbeat) dropped it.
+func (s *StateStore) SetStartingEquity(equity float64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st, err := s.load()
+	if err != nil {
+		return err
+	}
+	st.StartingEquity = equity
+	return s.saveLocked(st)
+}
+
+// SetStartingEquityIfUnset stores the baseline only when nothing is stored
+// yet, and reports whether it wrote. Read-and-write happen under the
+// store's lock, so two ticks that both see "no baseline" cannot each
+// persist a different equity.
+func (s *StateStore) SetStartingEquityIfUnset(equity float64) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st, err := s.load()
+	if err != nil {
+		return false, err
+	}
+	if st.StartingEquity != 0 {
+		return false, nil
+	}
+	st.StartingEquity = equity
+	if err := s.saveLocked(st); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // CryptoLevels returns locally-enforced levels for every open crypto
 // position, sorted by symbol for deterministic iteration. Intraday-track
 // levels are EXCLUDED from the swing monitor pass: the intraday book
@@ -326,3 +492,115 @@ func (s *StateStore) cryptoLevelsByTrack(track string) ([]*PositionLevels, error
 }
 
 func (s *StateStore) save(st *State) error { return s.Save(st) }
+
+// ---- dashboard-owned config overrides ----
+
+// ConfigOverridesFileName is the dashboard's own knobs document. It lives
+// next to strategy-state.json ("data/config-overrides.json") and is the
+// ONLY file the API process writes for configuration; the bot reads it and
+// never writes it, and the API never writes strategy-state.json. One
+// writer per file, so no cross-process read-modify-write can lose a
+// TP/SL level, a drawdown peak, or an operator's risk cap.
+const ConfigOverridesFileName = "config-overrides.json"
+
+// ConfigOverrides is the full schema of that file. It is written whole on
+// every save (no merge with the bot's document) and read whole by the bot.
+//
+//	{
+//	  "max_position_usd":        number, USD cap per equity position
+//	  "max_portfolio_pct":       number, [0,1] share of portfolio per name
+//	  "crypto_max_position_usd": number, USD cap per crypto position
+//	  "min_confidence":          number, [0,1] signal floor to act
+//	  "daily_dd_halt":           number, [0,1] daily drawdown kill level
+//	  "weekly_dd_halt":          number, [0,1] weekly drawdown kill level
+//	  "total_dd_halt":           number, [0,1] total drawdown kill level
+//	  "updated_at":              string, RFC3339Nano UTC of the last write
+//	}
+//
+// Every key is always present (no omitempty). A consumer that cannot tell
+// "operator set 0" from "never written" should treat <= 0 as "not set —
+// keep the env/compiled default", which is what the dashboard's own
+// validation already enforces (caps must be > 0, fractions in [0,1]).
+type ConfigOverrides struct {
+	MaxPositionUSD       float64   `json:"max_position_usd"`
+	MaxPortfolioPct      float64   `json:"max_portfolio_pct"`
+	CryptoMaxPositionUSD float64   `json:"crypto_max_position_usd"`
+	MinConfidence        float64   `json:"min_confidence"`
+	DailyDDHalt          float64   `json:"daily_dd_halt"`
+	WeeklyDDHalt         float64   `json:"weekly_dd_halt"`
+	TotalDDHalt          float64   `json:"total_dd_halt"`
+	UpdatedAt            time.Time `json:"updated_at"`
+}
+
+// ConfigOverridesPath derives the override path from any data-dir path —
+// the state file or the trade log — so no new flag has to be plumbed:
+// data/strategy-state.json -> data/config-overrides.json.
+func ConfigOverridesPath(stateOrTradeLogPath string) string {
+	fallback := filepath.Join("data", ConfigOverridesFileName)
+	p := strings.TrimSpace(stateOrTradeLogPath)
+	if p == "" {
+		return fallback
+	}
+	dir := filepath.Dir(p)
+	if dir == "" || dir == "." {
+		return fallback
+	}
+	return filepath.Join(dir, ConfigOverridesFileName)
+}
+
+// LoadConfigOverrides reads the dashboard's overrides. A missing file is
+// not an error — a fresh box has no overrides and must fall back to env
+// defaults. A corrupt file IS an error: silently zeroing an operator's
+// risk caps is worse than refusing to apply them.
+func LoadConfigOverrides(path string) (*ConfigOverrides, error) {
+	if strings.TrimSpace(path) == "" {
+		return &ConfigOverrides{}, nil
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return &ConfigOverrides{}, nil
+		}
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+	if len(strings.TrimSpace(string(b))) == 0 {
+		return &ConfigOverrides{}, nil
+	}
+	var ov ConfigOverrides
+	if err := json.Unmarshal(b, &ov); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	return &ov, nil
+}
+
+// SaveConfigOverrides writes the document atomically: mkdir, write to a
+// process-scoped scratch name, rename. The scratch suffix carries
+// "overrides" plus the pid so it can never collide with the bot's
+// "<state>.state-<pid>.tmp" scratch file — or with an older API build's
+// "<state>.tmp".
+func SaveConfigOverrides(path string, ov ConfigOverrides) error {
+	if strings.TrimSpace(path) == "" {
+		return fmt.Errorf("config overrides: empty path")
+	}
+	if ov.UpdatedAt.IsZero() {
+		ov.UpdatedAt = time.Now().UTC()
+	} else {
+		ov.UpdatedAt = ov.UpdatedAt.UTC()
+	}
+	b, err := json.MarshalIndent(ov, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	tmp := fmt.Sprintf("%s.overrides-%d.tmp", path, os.Getpid())
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}

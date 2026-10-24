@@ -25,10 +25,29 @@ type Config struct {
 	// MaxNotional is the per-signal USD cap.
 	MaxNotional float64
 	// MaxSignalsPerHour caps how many signals one agent may post per
-	// hour.
+	// hour. It is a rolling window, not a lifetime counter: the count is
+	// taken from the timestamps kept in SignalWindow.
 	MaxSignalsPerHour int
+	// SignalWindow is how long an accepted signal keeps counting towards
+	// MaxSignalsPerHour. Zero means one hour.
+	SignalWindow time.Duration
+	// MaxPending caps the queue of accepted-but-not-yet-evaluated
+	// signals. Without a cap a peer that floods the ingress grows the
+	// state file forever. Zero means the constructor's default.
+	MaxPending int
 	// SeenRetention is how long a signal id is remembered for dedupe.
 	SeenRetention time.Duration
+	// PeerTokens binds a credential to a single agent id: agent -> that
+	// peer's own bearer token.
+	//
+	// The bridge token authenticates the SENDER, so an agent id asserted
+	// in the body may not be the whole story: with one shared token any
+	// holder could post as any allow-listed agent, including one ramped
+	// on. When an agent has an entry here, only its own token may post as
+	// it and the group Token is refused for that id. Agents with no entry
+	// keep using Token, so a deployment that has only ever used one
+	// shared token behaves exactly as before.
+	PeerTokens map[string]string
 }
 
 // Bridge accepts inbound signals, applies the ramp, and hands the
@@ -53,10 +72,24 @@ func NewBridge(cfg Config, store *Store) *Bridge {
 	if cfg.MaxSignalsPerHour <= 0 {
 		cfg.MaxSignalsPerHour = 60
 	}
+	if cfg.SignalWindow <= 0 {
+		cfg.SignalWindow = time.Hour
+	}
+	if cfg.MaxPending <= 0 {
+		cfg.MaxPending = 100
+	}
 	if cfg.SeenRetention <= 0 {
 		cfg.SeenRetention = 24 * time.Hour
 	}
 	return &Bridge{cfg: cfg, store: store, now: func() time.Time { return time.Now().UTC() }}
+}
+
+// window returns the rolling window the per-agent quota counts inside.
+func (b *Bridge) window() time.Duration {
+	if b.cfg.SignalWindow > 0 {
+		return b.cfg.SignalWindow
+	}
+	return time.Hour
 }
 
 // Decision is the outcome of offering a signal to the bridge.
@@ -81,7 +114,7 @@ func (b *Bridge) Ingest(sig Signal) Decision {
 	if !b.cfg.Enabled {
 		return Decision{Accepted: false, Reason: "a2a bridge is disabled"}
 	}
-	if strings.TrimSpace(b.cfg.Token) == "" {
+	if !b.cfg.hasCredential() {
 		return Decision{Accepted: false, Reason: "a2a bridge has no token configured; refusing every signal"}
 	}
 	if err := sig.Validate(now); err != nil {
@@ -93,7 +126,17 @@ func (b *Bridge) Ingest(sig Signal) Decision {
 		return Decision{Accepted: false, Reason: "agent is not allow-listed"}
 	}
 	if b.cfg.MaxNotional > 0 {
-		if n := parseNotional(sig); n > b.cfg.MaxNotional {
+		n, known := parseNotional(sig)
+		if !known {
+			// The bridge has no market-data client and must not gain
+			// one: sizing is the risk gate's job. So a qty-only signal
+			// has no notional this layer can check, and an exposure it
+			// cannot evaluate is an exposure it must not accept.
+			reason := fmt.Sprintf("signal prices itself by qty only, so its notional cannot be checked against the bridge cap %.2f; send a notional", b.cfg.MaxNotional)
+			b.countRefusal(sig.Agent, reason)
+			return Decision{Accepted: false, Reason: reason}
+		}
+		if n > b.cfg.MaxNotional {
 			reason := fmt.Sprintf("signal notional %.2f exceeds the bridge cap %.2f", n, b.cfg.MaxNotional)
 			b.countRefusal(sig.Agent, reason)
 			return Decision{Accepted: false, Reason: reason}
@@ -110,37 +153,60 @@ func (b *Bridge) Ingest(sig Signal) Decision {
 		if as.Mode == "" {
 			as.Mode = ModeOff
 		}
-		// Idempotency: a replayed signal id is dropped.
-		if _, seen := st.Seen[sig.ID]; seen {
+		// Idempotency: a replayed id is dropped, and an id reused with a
+		// different payload is refused out loud.
+		fp := Fingerprint(sig)
+		if prev, seen := st.Seen[sig.ID]; seen {
+			if prev.Fingerprint != "" && prev.Fingerprint != fp {
+				reason := "signal id reused with a different payload"
+				markRefusal(as, reason)
+				decision = Decision{Accepted: false, Mode: as.Mode, Reason: reason}
+				return nil
+			}
 			decision = Decision{Accepted: false, Mode: as.Mode, Reason: "duplicate signal id"}
 			return nil
 		}
-		// Per-agent rate limit.
-		if b.cfg.MaxSignalsPerHour > 0 && as.Accepted >= b.cfg.MaxSignalsPerHour {
-			decision = Decision{Accepted: false, Mode: as.Mode,
-				Reason: fmt.Sprintf("agent reached its hourly limit of %d signals", b.cfg.MaxSignalsPerHour)}
+		// Per-agent rate limit, counted inside a rolling window.
+		if b.cfg.MaxSignalsPerHour > 0 {
+			window := b.window()
+			if hits := windowHits(st, sig.Agent, window, now); hits >= b.cfg.MaxSignalsPerHour {
+				reason := fmt.Sprintf("agent has %d signals inside its rolling %s window (limit %d)",
+					hits, window, b.cfg.MaxSignalsPerHour)
+				markRefusal(as, reason)
+				decision = Decision{Accepted: false, Mode: as.Mode, Reason: reason}
+				return nil
+			}
+		}
+		// Queue depth: the consumer must be able to keep up, and the
+		// state file must not grow without bound. Nothing already
+		// queued is dropped to make room — the newcomer is refused.
+		if b.cfg.MaxPending > 0 && len(st.Pending) >= b.cfg.MaxPending {
+			reason := fmt.Sprintf("the bridge queue is full (%d signals waiting, cap %d); nothing was queued",
+				len(st.Pending), b.cfg.MaxPending)
+			markRefusal(as, reason)
+			decision = Decision{Accepted: false, Mode: as.Mode, Reason: reason}
 			return nil
 		}
-		st.Seen[sig.ID] = now
+		st.Seen[sig.ID] = SeenEntry{At: now, Fingerprint: fp}
 		pruneSeen(st, now.Add(-b.cfg.SeenRetention))
+		stampAccepted(st, sig.Agent, now)
 		as.Accepted++
 		as.LastReason = ""
 		switch as.Mode {
 		case ModeShadow:
 			exp := expiryOf(sig, now)
-			st.Pending = append(st.Pending, queued(sig, exp))
+			st.Pending = append(st.Pending, queued(sig, exp, now))
 			decision = Decision{Accepted: true, Mode: as.Mode,
-				Reason:   "accepted in shadow mode; no order will be placed",
+				Reason:    "accepted in shadow mode; no order will be placed",
 				ExpiresAt: exp}
 		case ModeOn:
 			exp := expiryOf(sig, now)
-			st.Pending = append(st.Pending, queued(sig, exp))
+			st.Pending = append(st.Pending, queued(sig, exp, now))
 			decision = Decision{Accepted: true, Mode: as.Mode,
-				Reason:   "accepted; the signal will be gated by the risk gate on the next tick",
+				Reason:    "accepted; the signal will be gated by the risk gate on the next tick",
 				ExpiresAt: exp}
 		default:
-			as.Refused++
-			as.LastReason = "agent is ramped off"
+			markRefusal(as, "agent is ramped off")
 			decision = Decision{Accepted: false, Mode: as.Mode, Reason: "agent is ramped off"}
 		}
 		return nil
@@ -152,15 +218,13 @@ func (b *Bridge) Ingest(sig Signal) Decision {
 }
 
 // queued stamps a signal with its ingest time and expiry for the
-// pending queue.
-func queued(sig Signal, exp time.Time) Signal {
-	sig.ReceivedAt = b_now()
+// pending queue. The bridge's own clock is used so a test (or a replay)
+// that moves time moves the stamps with it.
+func queued(sig Signal, exp, now time.Time) Signal {
+	sig.ReceivedAt = now
 	sig.ExpiresAt = exp
 	return sig
 }
-
-// b_now is the clock used when stamping queued signals.
-func b_now() time.Time { return time.Now().UTC() }
 
 // expiryOf returns the signal's expiry, defaulting to a short window so
 // a stale idea cannot be traded hours later.
@@ -188,11 +252,18 @@ func (b *Bridge) countRefusal(agent, reason string) {
 		return
 	}
 	_ = b.store.Mutate(func(st *State) error {
-		as := agentState(st, agent)
-		as.Refused++
-		as.LastReason = reason
+		markRefusal(agentState(st, agent), reason)
 		return nil
 	})
+}
+
+// markRefusal counts a refusal on an agent state the caller already
+// holds. It is the same bookkeeping countRefusal does, for the paths
+// that are already inside a store mutation — the refusal is recorded
+// whether it is caught before or during the write.
+func markRefusal(as *AgentState, reason string) {
+	as.Refused++
+	as.LastReason = reason
 }
 
 // RecordOutcome folds the result of evaluating a signal back into the
@@ -280,9 +351,16 @@ func (b *Bridge) ModeOf(agent string) (Mode, error) {
 	return ModeOff, nil
 }
 
-// Drain removes the pending signals and returns the ones that are still
-// valid. Expired signals are dropped silently: a stale idea must never
-// be traded because nobody was around to reject it.
+// Drain returns the pending signals that are still valid and drops the
+// expired ones: a stale idea must never be traded because nobody was
+// around to reject it.
+//
+// Note the current contract — a signal that is still valid is handed to
+// the consumer AND left in the queue, so it is offered again on the next
+// tick until it ages out. That is at-least-once delivery, and it is why
+// MaxPending counts waiting signals as capacity the bridge has already
+// spent. Changing it is a delivery-semantics decision outside the ingress
+// hardening done here.
 func (b *Bridge) Drain(now time.Time) ([]Signal, error) {
 	var out []Signal
 	err := b.store.Mutate(func(st *State) error {
@@ -306,15 +384,66 @@ func (b *Bridge) Drain(now time.Time) ([]Signal, error) {
 	return out, nil
 }
 
-// parseNotional estimates the signal's USD exposure. A notional
-// signal uses its own value; a qty signal is estimated with the
-// configured per-unit budget ceiling, so a qty-only signal can never
-// silently exceed the cap.
-func parseNotional(sig Signal) float64 {
-	if n := strings.TrimSpace(sig.Notional); n != "" {
-		if f, err := parseFloat(n); err == nil {
-			return f
+// Ack removes the named signals from the pending queue once the consumer
+// has finished evaluating them.
+//
+// Drain is at-least-once: a valid signal stays queued until it expires, so
+// without an ack a signal from an agent ramped ON is re-evaluated on EVERY
+// tick for its whole lifetime — a 15-minute signal at a 5-minute poll is
+// three entries, and the shadow streak advances three times for one idea.
+// Acknowledging after evaluation is what turns "the bridge delivered this"
+// into "the bot did something with this, once".
+//
+// A signal the consumer never reaches (crash before the ack) is delivered
+// again, which is why the execution path keys its broker intent to the
+// signal id: the retry is then refused by the broker as a duplicate rather
+// than becoming a second order.
+func (b *Bridge) Ack(ids ...string) (int, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	want := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if id = strings.TrimSpace(id); id != "" {
+			want[id] = struct{}{}
 		}
 	}
-	return 0
+	removed := 0
+	err := b.store.Mutate(func(st *State) error {
+		if len(st.Pending) == 0 || len(want) == 0 {
+			return nil
+		}
+		keep := make([]Signal, 0, len(st.Pending))
+		for _, sig := range st.Pending {
+			if _, hit := want[strings.TrimSpace(sig.ID)]; hit {
+				removed++
+				continue
+			}
+			keep = append(keep, sig)
+		}
+		st.Pending = keep
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return removed, nil
+}
+
+// parseNotional returns the signal's USD exposure and whether it is
+// knowable here at all.
+//
+// A notional signal states its own exposure, so it is checked against
+// the bridge cap. A qty-only signal is NOT quietly read as zero: the
+// bridge has no market-data client (and must not gain one — sizing and
+// pricing are the risk gate's job), so its exposure cannot be computed
+// and known comes back false. Ingest refuses such a signal whenever a
+// cap is configured, rather than wave an unmeasurable exposure through.
+func parseNotional(sig Signal) (float64, bool) {
+	if n := strings.TrimSpace(sig.Notional); n != "" {
+		if f, err := parseFloat(n); err == nil {
+			return f, true
+		}
+	}
+	return 0, false
 }

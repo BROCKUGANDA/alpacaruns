@@ -48,6 +48,12 @@ func newValidator(cfg *config.Config, kill HaltSource, clock MarketClock, equity
 	}
 	if positions != nil {
 		v.Positions = func(sym string) float64 { return positions[sym] }
+	} else {
+		// An empty book is wired explicitly rather than left nil: a nil
+		// source now means "unknown", and the gate refuses rather than
+		// sizing against a book it never read. Tests that want a flat book
+		// say so.
+		v.Positions = func(string) float64 { return 0 }
 	}
 	return v
 }
@@ -185,19 +191,106 @@ func TestValidateFailsClosedOnAccountError(t *testing.T) {
 	}
 }
 
+// TestNilOptionalDependencies pins what "no exposure source" MEANS.
+//
+// A nil source used to be read as a flat book, so the portfolio-percentage
+// cap evaluated the new order alone and approved it — which is precisely
+// the behaviour that lets twenty positions each under 20% produce a 400%
+// book while every check reports green. An unreadable book is not an empty
+// book: with no way to know what is already committed, the only honest
+// verdict is refusal.
 func TestNilOptionalDependencies(t *testing.T) {
-	// No kill switch, no clock, no positions: remaining checks still run.
 	v := &Validator{
 		Cfg: baseCfg(),
 		Portfolio: func() (Portfolio, error) {
 			return Portfolio{Equity: 100000}, nil
 		},
 	}
-	if got := v.Validate(Proposal{Symbol: "AAPL", Side: "buy", Notional: "5000", Confidence: conf(0.9)}); !got.Approved {
-		t.Fatalf("expected approval, got: %v", got.Reasons)
+	got := v.Validate(Proposal{Symbol: "AAPL", Side: "buy", Notional: "5000", Confidence: conf(0.9)})
+	if got.Approved {
+		t.Fatal("approved an order it could not size against the book: the additive cap was silently skipped")
 	}
-	if got := v.Validate(Proposal{Symbol: "AAPL", Side: "buy", Notional: "999999", Confidence: conf(0.9)}); got.Approved {
+	if len(got.Reasons) == 0 || got.Reasons[0] == "" {
+		t.Fatalf("refusal carried no reason: %+v", got)
+	}
+	// The other caps still bite once a book is actually wired.
+	v.Positions = func(string) float64 { return 0 }
+	if ok := v.Validate(Proposal{Symbol: "AAPL", Side: "buy", Notional: "5000", Confidence: conf(0.9)}); !ok.Approved {
+		t.Fatalf("a flat, readable book must still allow a sized order: %v", ok.Reasons)
+	}
+	if bad := v.Validate(Proposal{Symbol: "AAPL", Side: "buy", Notional: "999999", Confidence: conf(0.9)}); bad.Approved {
 		t.Fatal("cap must still apply without optional deps")
+	}
+	// And a book that already holds exposure is counted, not ignored.
+	v.Positions = func(string) float64 { return 90000 }
+	if crowd := v.Validate(Proposal{Symbol: "AAPL", Side: "buy", Notional: "20000", Confidence: conf(0.9)}); crowd.Approved {
+		t.Fatal("combined exposure over the portfolio cap was approved")
+	}
+}
+
+// A proven reducing order is exempt from exactly the policies that exist to
+// stop NEW risk, and is still refused when it would oversell.
+func TestReducingOrdersAreProvenNotTrusted(t *testing.T) {
+	hold := map[string]float64{"AAPL": 10, "TSLA": -4}
+	newV := func(halted bool, holdings map[string]float64) *Validator {
+		k := &fakeKill{halted: halted}
+		v := &Validator{
+			Cfg:  baseCfg(),
+			Kill: k,
+			Portfolio: func() (Portfolio, error) {
+				return Portfolio{Equity: 100000}, nil
+			},
+			Positions: func(string) float64 { return 0 },
+			Factors: &fakeScorer{result: FactorResult{
+				Composite: 0.1, MinScore: 0.6, Passed: false,
+				Factors: map[string]float64{"trend": 0.1},
+			}},
+		}
+		if holdings != nil {
+			v.Holdings = func(sym string) (float64, error) {
+				q, ok := holdings[sym]
+				if !ok {
+					return 0, nil
+				}
+				return q, nil
+			}
+		}
+		return v
+	}
+
+	// Halted, weak factors, no confidence at all: an exit still goes.
+	halt := newV(true, hold)
+	got := halt.Validate(Proposal{Symbol: "AAPL", Side: "sell", Qty: "10", Reducing: true})
+	if !got.Approved {
+		t.Fatalf("a flatten was refused while halted: %v", got.Reasons)
+	}
+
+	// Oversell: held 10, asked to sell 11.
+	if bad := halt.Validate(Proposal{Symbol: "AAPL", Side: "sell", Qty: "11", Reducing: true}); bad.Approved {
+		t.Fatalf("overselling exit approved: %v", bad.Reasons)
+	}
+	// Wrong direction: short TSLA, so a reducing SELL would ADD exposure.
+	if bad := halt.Validate(Proposal{Symbol: "TSLA", Side: "sell", Qty: "4", Reducing: true}); bad.Approved {
+		t.Fatalf("a short-side sell was approved as reducing: %v", bad.Reasons)
+	}
+	// Covering the short is the reducing direction.
+	if ok := halt.Validate(Proposal{Symbol: "TSLA", Side: "buy", Qty: "4", Reducing: true}); !ok.Approved {
+		t.Fatalf("covering a short refused: %v", ok.Reasons)
+	}
+	// No position to reduce.
+	if bad := halt.Validate(Proposal{Symbol: "NVDA", Side: "sell", Qty: "5", Reducing: true}); bad.Approved {
+		t.Fatal("a reducing order against a flat position was approved")
+	}
+	// The assertion is worthless without a book to check it against.
+	blind := newV(false, nil)
+	if bad := blind.Validate(Proposal{Symbol: "AAPL", Side: "sell", Qty: "5", Reducing: true}); bad.Approved {
+		t.Fatal("reducing accepted with no holdings source wired")
+	}
+	// An UNproven reducing claim does not buy the exemptions for an entry:
+	// a buy with Reducing asserted against a long position is refused above,
+	// and a plain buy while halted is still refused.
+	if bad := halt.Validate(Proposal{Symbol: "AAPL", Side: "buy", Qty: "1", Confidence: conf(0.9)}); bad.Approved {
+		t.Fatal("new exposure approved while the kill switch is engaged")
 	}
 }
 

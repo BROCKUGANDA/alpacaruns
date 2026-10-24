@@ -2,6 +2,7 @@ package strategy
 
 import (
 	"fmt"
+	"math"
 )
 
 // Sizing computes the fixed-fractional position budget and share/contract
@@ -35,7 +36,12 @@ func (s Sizing) SizeForPrice(portfolioValue, price float64) QtyResult {
 		return QtyResult{Skip: fmt.Sprintf("non-positive portfolio value %g", portfolioValue)}
 	}
 	budget := s.Budget(portfolioValue)
-	qty := int(budget / price)
+	// The epsilon is not cosmetic. budget/price is float64 arithmetic, and
+	// a budget that lands exactly on an integer number of units routinely
+	// computes as 28.999999999999996 — truncation then quietly buys 28 when
+	// the operator sized 29. A tolerance far below one unit only ever
+	// rescues a value that was meant to be whole.
+	qty := int(math.Floor(budget/price + 1e-9))
 	if qty < 1 {
 		return QtyResult{
 			Budget: budget,

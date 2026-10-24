@@ -2,8 +2,10 @@
 // The bot and the API are deliberately two separate processes (Option A
 // from the hackathon spec) so the bot keeps trading even when the
 // dashboard is unreachable, and vice versa. The API reads the same
-// data/ directory the bot writes; the pause flag is the only file
-// both touch, and it's atomic (write-temp + rename).
+// data/ directory the bot writes; the files this process writes are the
+// pause flag and config-overrides.json (the UI's risk knobs), both atomic
+// (write-temp + rename) and both read-only for strategy-state.json, which
+// the bot owns.
 package main
 
 import (
@@ -132,26 +134,30 @@ func cmdServe(args []string) int {
 	}
 
 	settings := api.ServerSettings{
-		Port:         port,
-		Bind:         bind,
-		CORSOrigin:   cors,
-		TradeLog:     cfg.TradeLog,
-		StateFile:    dataSibling(cfg.TradeLog, "strategy-state.json"),
-		PauseFlag:    dataSibling(cfg.TradeLog, "paused"),
-		AllowStep:    !fl.disableStep,
-		AllowPause:   !fl.disablePause,
-		AuthToken:    authToken,
-		TrustedProxy: trustedProxy,
-		TLSCert:      tlsCert,
-		TLSKey:       tlsKey,
-		HSTS:         tlsCert != "" && tlsKey != "",
+		Port:       port,
+		Bind:       bind,
+		CORSOrigin: cors,
+		TradeLog:   cfg.TradeLog,
+		// strategy-state.json is the bot's document — this process only
+		// reads it. Its own knob writes land in config-overrides.json,
+		// derived from the same data dir so no new flag is required.
+		StateFile:           dataSibling(cfg.TradeLog, "strategy-state.json"),
+		ConfigOverridesFile: dataSibling(cfg.TradeLog, strategy.ConfigOverridesFileName),
+		PauseFlag:           dataSibling(cfg.TradeLog, "paused"),
+		AllowStep:           !fl.disableStep,
+		AllowPause:          !fl.disablePause,
+		AuthToken:           authToken,
+		TrustedProxy:        trustedProxy,
+		TLSCert:             tlsCert,
+		TLSKey:              tlsKey,
+		HSTS:                tlsCert != "" && tlsKey != "",
 	}
 
 	srv := api.New(cfg, client, settings, &set)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	log.Printf("[serve] alpacaruns dashboard api on %s:%d (trade_log=%s state=%s pause=%s cors=%s)",
-		settings.Addr(), port, settings.TradeLog, settings.StateFile, settings.PauseFlag, cors)
+	log.Printf("[serve] alpacaruns dashboard api on %s:%d (trade_log=%s state=%s (read-only) overrides=%s pause=%s cors=%s)",
+		settings.Addr(), port, settings.TradeLog, settings.StateFile, settings.ConfigOverridesFile, settings.PauseFlag, cors)
 	if err := srv.Run(ctx); err != nil {
 		log.Printf("serve: %v", err)
 		return 1

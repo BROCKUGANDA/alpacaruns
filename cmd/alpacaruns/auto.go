@@ -7,7 +7,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -54,6 +53,16 @@ type autoLoop struct {
 	// pausedLogged remembers whether we already printed the
 	// "[control] paused" line; we don't spam it on every tick.
 	pausedLogged bool
+	// haltLogged does the same for the kill-switch notice: one line when
+	// the halt engages, not one per tick for the rest of the process's
+	// life. The halt no longer exits the loop, so monitoring continues.
+	haltLogged bool
+	// venueChecked records that the account was proven to belong to the
+	// venue the base URL claims. Checked once, before the first order.
+	venueChecked bool
+	// overridesAt is the mtime of the dashboard's config-overrides file
+	// when it was last applied, so the file is re-read only when it changes.
+	overridesAt time.Time
 	// ensemble is non-nil only when ENSEMBLE_ENABLED=true; nil keeps the
 	// original single-expert tick path bit-for-bit.
 	ensemble *ensemble.Runner
@@ -80,6 +89,11 @@ type autoLoop struct {
 	// agents, evaluated by the deterministic risk gate. nil when the
 	// bridge is disabled.
 	bridge *a2a.Bridge
+	// book is the live view of the broker's positions that the risk gate
+	// reads through. It is invalidated after every mutation this loop
+	// makes, which is what lets one tick place two buys of the same symbol
+	// without the second one sizing against a book it already changed.
+	book *liveBook
 	// registry is the classified universe (equities, ETFs, index
 	// trackers, crypto) built by the universal signal picker. It is
 	// refreshed on a timer because the broker asset catalogue is a
@@ -215,9 +229,20 @@ func cmdAuto(args []string) int {
 		loop.set.CryptoSymbols, loop.set.OptionUnderlyings, loop.set.PollSeconds, dryRun)
 
 	for {
-		if ctx.Err() != nil || loop.exec.Kill.Halted() {
-			log.Printf("[auto] stopped (signal or kill switch)")
+		if ctx.Err() != nil {
+			log.Printf("[auto] stopped (signal)")
 			return 0
+		}
+		// A kill switch halt used to stop this process. That was the most
+		// dangerous line in the loop: with Restart=always the unit comes
+		// back 10 seconds later with a FRESH switch, so the bot spends its
+		// life cycling — and between the exit and the restart nothing
+		// enforces crypto TP/SL, rebuilds missing protection or watches
+		// drawdown. A halt means "stop taking risk", which the tick
+		// enforces; it never meant "stop protecting what is open".
+		if loop.exec.Kill.Halted() && !loop.haltLogged {
+			log.Printf("[auto] HALTED: new entries suppressed, protective monitoring continues")
+			loop.haltLogged = true
 		}
 		if err := loop.safeTick(ctx); err != nil {
 			log.Printf("[auto] tick error: %v", err)
@@ -278,6 +303,18 @@ func buildAutoLoop(ctx context.Context, cfg *config.Config, set strategy.Setting
 	// Wire the validator with the same MultiVenueBars-aware scorer so the
 	// risk gate's factor check routes crypto symbols to /v1beta3/...
 	val := agents.NewValidatorWithScorer(kill, cfg, riskScorer)
+	// The gate reads the book through a short-TTL live view. Without this
+	// wiring the validator's additive-exposure check was skipped on exactly
+	// the unattended path, so every percentage cap was evaluated against
+	// the order alone: a book of twenty positions each under the cap passed
+	// with no check ever summing them.
+	book := newLiveBook(client)
+	val.Exposure = func(sym string) (float64, error) {
+		return book.exposureUSD(context.Background(), sym)
+	}
+	val.Holdings = func(sym string) (float64, error) {
+		return book.signedQty(context.Background(), sym)
+	}
 
 	engine, err := strategy.NewEngine(strategy.EngineConfig{
 		Scorer:        scorer,
@@ -339,6 +376,10 @@ func buildAutoLoop(ctx context.Context, cfg *config.Config, set strategy.Setting
 	loop := &autoLoop{
 		cfg: cfg, set: set, engine: engine, windows: windows, exec: exec,
 		monitor: monitor, optPlanner: planner, journal: j, client: client,
+		// book backs the gate's live view of the account; every mutation
+		// this loop makes invalidates it so the next cap check is honest.
+		book: book,
+
 		dryRun:        dryRun,
 		pauseFlagPath: defaultPauseFlagPath(cfg.TradeLog),
 	}
@@ -355,6 +396,7 @@ func buildAutoLoop(ctx context.Context, cfg *config.Config, set strategy.Setting
 			ShadowPasses:      cfg.A2AShadowPasses,
 			MaxNotional:       cfg.A2AMaxNotional,
 			MaxSignalsPerHour: 60,
+			PeerTokens:        cfg.A2APeerTokens,
 		}, a2a.NewStore(j.Path()))
 		loop.bridge = bridge
 		log.Printf("[a2a] bridge enabled: agents=%v mode=%s shadow_passes=%d max_notional=%.2f",
@@ -546,9 +588,28 @@ func (l *autoLoop) tick(ctx context.Context) error {
 	if l.client == nil {
 		return fmt.Errorf("auto: no broker client configured")
 	}
+	// Operator knobs saved in the dashboard take effect from this tick on.
+	l.applyConfigOverrides()
 	acct, err := l.client.GetAccount(ctx)
 	if err != nil {
 		return fmt.Errorf("account: %w", err)
+	}
+	// Prove the venue before the first order, not just that the URL string
+	// looks right. A paper URL plus live keys passes every other check in
+	// this process; this is the one that would catch it. A mismatch halts
+	// the switch — the bot keeps monitoring, but takes on nothing new.
+	if !l.venueChecked {
+		inside, verr := l.client.VerifyVenue(ctx, tools.ExpectPaperVenue(l.cfg.AlpacaBaseURL))
+		if verr != nil {
+			log.Printf("[auto] VENUE CHECK FAILED: %v", verr)
+			if l.exec != nil && l.exec.Kill != nil {
+				l.exec.Kill.Halt()
+			}
+			return fmt.Errorf("venue verification: %w", verr)
+		}
+		l.venueChecked = true
+		log.Printf("[auto] venue verified: account %s (%s) is the paper account the URL claims",
+			inside.ID, inside.AccountNumber)
 	}
 	equity, _ := strconv.ParseFloat(acct.Equity, 64)
 	pfv, _ := strconv.ParseFloat(acct.PortfolioValue, 64)
@@ -597,6 +658,16 @@ func (l *autoLoop) tick(ctx context.Context) error {
 	// protective order resting over no position is a short sale waiting
 	// to fill, and the monitor should not have to work around it.
 	l.maybeHeal(ctx)
+	// Recover any fill the broker has but the journal does not. This runs
+	// BEFORE the drawdown check and the ledger rebuild, because both derive
+	// their numbers from those rows: a missing fill is not a missing
+	// statistic, it is a halt that will not fire and a learner that will
+	// never see the trade.
+	if n, err := l.reconcileFills(ctx); err != nil {
+		log.Printf("[reconcile] fill reconciliation failed: %v", err)
+	} else if n > 0 {
+		log.Printf("[reconcile] recovered %d fill(s) the broker reported and the journal did not", n)
+	}
 	// Then fold newly closed round-trips into the ledger and let the
 	// learner recalibrate on its own cadence (every N closed trades, not
 	// every tick).
@@ -756,6 +827,9 @@ func (l *autoLoop) tickIntraday(ctx context.Context, pfv float64) error {
 
 // intraEntry places (or logs) one intraday entry with bracket protection.
 func (l *autoLoop) intraEntry(ctx context.Context, dec strategy.Decision, pfv float64) {
+	if l.exec != nil && l.exec.Kill != nil && l.exec.Kill.Halted() {
+		return // halted: no new risk, in either book
+	}
 	if !l.intraWin.CanTrade(dec.Symbol) {
 		return // per-symbol window check
 	}
@@ -788,7 +862,7 @@ func (l *autoLoop) intraEntry(ctx context.Context, dec strategy.Decision, pfv fl
 			plan.Symbol, plan.Qty, plan.Price, plan.Brackets.TakeProfit, plan.Brackets.StopLoss)
 		return
 	}
-	if err := l.exec.ExecuteEntry(ctx, plan, 1.0); err != nil {
+	if err := l.submitEntry(ctx, plan, 1.0); err != nil {
 		log.Printf("[intraday] %s entry rejected/failed: %v", plan.Symbol, err)
 		return
 	}
@@ -806,29 +880,28 @@ func (l *autoLoop) intraEntry(ctx context.Context, dec strategy.Decision, pfv fl
 }
 
 // intraExit closes an intraday position by symbol (live mode only).
+// intraExit closes one intraday-book position through the same exit
+// authority as the swing book: fresh position read, protection cleared
+// first, gate proven reducing, deterministic id.
 func (l *autoLoop) intraExit(ctx context.Context, dec strategy.Decision, why string) {
-	qty, err := positionQtyFor(ctx, l.client, dec.Symbol)
-	if err != nil || qty <= 0 {
+	autoJournal(l.journal, fmt.Sprintf("intraday-sell %s (%s)", dec.Symbol, why), dec.Symbol, "sell", 0)
+	if l.set.IntradayTrack == "shadow" {
+		log.Printf("[intraday] SHADOW SELL %s (%s)", dec.Symbol, why)
+		return
+	}
+	done, err := l.exec.ExecuteReduce(ctx, dec.Symbol, "intraday: "+why)
+	l.book.Invalidate()
+	if err != nil {
+		log.Printf("[intraday] %s close refused: %v", dec.Symbol, err)
+		return
+	}
+	if !done {
+		// Flat: drop the level so the held-map stops reporting a position
+		// that is not there (a stale level re-buys on the next tick).
 		_ = l.State().ClearLevelTrack(dec.Symbol, "intraday")
 		return
 	}
-	autoJournal(l.journal, fmt.Sprintf("intraday-sell %s qty=%s (%s)", dec.Symbol, trimNum(qty), why),
-		dec.Symbol, "sell", 0)
-	if l.set.IntradayTrack == "shadow" {
-		log.Printf("[intraday] SHADOW SELL %s qty=%s (%s)", dec.Symbol, trimNum(qty), why)
-		return
-	}
-	req := tools.OrderRequest{
-		Symbol: dec.Symbol, Side: "sell", Type: "market", TimeInForce: "gtc",
-		Qty: trimNum(qty),
-		ClientOrderID: fmt.Sprintf("intraday-eod-%s-%d-%d",
-			strategy.SanitizeSymbol(dec.Symbol), int64(qty*10000), time.Now().UTC().Truncate(24*time.Hour).Unix()),
-	}
-	if _, err := l.client.PlaceOrder(ctx, req); err != nil {
-		log.Printf("[intraday] %s close failed: %v", dec.Symbol, err)
-		return
-	}
-	log.Printf("[intraday] EXIT %s qty=%s placed (%s)", dec.Symbol, trimNum(qty), why)
+	log.Printf("[intraday] EXIT %s placed (%s)", dec.Symbol, why)
 	_ = l.State().ClearLevelTrack(dec.Symbol, "intraday")
 }
 
@@ -901,65 +974,29 @@ func (l *autoLoop) positionUsd(ctx context.Context, symbol string) float64 {
 	return 0
 }
 
-// closePosition places a reducing market order to fully exit a single
-// symbol. Used by the time-based close and the profit-target rebalancer.
-// The client_order_id is deterministic on (symbol, reason) so retries
-// dedupe on the broker side; the call is fire-and-forget for paper
-// trading.
+// closePosition exits a symbol from a scheduled policy: the max-hold
+// close and the profit-target rebalancer. It delegates the order to the
+// exit authority (Executor.ExecuteReduce) rather than assembling one,
+// because this path used to read its quantity from the tick-frozen
+// position cache — the same tick's earlier monitor pass or profit-take
+// could already have reduced or closed that position, and the stale number
+// was sent as a market sell against a smaller holding, which is an
+// unintended short.
 func (l *autoLoop) closePosition(ctx context.Context, symbol, reason string) {
-	pos, err := l.positionsCached(ctx)
+	if l.dryRun {
+		log.Printf("[auto] DRY-RUN close %s (%s)", symbol, reason)
+		return
+	}
+	done, err := l.exec.ExecuteReduce(ctx, symbol, reason)
+	l.book.Invalidate()
 	if err != nil {
-		log.Printf("[auto] %s close skipped: positions lookup failed: %v", symbol, err)
+		log.Printf("[auto] %s close refused: %v", symbol, err)
 		return
 	}
-	var found *tools.Position
-	for i := range pos {
-		if tools.SameSymbol(pos[i].Symbol, symbol) {
-			found = &pos[i]
-			break
-		}
+	if !done {
+		return // flat already: nothing to redeploy
 	}
-	if found == nil {
-		return
-	}
-	qty, _ := strconv.ParseFloat(found.Qty, 64)
-	if qty == 0 {
-		return
-	}
-	side := "sell"
-	if qty < 0 {
-		side = "buy"
-	}
-	tif := "gtc"
-	if tools.IsOCCSymbol(symbol) {
-		tif = "day"
-	}
-	clientID := fmt.Sprintf("auto-close-%s-%s-%d",
-		sanitizeForOrderID(symbol), reason, time.Now().UnixNano())
-	req := tools.OrderRequest{
-		Symbol:        symbol,
-		Side:          side,
-		Type:          "market",
-		TimeInForce:   tif,
-		Qty:           strconv.FormatFloat(math.Abs(qty), 'f', -1, 64),
-		ClientOrderID: clientID,
-	}
-	o, err := l.client.PlaceOrder(ctx, req)
-	if err != nil {
-		log.Printf("[auto] %s close failed: %v", symbol, err)
-		return
-	}
-	log.Printf("[auto] %s %s %s qty=%s order=%s",
-		symbol, reason, side, req.Qty, o.ID)
-	if l.journal != nil {
-		_ = l.journal.Append(pnl.Record{
-			Kind: pnl.KindDecision, Source: "strategy:auto", Risk: "APPROVED",
-			Symbol: symbol, Side: side,
-			Detail: fmt.Sprintf("close %s reason=%s side=%s qty=%s order=%s",
-				symbol, reason, side, req.Qty, o.ID),
-		})
-	}
-	_ = l.State().ClearLevel(symbol)
+	log.Printf("[auto] %s closed (%s)", symbol, reason)
 
 	// After the close settles, record the outcome to the stats ledger
 	// (recomputes the round-trip from journal fills) and immediately
@@ -972,9 +1009,8 @@ func (l *autoLoop) closePosition(ctx context.Context, symbol, reason string) {
 		_ = l.stats.persist()
 	}
 	// rebalanceAfterClose runs an immediate fresh-tick entry pass over
-	// the universe so the freed-up capital isn't idle until the next
-	// 5-minute poll. Pulls the live account portfolio value to size
-	// the new entries.
+	// the universe to redeploy the cash freed by a recent close. Pulls
+	// the live account portfolio value to size the new entries.
 	if acct, err := l.client.GetAccount(ctx); err == nil {
 		if pfv, perr := strconv.ParseFloat(acct.PortfolioValue, 64); perr == nil {
 			l.rebalanceAfterClose(ctx, pfv)
@@ -1166,6 +1202,12 @@ func formatVotes(votes []ensemble.VoiceVote) string {
 	return strings.Join(parts, ", ")
 }
 func (l *autoLoop) handleBuy(ctx context.Context, dec strategy.Decision, pfv, conf float64) {
+	// A halt suppresses NEW risk. It must never suppress an exit: that is
+	// the whole reason the drawdown halt exists.
+	if l.exec != nil && l.exec.Kill != nil && l.exec.Kill.Halted() {
+		log.Printf("[auto] %s BUY skipped: kill switch halted (entries closed, monitoring live)", dec.Symbol)
+		return
+	}
 	// Market state decides the ENTRY MODE: with PRE_ORDERS enabled an
 	// equity entry while the market is closed is queued as a resting
 	// limit/GTC bracket at the last close; otherwise a closed market
@@ -1283,7 +1325,7 @@ func (l *autoLoop) handleBuy(ctx context.Context, dec strategy.Decision, pfv, co
 				log.Printf("[auto] DRY-RUN option entry %s x%d (%s)", leg.OCC, leg.Contracts, dec.Symbol)
 				return
 			}
-			if err := l.exec.ExecuteOptionEntry(ctx, leg, conf); err != nil {
+			if err := l.submitOptionEntry(ctx, leg, conf); err != nil {
 				log.Printf("[auto] option entry %s failed: %v", leg.OCC, err)
 				return
 			}
@@ -1300,7 +1342,7 @@ func (l *autoLoop) handleBuy(ctx context.Context, dec strategy.Decision, pfv, co
 			plan.Symbol, plan.Qty, plan.Price, plan.Brackets.TakeProfit, plan.Brackets.StopLoss)
 		return
 	}
-	if err := l.exec.ExecuteEntry(ctx, plan, conf); err != nil {
+	if err := l.submitEntry(ctx, plan, conf); err != nil {
 		log.Printf("[auto] %s entry rejected/failed: %v", plan.Symbol, err)
 	}
 }
@@ -1368,7 +1410,7 @@ func (l *autoLoop) preOrder(ctx context.Context, dec strategy.Decision, pfv, con
 				dec.Symbol, "buy", conf)
 			if l.dryRun {
 				log.Printf("[auto] DRY-RUN PRE-ORDER option %s x%d (%s)", leg.OCC, leg.Contracts, dec.Symbol)
-			} else if err := l.exec.ExecuteOptionEntry(ctx, leg, conf); err != nil {
+			} else if err := l.submitOptionEntry(ctx, leg, conf); err != nil {
 				log.Printf("[auto] pre-order option %s failed: %v", leg.OCC, err)
 			} else {
 				log.Printf("[auto] PRE-ORDER OPTION %s x%d for %s", leg.OCC, leg.Contracts, dec.Symbol)
@@ -1385,38 +1427,34 @@ func (l *autoLoop) preOrder(ctx context.Context, dec strategy.Decision, pfv, con
 			plan.Symbol, plan.Qty, plan.Price, plan.Brackets.TakeProfit, plan.Brackets.StopLoss)
 		return
 	}
-	if err := l.exec.ExecutePreOrder(ctx, plan, conf); err != nil {
+	if err := l.submitPreOrder(ctx, plan, conf); err != nil {
 		log.Printf("[auto] %s pre-order rejected/failed: %v", dec.Symbol, err)
 	}
 }
 
+// handleSell exits a symbol on a signal. It used to refuse when the
+// current time fell outside the ENTRY trading window, and to skip any
+// position whose quantity was not positive — so a short could never be
+// closed by a signal, and an exit could be blocked by the schedule that
+// governs opening risk. Neither policy belongs here: the window answers
+// "may this bot take on exposure now?", not "may it shed exposure?".
 func (l *autoLoop) handleSell(ctx context.Context, dec strategy.Decision) {
-	if !l.windows.CanTrade(dec.Symbol) {
-		log.Printf("[auto] %s SELL outside window; skipped", dec.Symbol)
-		return
-	}
 	autoJournal(l.journal, "sell-exit "+dec.Symbol+" "+dec.Reason, dec.Symbol, "sell", 0)
 	if l.dryRun {
 		log.Printf("[auto] DRY-RUN SELL %s: %s", dec.Symbol, dec.Reason)
 		return
 	}
-	qty, err := positionQtyFor(ctx, l.client, dec.Symbol)
-	if err != nil || qty <= 0 {
-		log.Printf("[auto] %s exit: no live position found", dec.Symbol)
+	done, err := l.exec.ExecuteReduce(ctx, dec.Symbol, dec.Reason)
+	l.book.Invalidate()
+	if err != nil {
+		log.Printf("[auto] %s exit refused: %v", dec.Symbol, err)
 		return
 	}
-	req := tools.OrderRequest{
-		Symbol: dec.Symbol, Side: "sell", Type: "market",
-		TimeInForce: exitTIF(dec.Symbol), Qty: trimNum(qty),
-	}
-	if _, err := l.client.PlaceOrder(ctx, req); err != nil {
-		log.Printf("[auto] %s exit order failed: %v", dec.Symbol, err)
+	if !done {
+		log.Printf("[auto] %s exit: nothing held to reduce", dec.Symbol)
 		return
 	}
-	log.Printf("[auto] EXIT %s qty=%s placed (%s)", dec.Symbol, trimNum(qty), dec.Reason)
-	autoJournal(l.journal, fmt.Sprintf("exit %s qty=%s", dec.Symbol, trimNum(qty)),
-		dec.Symbol, "sell", 0)
-	_ = l.exec.State.ClearLevel(dec.Symbol)
+	log.Printf("[auto] EXIT %s placed (%s)", dec.Symbol, dec.Reason)
 }
 
 // ---- small helpers ----
@@ -1499,41 +1537,112 @@ func (l *autoLoop) startingEquity() float64 {
 	if l.exec == nil || l.exec.State == nil {
 		return 0
 	}
-	type adaptiveBlob struct {
-		StartingEquity float64 `json:"starting_equity"`
-	}
-	var blob adaptiveBlob
-	path := l.exec.State.Path()
-	if path == "" {
+	// Read through the typed store. The previous version parsed the file
+	// itself, which masked a defect: the field was not part of the persisted
+	// document, so every Heartbeat marshalled the struct and DROPPED it. The
+	// adaptive baseline was destroyed on every tick, the P/L multiplier sat
+	// at 1.0 forever, and the dashboard reported a baseline the bot did not
+	// have.
+	v, err := l.exec.State.ReadStartingEquity()
+	if err != nil {
+		log.Printf("[auto] starting_equity read failed: %v", err)
 		return 0
 	}
-	if data, err := os.ReadFile(path); err == nil {
-		_ = json.Unmarshal(data, &blob)
-	}
-	return blob.StartingEquity
+	return v
 }
 
-// persistStartingEquity writes the starting_equity key into the strategy
-// state file. Idempotent on re-read: startingEquity() returns the
-// non-zero value on next boot and skip this path. The state file is a
-// JSON blob; the executor's State store is what reads/writes it for
-// positions/levels, so we patch the file in place to add our field
-// without disturbing the executor's schema.
+// persistStartingEquity records the adaptive-sizing baseline once, through
+// the typed store, so the value survives the per-tick heartbeat writes.
 func (l *autoLoop) persistStartingEquity(equity float64) {
-	if l.exec == nil || l.exec.State == nil {
+	if l.exec == nil || l.exec.State == nil || equity <= 0 {
 		return
 	}
-	path := l.exec.State.Path()
-	if path == "" {
+	wrote, err := l.exec.State.SetStartingEquityIfUnset(equity)
+	if err != nil {
+		log.Printf("[auto] starting_equity write failed: %v", err)
 		return
 	}
-	existing := map[string]any{}
-	if data, err := os.ReadFile(path); err == nil {
-		_ = json.Unmarshal(data, &existing)
+	if wrote {
+		log.Printf("[auto] adaptive sizing baseline set to %.2f", equity)
 	}
-	existing["starting_equity"] = equity
-	if out, err := json.MarshalIndent(existing, "", "  "); err == nil {
-		_ = os.WriteFile(path, out, 0o644)
+}
+
+// applyConfigOverrides reads the dashboard-owned knobs and applies them to
+// this process's live config.
+//
+// Before the single-writer split the API wrote these keys into the bot's
+// strategy-state.json, which the bot never read: the dashboard's risk knobs
+// were decorative for the trading process. Reading the API's own file makes
+// them real. The read is mtime-gated (one stat per tick) and applies only
+// positive values, so a key the operator never set keeps the env default
+// rather than zeroing a cap.
+func (l *autoLoop) applyConfigOverrides() {
+	if l.exec == nil || l.exec.State == nil || l.cfg == nil {
+		return
+	}
+	path := strategy.ConfigOverridesPath(l.exec.State.Path())
+	st, err := os.Stat(path)
+	if err != nil {
+		return // no overrides yet: env stands
+	}
+	if !l.overridesAt.IsZero() && st.ModTime().Equal(l.overridesAt) {
+		return
+	}
+	ov, err := strategy.LoadConfigOverrides(path)
+	if err != nil {
+		// A corrupt overrides file must not silently zero the operator's
+		// caps, and must not be applied partially either.
+		log.Printf("[config] overrides unreadable (%v); keeping the current settings", err)
+		return
+	}
+	l.overridesAt = st.ModTime()
+
+	var applied []string
+	if ov.MaxPositionUSD > 0 && ov.MaxPositionUSD != l.cfg.MaxPositionUSD {
+		l.cfg.MaxPositionUSD = ov.MaxPositionUSD
+		applied = append(applied, fmt.Sprintf("max_position_usd=%.2f", ov.MaxPositionUSD))
+	}
+	if ov.MaxPortfolioPct > 0 && ov.MaxPortfolioPct != l.cfg.MaxPortfolioPct {
+		l.cfg.MaxPortfolioPct = ov.MaxPortfolioPct
+		applied = append(applied, fmt.Sprintf("max_portfolio_pct=%.4f", ov.MaxPortfolioPct))
+	}
+	if ov.CryptoMaxPositionUSD > 0 && ov.CryptoMaxPositionUSD != l.cfg.CryptoMaxPositionUSD {
+		l.cfg.CryptoMaxPositionUSD = ov.CryptoMaxPositionUSD
+		applied = append(applied, fmt.Sprintf("crypto_max_position_usd=%.2f", ov.CryptoMaxPositionUSD))
+	}
+	if ov.MinConfidence > 0 && ov.MinConfidence != l.cfg.MinConfidence {
+		l.cfg.MinConfidence = ov.MinConfidence
+		applied = append(applied, fmt.Sprintf("min_confidence=%.4f", ov.MinConfidence))
+	}
+	// Drawdown halts live on a COPY inside the monitor, so the monitor's
+	// settings must be updated too or the dashboard's halt change would
+	// apply to the gate and not to the thing that watches drawdown.
+	if l.monitor != nil {
+		if ov.DailyDDHalt > 0 && ov.DailyDDHalt != l.monitor.Settings.DailyDD {
+			l.monitor.Settings.DailyDD = ov.DailyDDHalt
+			l.set.DailyDD = ov.DailyDDHalt
+			applied = append(applied, fmt.Sprintf("daily_dd_halt=%.4f", ov.DailyDDHalt))
+		}
+		if ov.WeeklyDDHalt > 0 && ov.WeeklyDDHalt != l.monitor.Settings.WeeklyDD {
+			l.monitor.Settings.WeeklyDD = ov.WeeklyDDHalt
+			l.set.WeeklyDD = ov.WeeklyDDHalt
+			applied = append(applied, fmt.Sprintf("weekly_dd_halt=%.4f", ov.WeeklyDDHalt))
+		}
+		if ov.TotalDDHalt > 0 && ov.TotalDDHalt != l.monitor.Settings.TotalDD {
+			l.monitor.Settings.TotalDD = ov.TotalDDHalt
+			l.set.TotalDD = ov.TotalDDHalt
+			applied = append(applied, fmt.Sprintf("total_dd_halt=%.4f", ov.TotalDDHalt))
+		}
+	}
+	if len(applied) == 0 {
+		return
+	}
+	log.Printf("[config] applied dashboard overrides: %s", strings.Join(applied, ", "))
+	if l.journal != nil {
+		_ = l.journal.Append(pnl.Record{
+			Kind: pnl.KindDecision, Source: "config:overrides", Risk: "APPROVED",
+			Detail: "applied dashboard risk overrides: " + strings.Join(applied, ", "),
+		})
 	}
 }
 
