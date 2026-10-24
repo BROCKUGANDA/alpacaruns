@@ -52,16 +52,16 @@ type KillSwitch struct {
 // does not need to expose keys; only sizing, halt thresholds, the LLM
 // provider label, options toggle and the symbol universe.
 type StatusConfig struct {
-	MaxPositionUSD      float64  `json:"max_position_usd"`
-	MaxPortfolioPct     float64  `json:"max_portfolio_pct"`
-	CryptoMaxPositionUSD float64 `json:"crypto_max_position_usd"`
-	DailyDDHalt         float64  `json:"daily_dd_halt"`
-	WeeklyDDHalt        float64  `json:"weekly_dd_halt"`
-	TotalDDHalt         float64  `json:"total_dd_halt"`
-	LLMProvider         string   `json:"llm_provider"`
-	OptionsEnabled      bool     `json:"options_enabled"`
-	Symbols             []string `json:"symbols"`
-	EnsembleEnabled     bool     `json:"ensemble_enabled"`
+	MaxPositionUSD       float64  `json:"max_position_usd"`
+	MaxPortfolioPct      float64  `json:"max_portfolio_pct"`
+	CryptoMaxPositionUSD float64  `json:"crypto_max_position_usd"`
+	DailyDDHalt          float64  `json:"daily_dd_halt"`
+	WeeklyDDHalt         float64  `json:"weekly_dd_halt"`
+	TotalDDHalt          float64  `json:"total_dd_halt"`
+	LLMProvider          string   `json:"llm_provider"`
+	OptionsEnabled       bool     `json:"options_enabled"`
+	Symbols              []string `json:"symbols"`
+	EnsembleEnabled      bool     `json:"ensemble_enabled"`
 }
 
 // StatusResponse is the shape of GET /api/status.
@@ -134,18 +134,18 @@ type PnLResponse struct {
 // map (trend / momentum / volume / vol / sentiment) when the
 // underlying journal entry carries them; otherwise nil.
 type TradeRow struct {
-	ID            string             `json:"id"`
-	TS            time.Time          `json:"ts"`
-	Symbol        string             `json:"symbol"`
-	Side          string             `json:"side"`
-	Qty           string             `json:"qty"`
-	Price         string             `json:"price"`
-	Status        string             `json:"status"`
-	Path          string             `json:"path"` // agent | ensemble | manual | auto
-	Confidence    *float64           `json:"confidence,omitempty"`
-	FactorScores  map[string]float64 `json:"factor_scores,omitempty"`
-	Notional      float64            `json:"notional,omitempty"`
-	UnrealizedPL  string             `json:"unrealized_pl,omitempty"` // closed-loop realized P/L when known
+	ID           string             `json:"id"`
+	TS           time.Time          `json:"ts"`
+	Symbol       string             `json:"symbol"`
+	Side         string             `json:"side"`
+	Qty          string             `json:"qty"`
+	Price        string             `json:"price"`
+	Status       string             `json:"status"`
+	Path         string             `json:"path"` // agent | ensemble | manual | auto
+	Confidence   *float64           `json:"confidence,omitempty"`
+	FactorScores map[string]float64 `json:"factor_scores,omitempty"`
+	Notional     float64            `json:"notional,omitempty"`
+	UnrealizedPL string             `json:"unrealized_pl,omitempty"` // closed-loop realized P/L when known
 }
 
 // TradesResponse is the shape of GET /api/trades. next_cursor is
@@ -183,15 +183,15 @@ type DecisionsResponse struct {
 
 // PositionRow is one row of GET /api/positions.
 type PositionRow struct {
-	Symbol          string    `json:"symbol"`
-	Qty             string    `json:"qty"`
-	AvgEntryPrice   string    `json:"avg_entry_price"`
-	CurrentPrice    string    `json:"current_price"`
-	MarketValue     string    `json:"market_value"`
-	UnrealizedPL    string    `json:"unrealized_pl"`
-	UnrealizedPLPct string    `json:"unrealized_pl_pct"`
-	ChangeToday     string    `json:"change_today,omitempty"`
-	Side            string    `json:"side"`
+	Symbol          string `json:"symbol"`
+	Qty             string `json:"qty"`
+	AvgEntryPrice   string `json:"avg_entry_price"`
+	CurrentPrice    string `json:"current_price"`
+	MarketValue     string `json:"market_value"`
+	UnrealizedPL    string `json:"unrealized_pl"`
+	UnrealizedPLPct string `json:"unrealized_pl_pct"`
+	ChangeToday     string `json:"change_today,omitempty"`
+	Side            string `json:"side"`
 	// Since is the entry time of the bot's last recorded bracket for
 	// this symbol (zero when no bracket is stored, e.g. a position
 	// the bot inherited from a prior run). The dashboard renders it
@@ -205,10 +205,13 @@ type PositionRow struct {
 // server returns the resulting pause flag and the tick number so the
 // UI can refresh without a second round-trip.
 type ControlResponse struct {
-	Action   string    `json:"action"`              // pause | resume | step
-	Paused   bool      `json:"paused"`              // resulting flag value
-	Tick     int64     `json:"tick"`                // most recent bot tick at time of action
-	Result   string    `json:"result,omitempty"`    // for /step, the human-readable outcome
+	Action string `json:"action"`           // pause | resume | step
+	Paused bool   `json:"paused"`           // resulting flag value
+	Tick   int64  `json:"tick"`             // most recent bot tick at time of action
+	Result string `json:"result,omitempty"` // for /step, the human-readable outcome
+	// Actor names the operator who took the action, when named operator
+	// tokens are configured. Attribution in the response as well as the log.
+	Actor    string       `json:"actor,omitempty"`
 	Decision *DecisionRow `json:"decision,omitempty"` // for /step, the decision the bot just made
 }
 
@@ -260,14 +263,14 @@ type ConfigUpdateRequest struct {
 // are set — Alpaca semantics). ExtendedHours is honored only for
 // type=limit + day|gtc; the validator rejects bad combos.
 type TradeProposalRequest struct {
-	Symbol        string  `json:"symbol"`
-	Side          string  `json:"side"` // buy | sell
-	Qty           string  `json:"qty,omitempty"`
-	Notional      string  `json:"notional,omitempty"`
-	OrderType     string  `json:"order_type,omitempty"`     // market | limit
-	TimeInForce   string  `json:"time_in_force,omitempty"` // day | gtc
-	LimitPrice    string  `json:"limit_price,omitempty"`
-	ExtendedHours bool    `json:"extended_hours,omitempty"`
+	Symbol        string   `json:"symbol"`
+	Side          string   `json:"side"` // buy | sell
+	Qty           string   `json:"qty,omitempty"`
+	Notional      string   `json:"notional,omitempty"`
+	OrderType     string   `json:"order_type,omitempty"`    // market | limit
+	TimeInForce   string   `json:"time_in_force,omitempty"` // day | gtc
+	LimitPrice    string   `json:"limit_price,omitempty"`
+	ExtendedHours bool     `json:"extended_hours,omitempty"`
 	Confidence    *float64 `json:"confidence,omitempty"`
 }
 
@@ -288,10 +291,10 @@ type TradeSimulationResponse struct {
 // paused; "live" when an actual order was placed. approved=false
 // always carries at least one reason.
 type TradeExecutionResponse struct {
-	Approved bool       `json:"approved"`
-	Mode     string     `json:"mode"` // simulated | live
-	Reasons  []string   `json:"reasons,omitempty"`
-	Notional float64    `json:"notional"`
+	Approved bool        `json:"approved"`
+	Mode     string      `json:"mode"` // simulated | live
+	Reasons  []string    `json:"reasons,omitempty"`
+	Notional float64     `json:"notional"`
 	Order    *TradeOrder `json:"order,omitempty"`
 }
 
@@ -299,13 +302,13 @@ type TradeExecutionResponse struct {
 // renders next to the risk verdict. Mirrors tools.OrderRequest so
 // the UI can paste it back into the Alpaca UI for confirmation.
 type TradeOrder struct {
-	Symbol        string  `json:"symbol"`
-	Side          string  `json:"side"`
-	Qty           string  `json:"qty,omitempty"`
-	Notional      string  `json:"notional,omitempty"`
-	OrderType     string  `json:"order_type,omitempty"`
-	TimeInForce   string  `json:"time_in_force,omitempty"`
-	LimitPrice    string  `json:"limit_price,omitempty"`
-	ExtendedHours bool    `json:"extended_hours,omitempty"`
-	ClientOrderID string  `json:"client_order_id,omitempty"`
+	Symbol        string `json:"symbol"`
+	Side          string `json:"side"`
+	Qty           string `json:"qty,omitempty"`
+	Notional      string `json:"notional,omitempty"`
+	OrderType     string `json:"order_type,omitempty"`
+	TimeInForce   string `json:"time_in_force,omitempty"`
+	LimitPrice    string `json:"limit_price,omitempty"`
+	ExtendedHours bool   `json:"extended_hours,omitempty"`
+	ClientOrderID string `json:"client_order_id,omitempty"`
 }

@@ -620,6 +620,12 @@ go run ./cmd/alpacaruns trade --symbol TSLA --side buy --qty 1
 go run ./cmd/alpacaruns chain --symbol AAPL --exp 2026-09-18 --type call
 go run ./cmd/alpacaruns factors --symbol AAPL
 go run ./cmd/alpacaruns pl --since 2026-08-01
+
+# research: replay the rule over history, per walk-forward fold. Never trades.
+go run ./cmd/alpacaruns research --symbols SPY,QQQ --from 2024-01-01 --to 2025-01-01     --folds 4 --spread-bps 2 --slippage-bps 3
+
+# mirror: build/verify the SQLite view of the journal + state. Exit 1 if they differ.
+go run ./cmd/alpacaruns mirror
 ```
 
 `auto` is the recommended entry point. `monitor` (the LLM-gated path),
@@ -879,18 +885,59 @@ orders ungated") are not listed, because they were already true.
 | Non-tradable symbols | The picker recorded `tradable` but the trading universe ignored it, so delisted/halted/renamed tickers were scored and rejected once per poll | The loop scores `TradableSymbols()` and logs what it excluded |
 | Unpinned MCP server | `uvx alpaca-mcp-server` floated to whatever build PyPI served; the guard classifies tool names, so an unannounced upgrade changes the surface it was written against | Pinned to `alpaca-mcp-server==2.4.0` (override with `ALPACA_MCP_SPEC`), and the spec is logged at launch |
 
-Still open, and deliberately not attempted here: migrating the JSON/JSONL
-state to SQLite (the single-writer split removes the corruption class
-without a rewrite that would touch every reader while a monitor is live);
-a full OMS with replace/cancel-replace chains (the bot cancels and re-places
-by design, and the ambiguity that matters — a lost response — is now
-resolved by id); an experiment registry and walk-forward harness (no
-backtester exists, so nothing here has been validated out-of-sample, and a
-credible one is its own project); corporate-action metadata beyond
-tradability (splits are handled in the data, but symbol changes, mergers and
-delistings still have no reference-data versioning); per-actor operator
-identity (one shared token, so attribution is by IP and revocation is a
-global rotation); and prompt-injection hardening for news/tool text.
+### The research harness, and what it is for
+
+`research/` replays the **same** scoring code the bot runs
+(`factors.ScoreBars`) over historical bars and reports what the rule would
+have produced, per chronological walk-forward fold. Three properties are
+enforced in code and pinned by tests, because each is how a backtest lies:
+
+- a signal computed from bar N executes at bar **N+1's open** (a test buys
+  through a 20% opening gap and asserts the fill is the gap, not the signal
+  bar's close);
+- when a bar's range covers both the stop and the target, the **stop** is
+  booked (OHLC does not say which came first);
+- every trade pays the configured spread, slippage and commission.
+
+Every run is appended to `data/research-runs.jsonl` with its parameter hash,
+and a repeated parameter set is flagged — the tenth tweak of one parameter
+set is not ten independent experiments. The report says what it does not
+cover: no intraday path, no borrow, no partial fills, no market impact. It is
+a screen, not a validation.
+
+### The SQLite stage
+
+`store/` mirrors fills, intents, decisions, levels and the state scalars into
+`data/alpacaruns.db`. The JSON/JSONL files remain the **write** path — one
+writer each, atomic rename — and `Verify()` replays both sides and reports
+every disagreement before anything reads from the mirror. `alpacaruns mirror`
+runs it once (exit 1 on divergence); the bot ingests per tick and verifies
+every tenth tick, journaling a `mirror:verify` finding if the two ever differ.
+A cut-over that moved the live monitor onto a schema change in one commit
+would have put position protection on the critical path of a migration; this
+does not.
+
+### What is still open
+
+- **Replace / cancel-replace chains — measured as unavailable.** `PATCH
+  /v2/orders/{id}` returns `422 "cannot replace order in accepted status"` on
+  this venue for our resting orders, which stay in `accepted`. The bot
+  continues to cancel-and-place, which is the only path the broker allows;
+  the replacement lineage fields Alpaca returns are mirrored when present.
+- **Renames and mergers.** Tradability flips and disappearances are now
+  recorded in versioned snapshots (`data/refdata.json`) and journaled as
+  `refdata:*` events, but mapping an old ticker to a new one needs an
+  external source. Guessing would move protection to the wrong instrument.
+- **Per-actor identity is named, not federated.** `DASHBOARD_TOKENS=alice:…`
+  gives attribution and per-name revocation; there is no SSO and one
+  credential per operator is still a static secret.
+- **Prompt injection is bounded, not solved** — untrusted text is enveloped,
+  length-capped and flagged (`agents.WrapUntrusted`), and the deterministic
+  path never consumes prose. A model can still be persuaded by well-formed
+  data; the mitigation is that no agent output can place an order.
+- **No out-of-sample evidence yet.** The harness exists; running it on the
+  shipped thresholds and reporting the result honestly is the next step, and
+  a losing result is a valid outcome.
 
 ---
 

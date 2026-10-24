@@ -741,12 +741,14 @@ func (s *Server) handleControlPause(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "write_flag", "cannot update pause flag")
 		return
 	}
-	log.Printf("[api] pause flag engaged via /api/control/pause from %s", s.clientKey(r))
+	actor := s.actingActor(r)
+	log.Printf("[api] pause flag engaged by %s from %s", actor, s.clientKey(r))
 	writeJSON(w, http.StatusOK, ControlResponse{
 		Action: "pause",
 		Paused: true,
 		Tick:   s.tickNumber.Load(),
 		Result: "paused: new entries skipped, monitor loop alive",
+		Actor:  actor,
 	})
 }
 
@@ -766,12 +768,14 @@ func (s *Server) handleControlResume(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "write_flag", "cannot update pause flag")
 		return
 	}
-	log.Printf("[api] pause flag cleared via /api/control/resume from %s", s.clientKey(r))
+	actor := s.actingActor(r)
+	log.Printf("[api] pause flag cleared by %s from %s", actor, s.clientKey(r))
 	writeJSON(w, http.StatusOK, ControlResponse{
 		Action: "resume",
 		Paused: false,
 		Tick:   s.tickNumber.Load(),
 		Result: "running: new entries enabled",
+		Actor:  actor,
 	})
 }
 

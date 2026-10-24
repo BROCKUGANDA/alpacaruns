@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/BROCKUGANDA/alpacaruns/a2a"
+	"github.com/BROCKUGANDA/alpacaruns/agents"
 	"github.com/BROCKUGANDA/alpacaruns/pnl"
 	"github.com/BROCKUGANDA/alpacaruns/risk"
 	"github.com/BROCKUGANDA/alpacaruns/strategy"
@@ -209,6 +210,15 @@ func (l *autoLoop) journalA2A(sig a2a.Signal, risk string, detail string) {
 		return
 	}
 	conf := sig.Confidence
+	// The peer's own text is attacker-controlled. It is journalled inside an
+	// untrusted envelope (length-capped, control characters stripped) so it
+	// cannot pose as a system line in a log a human or a model later reads.
+	// If it looks like an instruction aimed at the model, say so.
+	reason := agents.WrapUntrusted("peer-reason", sig.Reason)
+	if agents.LooksLikeInjection(sig.Reason) {
+		reason += " [FLAGGED: instruction-like text from a peer]"
+		log.Printf("[a2a] %s signal %s carries instruction-like text; flagged in the journal", sig.Agent, sig.ID)
+	}
 	_ = l.journal.Append(pnl.Record{
 		Kind:       pnl.KindDecision,
 		Source:     "a2a:" + sig.Agent,
@@ -216,7 +226,7 @@ func (l *autoLoop) journalA2A(sig a2a.Signal, risk string, detail string) {
 		Side:       strings.ToLower(strings.TrimSpace(sig.Side)),
 		Risk:       risk,
 		Confidence: &conf,
-		Detail:     fmt.Sprintf("a2a signal %s %s: %s", sig.ID, sig.Symbol, detail),
+		Detail:     fmt.Sprintf("a2a signal %s %s: %s %s", sig.ID, sig.Symbol, detail, reason),
 	})
 }
 

@@ -42,7 +42,16 @@ type Config struct {
 	// AlpacaMCPSpec overrides the pinned uvx spec for the Alpaca MCP server
 	// (default: agents.DefaultMCPServerSpec). Changing it changes which tools
 	// the risk guard is classifying, so it is an explicit act.
-	AlpacaMCPSpec        string
+	AlpacaMCPSpec string
+	// DashboardTokens names the operators who may drive the control
+	// endpoints, "alice:token,bob:token". One shared token cannot say WHO
+	// acted, and revoking one operator means rotating everyone's credential;
+	// named tokens give attribution in the journal and per-name revocation.
+	// DASHBOARD_TOKEN remains supported as the unnamed fallback.
+	DashboardTokens map[string]string
+	// MirrorEnabled keeps a verified SQLite mirror of the journal and state
+	// next to them. The files remain the write path; see package store.
+	MirrorEnabled        bool
 	GeminiAPIKey         string
 	Mode                 Mode
 	PollSeconds          int     // monitoring loop interval
@@ -198,6 +207,21 @@ func Load(envFile string) (*Config, error) {
 		return nil, err
 	} else {
 		c.PreOrders = po
+	}
+
+	tokens, err := parseNamedTokens("DASHBOARD_TOKENS", os.Getenv("DASHBOARD_TOKENS"))
+	if err != nil {
+		return nil, err
+	}
+	c.DashboardTokens = tokens
+
+	// SQLITE_MIRROR keeps a verified SQLite mirror of the journal and state
+	// (default on). It is a queryable view, not the write path; set it to
+	// false to run with the files alone.
+	if mm, err := getBool("SQLITE_MIRROR", true); err != nil {
+		return nil, err
+	} else {
+		c.MirrorEnabled = mm
 	}
 
 	switch p := LLMProvider(strings.ToLower(strings.TrimSpace(getEnv("LLM_PROVIDER", "")))); p {
@@ -429,6 +453,12 @@ func splitCSV(v string) []string {
 // the shared token while the operator believes otherwise. A duplicate agent
 // is ambiguous for the same reason and is also rejected.
 func parsePeerTokens(v string) (map[string]string, error) {
+	return parseNamedTokens("A2A_PEER_TOKENS", v)
+}
+
+// parseNamedTokens reads "name:token,name2:token2". The env name is a
+// parameter so errors name the key the operator set.
+func parseNamedTokens(envName, v string) (map[string]string, error) {
 	v = strings.TrimSpace(v)
 	if v == "" {
 		return nil, nil
@@ -441,16 +471,16 @@ func parsePeerTokens(v string) (map[string]string, error) {
 		}
 		i := strings.Index(part, ":")
 		if i <= 0 || i == len(part)-1 {
-			return nil, fmt.Errorf("A2A_PEER_TOKENS entry %q is not agent:token", part)
+			return nil, fmt.Errorf("%s entry %q is not name:token", envName, part)
 		}
 		agent := strings.TrimSpace(part[:i])
 		token := strings.TrimSpace(part[i+1:])
 		if agent == "" || token == "" {
-			return nil, fmt.Errorf("A2A_PEER_TOKENS entry %q has an empty agent or token", part)
+			return nil, fmt.Errorf("%s entry %q has an empty name or token", envName, part)
 		}
 		key := strings.ToLower(agent)
 		if _, dup := out[key]; dup {
-			return nil, fmt.Errorf("A2A_PEER_TOKENS lists agent %q twice", agent)
+			return nil, fmt.Errorf("%s lists %q twice", envName, agent)
 		}
 		out[key] = token
 	}

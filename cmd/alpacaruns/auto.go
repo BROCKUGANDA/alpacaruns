@@ -28,7 +28,9 @@ import (
 	"github.com/BROCKUGANDA/alpacaruns/options"
 	"github.com/BROCKUGANDA/alpacaruns/picker"
 	"github.com/BROCKUGANDA/alpacaruns/pnl"
+	"github.com/BROCKUGANDA/alpacaruns/refdata"
 	"github.com/BROCKUGANDA/alpacaruns/selfheal"
+	"github.com/BROCKUGANDA/alpacaruns/store"
 	"github.com/BROCKUGANDA/alpacaruns/strategy"
 	"github.com/BROCKUGANDA/alpacaruns/strategy/ensemble"
 	"github.com/BROCKUGANDA/alpacaruns/tools"
@@ -67,6 +69,9 @@ type autoLoop struct {
 	// broker, which is what downgrades the first-pass wide window to the
 	// per-tick one.
 	fillBackfilled bool
+	// mirror is the SQLite view of the journal and state, opened lazily and
+	// verified on a cadence. nil when SQLITE_MIRROR=false.
+	mirror *store.DB
 	// ensemble is non-nil only when ENSEMBLE_ENABLED=true; nil keeps the
 	// original single-expert tick path bit-for-bit.
 	ensemble *ensemble.Runner
@@ -171,6 +176,10 @@ func (l *autoLoop) refreshRegistry(ctx context.Context) (*picker.Registry, error
 	// out loud: a configured ticker that has been delisted, halted or
 	// renamed otherwise just stops appearing in decisions, which looks
 	// identical to "no signal today".
+	// Reference data is versioned so a disappearance or a tradability flip is
+	// a reported event rather than an absence of signals. This is the only
+	// record of what the broker said yesterday.
+	l.recordReferenceData(reg)
 	if bad := reg.Untradable(); len(bad) > 0 {
 		names := make([]string, 0, len(bad))
 		for _, i := range bad {
@@ -238,6 +247,7 @@ func cmdAuto(args []string) int {
 		return code
 	}
 	defer loop.journal.Close()
+	defer loop.closeMirror()
 
 	log.Printf("[auto] deterministic loop start: equities=%v etfs=%v indices=%v crypto=%v options=%v poll=%ds dry-run=%t",
 		loop.set.EquitySymbols, loop.set.ETFSymbols, loop.set.IndexSymbols,
@@ -678,6 +688,7 @@ func (l *autoLoop) tick(ctx context.Context) error {
 	// their numbers from those rows: a missing fill is not a missing
 	// statistic, it is a halt that will not fire and a learner that will
 	// never see the trade.
+	l.mirrorTick(ctx)
 	if n, err := l.reconcileFills(ctx); err != nil {
 		log.Printf("[reconcile] fill reconciliation failed: %v", err)
 	} else if n > 0 {
@@ -1713,4 +1724,32 @@ func defaultPauseFlagPath(tradeLog string) string {
 		return "data/paused"
 	}
 	return filepath.Join(dir, "paused")
+}
+
+// recordReferenceData saves a versioned snapshot of the universe and journals
+// what changed since the last one. Failures are logged, never fatal: research
+// bookkeeping must not stop the monitor.
+func (l *autoLoop) recordReferenceData(reg *picker.Registry) {
+	if reg == nil || l.journal == nil {
+		return
+	}
+	path := refdata.Path(l.journal.Path())
+	prev, err := refdata.Load(path)
+	if err != nil {
+		// A corrupt snapshot must not be read as "everything appeared".
+		log.Printf("[refdata] previous snapshot unreadable (%v); starting a new one", err)
+	}
+	snap := refdata.Build(reg.Instruments(), time.Now())
+	snap.Version = prev.Version + 1
+	changes := refdata.Diff(prev, snap)
+	for _, c := range changes {
+		log.Printf("[refdata] %s %s: %s", c.Kind, c.Symbol, c.Detail)
+		_ = l.journal.Append(pnl.Record{
+			Kind: pnl.KindDecision, Source: "refdata:" + string(c.Kind),
+			Risk: "HEAL_NOTED", Symbol: c.Symbol, Detail: c.Detail,
+		})
+	}
+	if _, err := refdata.Save(path, snap); err != nil {
+		log.Printf("[refdata] snapshot not saved: %v", err)
+	}
 }

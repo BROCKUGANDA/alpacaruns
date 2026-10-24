@@ -98,30 +98,55 @@ func (s *Server) authorizeControl(w http.ResponseWriter, r *http.Request) bool {
 	return false
 }
 
-// validBearer compares the request's bearer token against the
-// configured AuthToken in constant time. Empty configured token
-// never validates (avoids matching an empty Authorization header).
-func (s *Server) validBearer(r *http.Request) bool {
-	want := s.settings.AuthToken
-	if want == "" {
-		return false
+// actorFor resolves WHO is acting, from the bearer token.
+//
+// One shared token cannot say who paused the bot or changed its risk caps,
+// and revoking one operator meant rotating everyone's credential. Named
+// operator tokens (DASHBOARD_TOKENS=alice:token,bob:token) fix both: the
+// journal records the name, and revocation is deleting one entry.
+//
+// Returns "" when the caller presented no credential or an unrecognised one.
+// "operator" is the shared DASHBOARD_TOKEN, which stays supported.
+func (s *Server) actorFor(r *http.Request) string {
+	got, ok := bearerToken(r)
+	if !ok {
+		return ""
 	}
-	h := r.Header.Get("Authorization")
-	if h == "" {
-		return false
+	if want := strings.TrimSpace(s.settings.AuthToken); want != "" &&
+		subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1 {
+		return "operator"
 	}
-	// Accept "Bearer <token>" (case-insensitive scheme); anything
-	// else is not a bearer credential.
-	parts := strings.SplitN(h, " ", 2)
-	if len(parts) != 2 || !strings.EqualFold(strings.TrimSpace(parts[0]), "bearer") {
-		return false
+	if s.cfg != nil {
+		s.cfgMu.RLock()
+		tokens := s.cfg.DashboardTokens
+		s.cfgMu.RUnlock()
+		for name, tok := range tokens {
+			if strings.TrimSpace(tok) == "" {
+				continue
+			}
+			if subtle.ConstantTimeCompare([]byte(got), []byte(tok)) == 1 {
+				return name
+			}
+		}
 	}
-	got := strings.TrimSpace(parts[1])
-	if got == "" {
-		return false
-	}
-	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+	return ""
 }
+
+// actingActor is what to journal: the named operator, or how the request was
+// authorised when no name is available. "same-origin" is a browser session
+// holding no credential, which is a different fact from "alice".
+func (s *Server) actingActor(r *http.Request) string {
+	if a := s.actorFor(r); a != "" {
+		return a
+	}
+	if s.sameOrigin(r) {
+		return "same-origin"
+	}
+	return "unnamed"
+}
+
+// validBearer accepts either the shared token or a named operator token.
+func (s *Server) validBearer(r *http.Request) bool { return s.actorFor(r) != "" }
 
 // sameOrigin reports whether the request's Origin (preferred) or Referer
 // names the host this server is reachable at.

@@ -102,8 +102,6 @@ func NewEngine(cfg *config.Config, bars BarSource, news NewsSource, opts Options
 // composite. Any failure fetching the underlying market data is an error
 // (the risk gate treats scorer errors as rejections, fail closed).
 func (e *Engine) Score(ctx context.Context, symbol string) (Result, error) {
-	res := Result{Factors: map[string]FactorResult{}}
-
 	allBars, err := e.bars.GetBars(ctx, []string{symbol}, e.opts.Timeframe, "", "", 100)
 	if err != nil {
 		return Result{}, fmt.Errorf("factor scoring %s: fetch bars: %w", symbol, err)
@@ -121,10 +119,6 @@ func (e *Engine) Score(ctx context.Context, symbol string) (Result, error) {
 	}
 	daily = kept
 	sort.Slice(daily, func(i, j int) bool { return daily[i].Time < daily[j].Time })
-	closes := make([]float64, len(daily))
-	for i, b := range daily {
-		closes[i] = b.Close
-	}
 
 	// Freshness is part of validity. A halted or delisted symbol still
 	// returns its last bars, and a fetch that silently serves a three-week-old
@@ -135,35 +129,66 @@ func (e *Engine) Score(ctx context.Context, symbol string) (Result, error) {
 		return Result{}, err
 	}
 
-	// Trend and volatility need SMA50 / a 20-return window respectively;
-	// without enough history we cannot judge — report an error rather
-	// than silently scoring blind.
-	const minCloses = 51 // SMA50 + current bar
-	if len(closes) < minCloses {
+	var sentiment *FactorResult
+	if e.news != nil {
+		f := scoreSentiment(ctx, e.news, symbol)
+		sentiment = &f
+	}
+	res, err := ScoreBars(symbol, daily, e.weights, e.opts, sentiment)
+	if err != nil {
+		return Result{}, err
+	}
+	// The threshold is policy, not maths: a replay can score the same window
+	// against a different floor, so ScoreBars reports the composite and the
+	// engine applies its own.
+	res.Passed = res.Composite >= e.minScore
+	return res, nil
+}
+
+// MinBarsForScore is the history a window needs before any price factor is
+// meaningful: SMA50 plus the current bar.
+const MinBarsForScore = 51
+
+// ScoreBars folds the price/volume factors over one bar window into the
+// weighted composite.
+//
+// It is exported because a replay must run the SAME rule as the live engine.
+// A research harness with its own copy of this arithmetic measures a strategy
+// the bot does not trade, and the difference stays invisible until someone
+// compares the two implementations line by line.
+//
+// daily need not be sorted or clean: corrupt closes are dropped and the
+// series is sorted here, exactly as the live path does. sentiment may be nil,
+// in which case the factor is excluded from the average rather than voting a
+// neutral 0.5 (a missing observation is not a neutral one).
+func ScoreBars(symbol string, daily []tools.Bar, weights map[string]float64, opts Options, sentiment *FactorResult) (Result, error) {
+	res := Result{Factors: map[string]FactorResult{}}
+	kept := make([]tools.Bar, 0, len(daily))
+	for _, b := range daily {
+		if b.Close > 0 && finite(b.Close) {
+			kept = append(kept, b)
+		}
+	}
+	sort.Slice(kept, func(i, j int) bool { return kept[i].Time < kept[j].Time })
+	closes := make([]float64, len(kept))
+	for i, b := range kept {
+		closes[i] = b.Close
+	}
+	if len(closes) < MinBarsForScore {
 		return Result{}, fmt.Errorf("factor scoring %s: need >= %d daily bars, got %d",
-			symbol, minCloses, len(closes))
+			symbol, MinBarsForScore, len(closes))
 	}
 	res.Factors["trend"] = scoreTrend(closes)
-	res.Factors["momentum"] = scoreMomentum(closes, e.opts.MomentumDays)
-	res.Factors["volatility"] = scoreVolatility(closes, e.opts.VolWindow, e.opts.VolThreshold)
-	res.Factors["volume"] = scoreVolume(daily)
-
-	// Sentiment proxy is best-effort by design: a dead or empty news feed
-	// yields a neutral 0.5 and never fails the whole score.
-	//
-	// With NO source at all the factor is left out of the average rather
-	// than contributing its weight at a neutral 0.5. The deterministic loop
-	// constructs the engine with news=nil, so the second behaviour — which
-	// silently shrank every composite by the sentiment weight — was the
-	// only behaviour production ever saw. A missing factor is not a neutral
-	// observation, and weight that no evidence supports must not vote.
-	if e.news != nil {
-		res.Factors["sentiment"] = scoreSentiment(ctx, e.news, symbol)
+	res.Factors["momentum"] = scoreMomentum(closes, opts.MomentumDays)
+	res.Factors["volatility"] = scoreVolatility(closes, opts.VolWindow, opts.VolThreshold)
+	res.Factors["volume"] = scoreVolume(kept)
+	if sentiment != nil {
+		res.Factors["sentiment"] = *sentiment
 	}
 
 	var num, den float64
 	for name, fr := range res.Factors {
-		w := e.weights[name]
+		w := weights[name]
 		num += w * fr.Score
 		den += w
 	}
@@ -171,14 +196,14 @@ func (e *Engine) Score(ctx context.Context, symbol string) (Result, error) {
 		return Result{}, fmt.Errorf("factor scoring %s: all factor weights are zero", symbol)
 	}
 	res.Composite = num / den
-	// Non-finite input data (or a future factor with degenerate math)
-	// must never reach the decision gate: NaN comparisons are always
-	// false, which silently turns every BUY branch into a HOLD and,
-	// worse, NaN >= FactorMinScore is false so SELL exits could stall.
+	// Non-finite input data (or a future factor with degenerate math) must
+	// never reach the decision gate: NaN comparisons are always false, which
+	// silently turns every BUY branch into a HOLD and makes SELL exits stall.
 	if !finite(res.Composite) {
 		return Result{}, fmt.Errorf("factor scoring %s: composite is not finite (%g)", symbol, res.Composite)
 	}
-	res.Passed = res.Composite >= e.minScore
+	// The pass/fail threshold belongs to the caller's engine; ScoreBars
+	// reports the composite and leaves Passed false. Engine.Score sets it.
 	return res, nil
 }
 
@@ -202,24 +227,19 @@ func barFreshnessWindow(timeframe string) time.Duration {
 }
 
 // checkBarFreshness refuses a series whose newest bar is too old to trade
-// on. It fails closed like every other data problem in this package: the
-// gate turns a scorer error into a rejection, so a stale symbol is skipped
-// instead of traded at a forgotten price.
+// on. It fails closed like every other data problem in this package.
 func checkBarFreshness(symbol string, bars []tools.Bar, timeframe string) error {
 	if len(bars) == 0 {
 		return fmt.Errorf("factor scoring %s: no bars returned", symbol)
 	}
-	// tools.Bar carries the venue's epoch-seconds timestamp.
 	stamp := bars[len(bars)-1].Time
 	if stamp <= 0 {
 		return fmt.Errorf("factor scoring %s: newest bar has no timestamp", symbol)
 	}
 	newest := time.Unix(stamp, 0).UTC()
-	age := time.Since(newest)
-	limit := barFreshnessWindow(timeframe)
-	if age > limit {
+	if age := time.Since(newest); age > barFreshnessWindow(timeframe) {
 		return fmt.Errorf("factor scoring %s: newest %s bar is %s old (limit %s); refusing to score stale data",
-			symbol, orNone(timeframe), age.Round(time.Minute), limit)
+			symbol, orNone(timeframe), age.Round(time.Minute), barFreshnessWindow(timeframe))
 	}
 	return nil
 }

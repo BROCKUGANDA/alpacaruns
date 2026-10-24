@@ -83,6 +83,14 @@ func run(argv []string) int {
 		// `auto` is fully deterministic: no LLM, no MCP server. It loads
 		// its own config and strategy settings.
 		return cmdAuto(rest)
+	case "research":
+		// `research` replays the rule over history and writes a report. It
+		// never trades and never touches strategy state.
+		return cmdResearch(rest)
+	case "mirror":
+		// `mirror` builds/refreshes the SQLite view and verifies it against
+		// the journal + state. Exit 1 when they disagree.
+		return cmdMirror(rest)
 	case "serve":
 		// `serve` is the dashboard HTTP API. Reads the same data/
 		// directory the bot writes; never places orders. Documented
