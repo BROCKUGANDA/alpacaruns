@@ -36,6 +36,10 @@ type PositionMonitor struct {
 	Settings Settings
 	Log      *log.Logger
 
+	// Bars supplies the daily series for ATR-scaled levels. Required only
+	// when BRACKET_MODE=atr; the percentage brackets need no bars.
+	Bars barSource
+
 	// Broker abstracts the Alpaca calls so tests can inject fakes.
 	// When nil it is built lazily from Client; when both are nil the
 	// enforcement passes degrade to no-ops (nothing to enforce against).
@@ -50,6 +54,13 @@ type BrokerOps interface {
 	Positions(ctx context.Context) ([]tools.Position, error)
 	OpenOrders(ctx context.Context) ([]tools.Order, error)
 	Place(ctx context.Context, req tools.OrderRequest) (*tools.Order, error)
+	// PlaceOCO protects a position the broker already holds with a
+	// take-profit / stop-loss pair (a bracket with no entry leg).
+	PlaceOCO(ctx context.Context, req tools.OCOClose) (*tools.Order, error)
+	// CancelSymbolOrders pulls every resting order on a symbol, used
+	// before a locally-enforced exit so a stale protective leg cannot
+	// fire afterwards and open the position back up as a short.
+	CancelSymbolOrders(ctx context.Context, symbol string) (int, error)
 }
 
 func (m *PositionMonitor) broker() BrokerOps {
@@ -65,8 +76,11 @@ func (m *PositionMonitor) broker() BrokerOps {
 
 // MonitorResult summarizes one monitor tick for tests and logging.
 type MonitorResult struct {
-	Closed      []string // symbols closed via local TP/SL (crypto)
-	Rebuilt     []string // equity SL orders re-placed
+	// Adopted lists positions the reconciliation pass newly protected
+	// (or re-anchored to the broker's real average entry).
+	Adopted []string
+	Closed  []string // symbols closed via local TP/SL (crypto, options)
+	Rebuilt []string // equity protective orders re-placed
 	HaltEngaged bool
 	HaltReasons []string
 }
@@ -85,14 +99,21 @@ func (m *PositionMonitor) Tick(ctx context.Context, prices map[string]float64, e
 // global (shared kill switch) — they are evaluated on the swing pass.
 func (m *PositionMonitor) TickTrack(ctx context.Context, prices map[string]float64, equity float64, track string) (*MonitorResult, error) {
 	res := &MonitorResult{}
+	// Position-aware first: adopt every broker position into the level
+	// book and make sure the broker actually protects the equities among
+	// them. The enforcement passes below only see what this book holds,
+	// so running them first would skip anything the bot did not open.
+	rec, err := m.Reconcile(ctx, track)
+	if err != nil {
+		m.log().Printf("[monitor] position reconciliation failed: %v", err)
+	}
+	res.Adopted = rec.Adopted
+	res.Rebuilt = rec.Protected
 	closed, err := m.enforceTPSL(ctx, prices, track)
 	if err != nil {
 		return res, err
 	}
 	res.Closed = closed
-	if err := m.verifyEquityBrackets(ctx, track); err != nil {
-		m.log().Printf("[monitor] bracket verification warning: %v", err)
-	}
 	if track != "intraday" {
 		// Drawdown halts engage the SHARED kill switch; running them on
 		// every track pass would double-log the same breach.
@@ -147,8 +168,18 @@ func (m *PositionMonitor) enforceTPSL(ctx context.Context, prices map[string]flo
 		if price <= 0 {
 			continue // no reliable mark this tick: nothing to do
 		}
-		side := ""
-		reason := ""
+		// The trigger direction depends on the POSITION side. A long
+		// profits above entry and dies below it; a short is the mirror,
+		// so its take-profit sits below the entry and its stop above.
+		// Reading a short's levels as a long's closes it immediately:
+		// price >= TP is true on the tick after entry when TP is below
+		// the market.
+		short := lv.IsShort()
+		exitSide := "sell"
+		if short {
+			exitSide = "buy"
+		}
+		triggered := ""
 		switch {
 		case lv.TakeProfit <= 0 && lv.StopLoss <= 0:
 			// No protective levels were ever stored (a bracket that failed
@@ -156,12 +187,23 @@ func (m *PositionMonitor) enforceTPSL(ctx context.Context, prices map[string]flo
 			// would market-sell the position on the very next tick, so
 			// zero levels mean "no local enforcement".
 			continue
-		case lv.TakeProfit > 0 && price >= lv.TakeProfit:
-			side, reason = "sell", "take-profit"
-		case lv.StopLoss > 0 && price <= lv.StopLoss:
-			side, reason = "sell", "stop-loss"
+		case lv.TakeProfit > 0 && ((short && price <= lv.TakeProfit) || (!short && price >= lv.TakeProfit)):
+			triggered = "take-profit"
+		case lv.StopLoss > 0 && ((short && price >= lv.StopLoss) || (!short && price <= lv.StopLoss)):
+			triggered = "stop-loss"
 		default:
 			continue
+		}
+		side, reason := exitSide, triggered
+		// Pull any resting protective orders on this symbol BEFORE the
+		// close goes out. Otherwise a leg that survives the fill (an
+		// adopted OCO pair, or a stop rebuilt by an earlier tick) fires
+		// later against a flat account and opens the position back up on
+		// the wrong side.
+		if n, err := b.CancelSymbolOrders(ctx, lv.Symbol); err != nil {
+			m.log().Printf("[monitor] %s: could not clear resting orders before the %s close: %v", lv.Symbol, reason, err)
+		} else if n > 0 {
+			m.log().Printf("[monitor] %s: cancelled %d resting order(s) before the %s close", lv.Symbol, n, reason)
 		}
 		req := tools.OrderRequest{
 			Symbol:      lv.Symbol,
@@ -193,83 +235,6 @@ func (m *PositionMonitor) enforceTPSL(ctx context.Context, prices map[string]flo
 	}
 	sort.Strings(closed)
 	return closed, nil
-}
-
-// verifyEquityBrackets confirms each open equity position with stored
-// levels still has a protective (stop/stop_limit) order open; rebuild a
-// missing one like the reference architecture does after restarts.
-// track filters the pass to one book ("" = swing, "intraday").
-func (m *PositionMonitor) verifyEquityBrackets(ctx context.Context, track string) error {
-	b := m.broker()
-	if b == nil {
-		return nil
-	}
-	orders, err := b.OpenOrders(ctx)
-	if err != nil {
-		return fmt.Errorf("list open orders: %w", err)
-	}
-	protected := map[string]bool{}
-	for _, o := range orders {
-		t := strings.ToLower(o.Type)
-		if t == "stop" || t == "stop_limit" || t == "trailing_stop" {
-			protected[o.Symbol] = true
-		}
-	}
-	st, err := m.State.Load()
-	if err != nil {
-		return err
-	}
-	syms := make([]string, 0, len(st.Levels))
-	for key, lv := range st.Levels {
-		if lv.Track != track {
-			continue
-		}
-		if !lv.Crypto && lv.StopLoss > 0 {
-			syms = append(syms, key)
-		}
-	}
-	sort.Strings(syms)
-	for _, key := range syms {
-		lv := st.Levels[key]
-		if lv == nil {
-			continue
-		}
-		// The map key carries the track suffix; the broker only knows
-		// the venue symbol.
-		sym := lv.Symbol
-		if protected[sym] {
-			continue
-		}
-		pos, err := m.findPosition(ctx, sym)
-		if err != nil {
-			m.log().Printf("[monitor] %s: position lookup failed: %v", sym, err)
-			continue
-		}
-		if pos == nil || pos.Qty <= 0 {
-			_ = m.State.ClearLevelTrack(sym, lv.Track)
-			continue
-		}
-		stopPrice := round2(lv.StopLoss)
-		req := tools.OrderRequest{
-			Symbol:      sym,
-			Qty:         trimFloat(pos.Qty),
-			Side:        "sell",
-			Type:        "stop",
-			TimeInForce: "gtc",
-			StopPrice:   strconv.FormatFloat(stopPrice, 'f', 2, 64),
-			// Deterministic per (symbol, price, qty): retries after a
-			// timeout dedupe broker-side; a rebuilt stop at a new level
-			// gets a fresh id.
-			ClientOrderID: fmt.Sprintf("strategy-sl-rebuild-%s-%d-%d",
-				sanitize(sym), int64(stopPrice*100), int64(pos.Qty*10000)),
-		}
-		if _, err := b.Place(ctx, req); err != nil {
-			m.log().Printf("[monitor] %s: SL rebuild failed: %v", sym, err)
-			continue
-		}
-		m.log().Printf("[monitor] %s: missing protective order REBUILT as stop @ %.2f", sym, stopPrice)
-	}
-	return nil
 }
 
 // checkDrawdown computes daily / weekly / total drawdown vs peak equity
@@ -346,6 +311,9 @@ func (m *PositionMonitor) findPosition(ctx context.Context, symbol string) (*pos
 			continue
 		}
 		q, _ := strconv.ParseFloat(p.Qty, 64)
+		if q == 0 {
+			continue // a zero-quantity row is not a position
+		}
 		// Capture the broker's own current mark too. The broker
 		// /positions response carries current_price for every open
 		// position, which is an authoritative, always-present quote
@@ -357,7 +325,7 @@ func (m *PositionMonitor) findPosition(ctx context.Context, symbol string) (*pos
 		if cp := strings.TrimSpace(p.CurrentPrice); cp != "" {
 			px, _ = strconv.ParseFloat(cp, 64)
 		}
-		return &positionQty{Qty: q, Price: px}, nil
+		return &positionQty{Qty: math.Abs(q), Short: isShortPosition(p.Side, q), Price: px}, nil
 	}
 	return nil, nil
 }
@@ -377,8 +345,21 @@ func (a *alpacaBroker) Place(ctx context.Context, req tools.OrderRequest) (*tool
 	return a.c.PlaceOrder(ctx, req)
 }
 
+func (a *alpacaBroker) PlaceOCO(ctx context.Context, req tools.OCOClose) (*tools.Order, error) {
+	return a.c.PlaceOCOClose(ctx, req)
+}
+
+func (a *alpacaBroker) CancelSymbolOrders(ctx context.Context, symbol string) (int, error) {
+	return a.c.CancelOrdersForSymbol(ctx, symbol)
+}
+
 type positionQty struct {
+	// Qty is the ABSOLUTE position quantity. Closing either side trades
+	// that many contracts/shares, and the direction comes from Short.
 	Qty float64
+	// Short reports the position side, so the exit is a buy rather
+	// than a sell.
+	Short bool
 	// Price is the position's current mark as reported by the broker
 	// (/positions.current_price). Zero when unavailable; callers fall
 	// back to the Data-API price map in that case.

@@ -142,6 +142,13 @@ type Settings struct {
 	BracketMode string
 	ATRMultTP   float64
 	ATRMultSL   float64
+
+	// ProtectAllPositions decides whether the position-aware
+	// reconciliation pass adopts EVERY broker position or only the ones
+	// inside the traded universe. On by default: a position with no stop
+	// is risk in the account whether or not this bot opened it, and the
+	// drawdown halts already price the whole account.
+	ProtectAllPositions bool
 }
 
 // defaults for every tunable; documented in README.md.
@@ -354,6 +361,9 @@ func LoadSettings(getenv func(string) string, pollSeconds int) (Settings, error)
 	}
 	if s.CryptoNotionalUSD < 0 {
 		return s, fmt.Errorf("CRYPTO_NOTIONAL_USD must be >= 0, got %g", s.CryptoNotionalUSD)
+	}
+	if s.ProtectAllPositions, err = envBool(getenv, "TPSL_PROTECT_ALL", true); err != nil {
+		return s, err
 	}
 	s.BracketMode = strings.ToLower(strings.TrimSpace(firstNonEmpty(getenv("BRACKET_MODE"), "pct")))
 	if s.BracketMode != "pct" && s.BracketMode != "atr" {

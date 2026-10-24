@@ -24,7 +24,14 @@ type orderCall struct {
 type fakeBroker struct {
 	positions []tools.Position
 	openStops map[string]bool // symbol -> protective stop exists
+	// openOrders, when non-nil, is what OpenOrders returns verbatim.
+	// Used to model a broker that already holds a protective pair.
+	openOrders []tools.Order
 	placed    []orderCall
+	// oco records the protective pairs the monitor placed, and
+	// cancelled records the symbols whose resting orders were pulled.
+	oco       []tools.OCOClose
+	cancelled []string
 }
 
 func (f *fakeBroker) Positions(ctx context.Context) ([]tools.Position, error) {
@@ -32,6 +39,9 @@ func (f *fakeBroker) Positions(ctx context.Context) ([]tools.Position, error) {
 }
 
 func (f *fakeBroker) OpenOrders(ctx context.Context) ([]tools.Order, error) {
+	if f.openOrders != nil {
+		return f.openOrders, nil
+	}
 	var out []tools.Order
 	for sym := range f.openStops {
 		out = append(out, tools.Order{Symbol: sym, Type: "stop"})
@@ -42,6 +52,16 @@ func (f *fakeBroker) OpenOrders(ctx context.Context) ([]tools.Order, error) {
 func (f *fakeBroker) Place(ctx context.Context, req tools.OrderRequest) (*tools.Order, error) {
 	f.placed = append(f.placed, orderCall{Symbol: req.Symbol, Side: req.Side, Type: req.Type, Qty: req.Qty})
 	return &tools.Order{ID: "fake-" + req.Symbol, Symbol: req.Symbol}, nil
+}
+
+func (f *fakeBroker) PlaceOCO(ctx context.Context, req tools.OCOClose) (*tools.Order, error) {
+	f.oco = append(f.oco, req)
+	return &tools.Order{ID: "fake-oco-" + req.Symbol, Symbol: req.Symbol, OrderClass: "oco"}, nil
+}
+
+func (f *fakeBroker) CancelSymbolOrders(ctx context.Context, symbol string) (int, error) {
+	f.cancelled = append(f.cancelled, symbol)
+	return 0, nil
 }
 
 func mkMonitor(t *testing.T, dir string, kill *agents.KillSwitch, set Settings) (*PositionMonitor, *fakeBroker) {
@@ -278,24 +298,26 @@ func TestEquityBracketRebuild(t *testing.T) {
 		}
 	})
 
-	t.Run("missing protective stop: rebuilt at stored level", func(t *testing.T) {
+	// A missing protective order is rebuilt as a PAIR, not a lone stop.
+	// The old path placed only a stop, so an equity whose bracket child
+	// vanished upstream got a floor but never banked upside — and a
+	// position with only a take-profit resting got no floor at all.
+	t.Run("missing protective pair: rebuilt at stored level", func(t *testing.T) {
 		delete(fb.openStops, "AAPL")
-		fb.positions = []tools.Position{{Symbol: "AAPL", Qty: "10"}}
-		fb.placed = nil
+		fb.positions = []tools.Position{{Symbol: "AAPL", Qty: "10", Side: "long", AvgEntry: "100"}}
+		fb.oco = nil
 		if _, err := m.Tick(context.Background(), map[string]float64{"AAPL": 100}, 100000); err != nil {
 			t.Fatal(err)
 		}
-		var rebuilt *orderCall
-		for i := range fb.placed {
-			if fb.placed[i].Symbol == "AAPL" && fb.placed[i].Type == "stop" {
-				rebuilt = &fb.placed[i]
-			}
+		if len(fb.oco) != 1 {
+			t.Fatalf("expected a protective pair rebuild, got %+v", fb.oco)
 		}
-		if rebuilt == nil {
-			t.Fatalf("expected a stop order rebuild, got %+v", fb.placed)
+		got := fb.oco[0]
+		if got.Symbol != "AAPL" || got.Side != "sell" || got.Qty != "10" {
+			t.Fatalf("rebuild wrong: %+v", got)
 		}
-		if rebuilt.Side != "sell" || rebuilt.Qty != "10" {
-			t.Fatalf("rebuild wrong: %+v", rebuilt)
+		if got.TakeProfit <= 100 || got.StopLoss >= 100 {
+			t.Fatalf("pair must straddle the entry: %+v", got)
 		}
 	})
 

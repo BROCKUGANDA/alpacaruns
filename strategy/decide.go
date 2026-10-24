@@ -156,6 +156,50 @@ func ComputeBrackets(entry, tpPct, slPct float64) (BracketLevels, error) {
 	return lv, nil
 }
 
+// DirectionalBrackets computes TP/SL for a position at avgEntry with the
+// position's direction taken into account.
+//
+// A long profits when price rises: TP above entry, SL below. A short
+// profits when price falls, so both levels flip — TP BELOW entry and SL
+// above it. Computing long levels for a short produces a stop above the
+// entry and a target below it, which the broker fires immediately: the
+// exit buys the position back at a loss on the first tick.
+//
+// entryPct/stopPct are the same magnitudes the long path uses; only the
+// sign changes with direction. ATR-scaled levels follow the same rule
+// (see ATRDirectionalBrackets).
+func DirectionalBrackets(entry, tpPct, slPct float64, short bool) (BracketLevels, error) {
+	lv, err := ComputeBrackets(entry, tpPct, slPct)
+	if err != nil {
+		return BracketLevels{}, err
+	}
+	if short {
+		lv.TakeProfit = round2(entry * (1 - tpPct))
+		lv.StopLoss = round2(entry * (1 + slPct))
+		if lv.TakeProfit <= 0 {
+			return BracketLevels{}, fmt.Errorf("short take-profit below zero (entry %.4f, tp %.4f)", entry, tpPct)
+		}
+	}
+	return lv, nil
+}
+
+// ATRDirectionalBrackets is ComputeATRBrackets with the short direction
+// applied: TP = entry - tpMult x atr, SL = entry + slMult x atr.
+func ATRDirectionalBrackets(entry, atr, tpMult, slMult float64, short bool) (BracketLevels, error) {
+	lv, err := ComputeATRBrackets(entry, atr, tpMult, slMult)
+	if err != nil {
+		return BracketLevels{}, err
+	}
+	if short {
+		lv.TakeProfit = round2(entry - tpMult*atr)
+		lv.StopLoss = round2(entry + slMult*atr)
+		if lv.TakeProfit <= 0 {
+			return BracketLevels{}, fmt.Errorf("short take-profit below zero (entry %.4f, atr %.4f)", entry, atr)
+		}
+	}
+	return lv, nil
+}
+
 // round2 (defined in monitor.go) pins prices to penny increments —
 // Alpaca rejects equity orders priced beyond two decimal places
 // ("sub-penny increment" HTTP 422).

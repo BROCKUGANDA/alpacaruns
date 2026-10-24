@@ -783,6 +783,78 @@ func (c *Client) PlaceOrder(ctx context.Context, req OrderRequest) (*Order, erro
 	return &o, nil
 }
 
+// OCOClose describes a protective pair placed against a position that
+// is ALREADY open. Alpaca's `oco` order class is a bracket without an
+// entry leg: a take-profit limit and a stop-loss, where filling either
+// one cancels the other. It exists precisely for the case a bot's own
+// entry orders do not cover — a position the bot did not open, or one
+// whose bracket was never placed.
+type OCOClose struct {
+	Symbol      string
+	Qty         string
+	Side        string // "sell" closes a long, "buy" closes a short
+	TimeInForce string // day | gtc
+	TakeProfit  float64
+	StopLoss    float64
+	// ClientOrderID makes the placement idempotent: a retry after a
+	// timeout is rejected by the broker instead of stacking a second
+	// protective pair on the same position.
+	ClientOrderID string
+}
+
+// PlaceOCOClose submits the protective pair. The payload shape is the
+// one Alpaca accepts: verified against the paper API, which rejects an
+// oco order whose take-profit is expressed as the parent limit price
+// ("oco orders require take_profit.limit_price").
+func (c *Client) PlaceOCOClose(ctx context.Context, req OCOClose) (*Order, error) {
+	if req.TakeProfit <= 0 || req.StopLoss <= 0 {
+		return nil, fmt.Errorf("oco close for %s needs both a take-profit and a stop price, got tp=%.4f sl=%.4f",
+			req.Symbol, req.TakeProfit, req.StopLoss)
+	}
+	tif := req.TimeInForce
+	if tif == "" {
+		tif = "gtc"
+	}
+	body := map[string]any{
+		"symbol":        req.Symbol,
+		"qty":           req.Qty,
+		"side":          req.Side,
+		"type":          "limit",
+		"time_in_force": tif,
+		"order_class":   "oco",
+		"take_profit":   map[string]string{"limit_price": strconv.FormatFloat(req.TakeProfit, 'f', 2, 64)},
+		"stop_loss":     map[string]string{"stop_price": strconv.FormatFloat(req.StopLoss, 'f', 2, 64)},
+	}
+	if req.ClientOrderID != "" {
+		body["client_order_id"] = req.ClientOrderID
+	}
+	var o Order
+	if err := c.do(ctx, http.MethodPost, c.BaseURL+"/orders", nil, body, &o); err != nil {
+		return nil, err
+	}
+	return &o, nil
+}
+
+// CancelOrdersForSymbol cancels every open order on one symbol. Used
+// before a locally-enforced exit fills, so a resting protective pair
+// cannot fire after the position is already closed and open a short by
+// accident.
+func (c *Client) CancelOrdersForSymbol(ctx context.Context, symbol string) (int, error) {
+	q := url.Values{"symbols": {symbol}, "status": {"open"}}
+	var os []Order
+	if err := c.do(ctx, http.MethodGet, c.BaseURL+"/orders", q, nil, &os); err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, o := range os {
+		if err := c.CancelOrder(ctx, o.ID); err != nil {
+			return n, fmt.Errorf("cancel %s: %w", o.ID, err)
+		}
+		n++
+	}
+	return n, nil
+}
+
 func (c *Client) GetOrderStatus(ctx context.Context, orderID string) (*Order, error) {
 	var o Order
 	if err := c.do(ctx, http.MethodGet, c.BaseURL+"/orders/"+url.PathEscape(orderID), nil, nil, &o); err != nil {

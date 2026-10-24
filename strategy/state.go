@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/BROCKUGANDA/alpacaruns/tools"
 )
 
 // TP/SL levels persisted next to the trade log so restarts keep enforcing
@@ -23,6 +25,16 @@ type PositionLevels struct {
 	Qty        string    `json:"qty"`    // broker-side qty string at entry
 	Crypto     bool      `json:"crypto"` // locally-enforced when true
 	Since      time.Time `json:"since"`
+	// Side is the POSITION side ("long" or "short"). TP/SL sit above the
+	// entry for a long and below it for a short, and closing a short is
+	// a buy — without this the monitor assumes long and would place an
+	// exit that doubles the exposure.
+	Side string `json:"side,omitempty"`
+	// AssetClass is the broker's class (us_equity, us_option, crypto).
+	// It decides whether protection is a broker-side order pair or a
+	// locally enforced level; the symbol text alone is not enough now
+	// that the universe spans every class.
+	AssetClass string `json:"asset_class,omitempty"`
 	// Track distinguishes the intraday book from the swing book when
 	// both hold the same symbol. Levels are keyed by the PLAIN symbol
 	// (no prefix): broker positions, the monitor's TP/SL matcher and the
@@ -31,6 +43,19 @@ type PositionLevels struct {
 	// which silently disabled intraday TP/SL enforcement and wiped the
 	// intraday held-map on every monitor tick. Empty = swing (default).
 	Track string `json:"track,omitempty"`
+}
+
+// IsShort reports whether this level protects a short position.
+func (p *PositionLevels) IsShort() bool {
+	return strings.EqualFold(strings.TrimSpace(p.Side), "short")
+}
+
+// LocallyEnforced reports whether TP/SL for this level are enforced by
+// the monitor rather than by the broker. Alpaca supports bracket/OCO
+// order classes for equities only, so crypto pairs and option contracts
+// always live here.
+func (p *PositionLevels) LocallyEnforced() bool {
+	return p.Crypto || p.AssetClass == tools.AssetClassOption || tools.IsOCCSymbol(p.Symbol)
 }
 
 // State is the persisted strategy-state.json document.
@@ -185,6 +210,46 @@ func (s *StateStore) SetLevel(lv PositionLevels) error {
 	return s.saveLocked(st)
 }
 
+// Level returns the stored levels for one symbol in one track
+// ("" = swing), or nil when nothing protects that position. This is the
+// lookup the reconciliation pass uses to tell "already covered" from
+// "the broker holds a position we have no levels for".
+func (s *StateStore) Level(symbol, track string) *PositionLevels {
+	st, err := s.Load()
+	if err != nil {
+		return nil
+	}
+	key := levelKey(CanonicalSymbol(symbol), track)
+	lv, ok := st.Levels[key]
+	if !ok || lv == nil {
+		return nil
+	}
+	cp := *lv
+	return &cp
+}
+
+// LevelAnyTrack returns the stored levels for a symbol in ANY track,
+// and the track that owns them. The broker reports one aggregated
+// position per symbol, so this is how the monitor knows a position is
+// already someone's exposure: a swing pass must not adopt a symbol the
+// intraday book is guarding, or both books would size, protect and
+// close the same shares.
+func (s *StateStore) LevelAnyTrack(symbol string) (*PositionLevels, string) {
+	st, err := s.Load()
+	if err != nil {
+		return nil, ""
+	}
+	want := CanonicalSymbol(symbol)
+	for _, lv := range st.Levels {
+		if lv == nil || CanonicalSymbol(lv.Symbol) != want {
+			continue
+		}
+		cp := *lv
+		return &cp, lv.Track
+	}
+	return nil, ""
+}
+
 // ClearLevel removes levels for a symbol (after exit fills).
 func (s *StateStore) ClearLevel(symbol string) error {
 	return s.ClearLevelTrack(symbol, "")
@@ -248,7 +313,11 @@ func (s *StateStore) cryptoLevelsByTrack(track string) ([]*PositionLevels, error
 	}
 	var out []*PositionLevels
 	for _, lv := range st.Levels {
-		if lv.Crypto && lv.Track == track {
+		// Every class the broker cannot protect for itself: crypto has
+		// no order classes, and Alpaca rejects brackets on options too.
+		// Filtering on Crypto alone left every option position with no
+		// take-profit and no stop at all.
+		if lv.LocallyEnforced() && lv.Track == track {
 			out = append(out, lv)
 		}
 	}

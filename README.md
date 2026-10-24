@@ -20,17 +20,18 @@ refuses to start a live session without that acknowledgement.
 1. [What this is](#1-what-this-is)
 2. [Architecture](#2-architecture)
 3. [The universal signal picker](#3-the-universal-signal-picker)
-4. [The agent-to-agent bridge](#4-the-agent-to-agent-bridge)
-5. [Safety rails](#5-safety-rails)
-6. [Configuration](#6-configuration)
-7. [CLI](#7-cli)
-8. [HTTP API](#8-http-api)
-9. [Dashboard](#9-dashboard)
-10. [Data flow and state files](#10-data-flow-and-state-files)
-11. [Deployment](#11-deployment)
-12. [Tests and gates](#12-tests-and-gates)
-13. [What was fixed in this pass](#13-what-was-fixed-in-this-pass)
-14. [Layout](#14-layout)
+4. [Position-aware TP/SL](#4-position-aware-tpsl)
+5. [The agent-to-agent bridge](#5-the-agent-to-agent-bridge)
+6. [Safety rails](#6-safety-rails)
+7. [Configuration](#7-configuration)
+8. [CLI](#8-cli)
+9. [HTTP API](#9-http-api)
+10. [Dashboard](#10-dashboard)
+11. [Data flow and state files](#11-data-flow-and-state-files)
+12. [Deployment](#12-deployment)
+13. [Tests and gates](#13-tests-and-gates)
+14. [What was fixed in this pass](#14-what-was-fixed-in-this-pass)
+15. [Layout](#15-layout)
 
 ---
 
@@ -52,10 +53,13 @@ One Go binary that:
 5. **Validates every order** against a code-enforced risk gate (kill
    switch, position caps, portfolio-percentage cap, drawdown halts,
    confidence floor, market hours, execution windows).
-6. **Executes** through the official Alpaca REST surface — equities get
-   server-side OCO brackets, crypto gets locally enforced TP/SL, options
+6. **Protects every position**, not only the ones this process opened.
+   The broker's open positions are reconciled against the TP/SL book each
+   tick and anchored to their real average entry.
+7. **Executes** through the official Alpaca REST surface — equities get a
+   resting OCO pair, crypto and options are enforced locally, and options
    are whole contracts only.
-7. **Serves a dashboard** from the same binary on the same port.
+8. **Serves a dashboard** from the same binary on the same port.
 
 Two optional layers sit on top:
 
@@ -189,7 +193,66 @@ every tick.
 
 ---
 
-## 4. The agent-to-agent bridge
+## 4. Position-aware TP/SL
+
+Protection is driven by **what the broker says is open**, not by what this
+process remembers placing. That distinction matters: a bot that only
+protects its own entries leaves every other position in the account
+riding with no stop — a hand trade from the dashboard, an order from the
+agent path, a position that survived a redeploy of the data directory,
+or one that was simply already there when the bot started.
+
+Every tick, before any decision is made:
+
+1. **Read the broker's positions.** Each one is matched against the level
+   book by venue symbol (`BTCUSD` and `BTC/USD` are the same position).
+2. **Adopt or re-anchor.** A position with no levels gets them; a position
+   whose stored entry no longer matches the broker's `avg_entry_price`,
+   whose quantity moved, or whose side flipped gets rebuilt. Levels are
+   anchored to the **actual average entry**, never to the price an entry
+   was planned at — a market order prints where the tape is, and
+   averaging in moves the basis.
+3. **Place the protection where the class allows it.**
+
+   | Class | Where TP/SL live | Why |
+   |---|---|---|
+   | Equity / ETF / index | A resting `order_class=oco` pair at the broker | A bracket with no entry leg; fills one, cancels the other |
+   | Crypto | Locally enforced levels | Alpaca has no order class for crypto |
+   | Option | Locally enforced levels | Alpaca has no order class for options either |
+
+4. **Sweep orphans.** A level whose position the broker no longer reports
+   is dropped, in that book only.
+
+Direction is part of the model. A long's target sits above the entry and
+its stop below; a short is the mirror, and closing it is a **buy**.
+Long-style levels on a short put the target above the market, so the
+first tick buys the position back at a loss — the level looks present and
+is actively wrong.
+
+Two more rules worth stating because they are the ones that bite:
+
+- **A zero level is not a trigger.** A bracket that failed to compute
+  leaves zeros behind; treating zero as a threshold would market-sell a
+  fresh position on the next tick. Zero means "no local enforcement", and
+  the adoption pass gives it a real level.
+- **Resting orders are pulled before a local close.** Otherwise the leg
+  that survived the fill fires later against a flat account and reopens
+  the position on the wrong side.
+
+Protection is idempotent: the deterministic `client_order_id` is derived
+from `(symbol, target, stop, qty)`, so a retry after a timeout dedupes at
+the broker instead of stacking a second pair, and a position already
+carrying an `oco`/`bracket` is left alone. Every adoption, re-anchor,
+placement and refusal is journaled to the trade log under
+`strategy:protect`, so "why is this guarded at this price?" is answerable
+from the audit trail.
+
+`TPSL_PROTECT_ALL=false` narrows adoption to the configured universe, for
+an operator who wants the bot to leave its own hand trades alone.
+
+---
+
+## 5. The agent-to-agent bridge
 
 The bridge lets *other* agents (a research process, another model, a
 strategy script) publish trade signals into this bot. An inbound signal
@@ -285,12 +348,13 @@ Every evaluation — approved, rejected or refused — is journaled to
 
 ---
 
-## 5. Safety rails
+## 6. Safety rails
 
 | Control | Mechanism | Where |
 |---|---|---|
 | Paper by default | `ALPACA_BASE_URL` points at the paper API; a non-paper URL is refused without `I_ALPACA_LIVE=YES` | `config/config.go` |
 | Kill switch | SIGINT/SIGTERM halts new trades; drawdown halts engage the same switch | `risk/`, `strategy/monitor.go` |
+| Position-aware TP/SL | Every broker position is adopted and anchored to its real `avg_entry_price`; equities get a resting `oco` pair, crypto and options are enforced locally | `strategy/positions.go` |
 | Position caps | `MAX_POSITION_USD`, `CRYPTO_MAX_POSITION_USD`, `MAX_PORTFOLIO_PCT`, per-symbol and additive exposure | `risk/risk.go` |
 | Drawdown halts | Daily ≥ 5%, weekly ≥ 10%, total ≥ 15% of peak equity | `strategy/monitor.go` |
 | Confidence floor | `MIN_CONFIDENCE` — every proposal carries a confidence; the agent path derives it from the deterministic factor composite | `risk/risk.go` |
@@ -306,7 +370,7 @@ Every evaluation — approved, rejected or refused — is journaled to
 
 ---
 
-## 6. Configuration
+## 7. Configuration
 
 Every knob lives in `.env`; `.env.example` is the canonical list.
 
@@ -365,7 +429,7 @@ Qwen3's own tool-call template is used) → `LLM_PROVIDER=oxlo` with
 
 ---
 
-## 7. CLI
+## 8. CLI
 
 ```bash
 cp .env.example .env          # add your paper keys
@@ -387,7 +451,7 @@ available.
 
 ---
 
-## 8. HTTP API
+## 9. HTTP API
 
 Responses carry the bare typed object on success and
 `{"error": "...", "code": "..."}` on failure — the HTTP status carries
@@ -432,7 +496,7 @@ deterministic loop), `agent` (the LLM cycle), `ensemble` and `manual`.
 
 ---
 
-## 9. Dashboard
+## 10. Dashboard
 
 The Next.js app is statically exported and embedded into the binary at
 `api/ui/`. Five pages:
@@ -460,7 +524,7 @@ different origin.
 
 ---
 
-## 10. Data flow and state files
+## 11. Data flow and state files
 
 | File | Written by | Read by |
 |---|---|---|
@@ -476,7 +540,7 @@ levels all live on disk rather than in memory.
 
 ---
 
-## 11. Deployment
+## 12. Deployment
 
 See [`deploy/DEPLOY.md`](deploy/DEPLOY.md) for the full bring-up.
 
@@ -508,7 +572,7 @@ mixed-content or CORS hops.
 
 ---
 
-## 12. Tests and gates
+## 13. Tests and gates
 
 ```bash
 go test ./...   # every package
@@ -533,7 +597,7 @@ Gates are written so they can fail:
 
 ---
 
-## 13. What was fixed in this pass
+## 14. What was fixed in this pass
 
 This pass audited the code, the broker layer, the risk gate, the agent
 layer and the API, and fixed the defects that mattered. The full list
@@ -575,6 +639,7 @@ order is rejected.
 | TP/SL state | Levels were keyed by symbol alone, so an intraday entry overwrote the swing book's brackets. Levels are now track-keyed. |
 | TP/SL triggers | A zero take-profit counted as "price ≥ TP" and market-sold a fresh position. |
 | `preOrder` | `PRE_ORDERS` was documented and implemented but never called. |
+| TP/SL scope | Protection existed only for positions this process opened, and levels were anchored to the plan-time price. Every broker position is now adopted and re-anchored to its real average entry, shorts are inverted, options are enforced locally, and equities get a resting `oco` pair. |
 | Pre-orders | `preOrder` was never wired into the tick; now a closed market queues a resting bracket instead of dropping the signal. |
 | Dashboard auth | The dashboard attached the bearer token only to `/api/control/*`, so every config save and manual order 401'd on a token-protected deployment. |
 | Config race | `POST /api/config` mutated the live config while other handlers read it. |
@@ -585,7 +650,7 @@ order is rejected.
 
 ---
 
-## 14. Layout
+## 15. Layout
 
 ```
 a2a/                agent-to-agent bridge (ingress, ramp, state)

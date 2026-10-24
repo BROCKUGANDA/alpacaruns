@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/BROCKUGANDA/alpacaruns/tools"
 )
 
 // writeStateFile writes a raw strategy-state.json into the state
@@ -88,5 +90,37 @@ func TestMigrateLegacyLevelKeys(t *testing.T) {
 	}
 	if _, bad := got.Levels["intraday:AAPL"]; bad {
 		t.Fatal("prefixed key must be removed after migration")
+	}
+}
+
+// TestLevelSymbolIsAlwaysBrokerUsable pins the invariant three call
+// sites depend on: the map KEY may carry a track suffix, but
+// PositionLevels.Symbol must always be the venue symbol the broker
+// accepts. Iterating levels and using the key as a symbol sends
+// "AAPL|intraday" to the order endpoint.
+func TestLevelSymbolIsAlwaysBrokerUsable(t *testing.T) {
+	dir := t.TempDir()
+	st := NewStateStore(filepath.Join(dir, "trades.jsonl"))
+	if err := st.SetLevel(PositionLevels{Symbol: "AAPL", EntryPrice: 100,
+		TakeProfit: 108, StopLoss: 96, Qty: "10", Track: "intraday"}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key, lv := range got.Levels {
+		if lv.Symbol != "AAPL" {
+			t.Fatalf("stored symbol must be broker-usable, got %q", lv.Symbol)
+		}
+		if key == lv.Symbol {
+			t.Fatalf("an intraday level must not share the swing book's key: key=%q", key)
+		}
+		// The key is NOT a symbol for a tracked level — that is the whole
+		// point, and why a caller holding the key must not order against
+		// it. Assert the distinction so nobody "fixes" it by using the key.
+		if tools.SameSymbol(key, lv.Symbol) {
+			t.Fatalf("tracked key %q must not resolve as the venue symbol %q", key, lv.Symbol)
+		}
 	}
 }

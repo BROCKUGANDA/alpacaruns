@@ -309,6 +309,10 @@ func buildAutoLoop(ctx context.Context, cfg *config.Config, set strategy.Setting
 
 	monitor := &strategy.PositionMonitor{
 		Client: client, Kill: kill, State: state, Journal: j, Settings: set,
+		// Daily bars for ATR-scaled levels. The reconciliation pass needs
+		// them to size a stop off realized volatility instead of a fixed
+		// percentage, including for positions this bot did not open.
+		Bars: bars,
 	}
 
 	loop := &autoLoop{
@@ -746,11 +750,13 @@ func (l *autoLoop) flattenIntraday(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	for sym, lv := range st.Levels {
+	for _, lv := range st.Levels {
 		if lv.Track != "intraday" {
 			continue
 		}
-		l.intraExit(ctx, strategy.Decision{Symbol: sym}, "EOD flatten")
+		// lv.Symbol, not the map key: the key carries the track suffix
+		// ("AAPL|intraday"), which is not a symbol the broker knows.
+		l.intraExit(ctx, strategy.Decision{Symbol: lv.Symbol}, "EOD flatten")
 	}
 	return nil
 }
@@ -762,9 +768,9 @@ func (l *autoLoop) intraHeldSymbols() map[string]bool {
 	if err != nil {
 		return held
 	}
-	for sym, lv := range st.Levels {
+	for _, lv := range st.Levels {
 		if lv.Track == "intraday" {
-			held[sym] = true
+			held[strategy.CanonicalSymbol(lv.Symbol)] = true
 		}
 	}
 	return held
@@ -952,14 +958,14 @@ func (l *autoLoop) timeBasedClose(ctx context.Context, maxHours float64) {
 		return
 	}
 	cutoff := time.Now().UTC().Add(-time.Duration(maxHours * float64(time.Hour)))
-	for sym, lv := range st.Levels {
+	for _, lv := range st.Levels {
 		if lv.Track == "intraday" {
 			continue // intraday book has its own EOD flatten
 		}
 		if lv.Since.IsZero() || lv.Since.After(cutoff) {
 			continue
 		}
-		l.closePosition(ctx, sym, fmt.Sprintf("max-hold-%.0fh", maxHours))
+		l.closePosition(ctx, lv.Symbol, fmt.Sprintf("max-hold-%.0fh", maxHours))
 	}
 }
 
