@@ -189,8 +189,9 @@ func cmdAuto(args []string) int {
 	}
 	defer loop.journal.Close()
 
-	log.Printf("[auto] deterministic loop start: equities=%v crypto=%v poll=%ds dry-run=%t",
-		loop.set.EquitySymbols, loop.set.CryptoSymbols, loop.set.PollSeconds, dryRun)
+	log.Printf("[auto] deterministic loop start: equities=%v etfs=%v indices=%v crypto=%v options=%v poll=%ds dry-run=%t",
+		loop.set.EquitySymbols, loop.set.ETFSymbols, loop.set.IndexSymbols,
+		loop.set.CryptoSymbols, loop.set.OptionUnderlyings, loop.set.PollSeconds, dryRun)
 
 	for {
 		if ctx.Err() != nil || loop.exec.Kill.Halted() {
