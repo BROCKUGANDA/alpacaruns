@@ -338,7 +338,7 @@ func TestIntradayTrackEnforcement(t *testing.T) {
 		t.Fatal(err)
 	}
 	st, _ := m.State.Load()
-	if _, ok := st.Levels["BTC/USD"]; !ok {
+	if _, ok := st.Levels[levelKey("BTC/USD", "intraday")]; !ok {
 		t.Fatal("swing pass must not clear an intraday-track level")
 	}
 	if len(fb.placed) != 0 {
@@ -398,7 +398,7 @@ func TestMigrateIntradayPrefix(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lv, ok := got.Levels["AAPL"]
+	lv, ok := got.Levels[levelKey("AAPL", "intraday")]
 	if !ok {
 		t.Fatalf("legacy intraday key not migrated, levels: %+v", got.Levels)
 	}
@@ -420,7 +420,7 @@ func TestMigrateIntradayPrefix(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if lv2, ok := again.Levels["AAPL"]; !ok || lv2.Track != "intraday" {
+	if lv2, ok := again.Levels[levelKey("AAPL", "intraday")]; !ok || lv2.Track != "intraday" {
 		t.Fatalf("migration not persisted: %+v", again.Levels)
 	}
 }
@@ -437,14 +437,14 @@ func TestClearLevelTrackIsolation(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, _ := st.Load()
-	if _, ok := got.Levels["AAPL"]; !ok {
+	if _, ok := got.Levels[levelKey("AAPL", "intraday")]; !ok {
 		t.Fatal("swing clear must not remove an intraday-track level")
 	}
 	if err := st.ClearLevelTrack("AAPL", "intraday"); err != nil {
 		t.Fatal(err)
 	}
 	got, _ = st.Load()
-	if _, ok := got.Levels["AAPL"]; ok {
+	if _, ok := got.Levels[levelKey("AAPL", "intraday")]; ok {
 		t.Fatal("intraday clear must remove the intraday-track level")
 	}
 }

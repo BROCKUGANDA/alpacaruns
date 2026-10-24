@@ -69,6 +69,16 @@ type Config struct {
 	// minimum composite a proposal needs in addition to MinConfidence.
 	FactorWeights  map[string]float64
 	FactorMinScore float64
+
+	// Agent-to-agent bridge. The ingress is opt-in: A2AEnabled must be
+	// true AND a token must be configured before any peer agent can
+	// post a signal.
+	A2AEnabled      bool
+	A2AToken        string   // bearer token required on inbound signals
+	A2AAgents       []string // allow-list of peer agent ids
+	A2AMode         string   // default ramp position: off | shadow | on
+	A2AMaxNotional  float64  // per-signal USD cap
+	A2AShadowPasses int      // shadow evaluations needed before ramp-on
 }
 
 // Load reads config from the environment, applying defaults.
@@ -179,6 +189,39 @@ func Load(envFile string) (*Config, error) {
 	if c.LLMProvider == ProviderOxlo && strings.TrimSpace(c.LLMModel) == "" {
 		c.LLMModel = DefaultOxloModel
 	}
+	// Agent-to-agent bridge configuration. Off by default: an open
+	// signal ingress is an attack surface, so it has to be enabled
+	// deliberately and needs a token.
+	if a2a, err := getBool("A2A_ENABLED", false); err != nil {
+		return nil, err
+	} else {
+		c.A2AEnabled = a2a
+	}
+	c.A2AToken = os.Getenv("A2A_TOKEN")
+	c.A2AAgents = splitCSV(os.Getenv("A2A_AGENTS"))
+	c.A2AMode = strings.ToLower(strings.TrimSpace(getEnv("A2A_MODE", "off")))
+	switch c.A2AMode {
+	case "off", "shadow", "on":
+	default:
+		return nil, fmt.Errorf("A2A_MODE must be %q, %q or %q, got %q", "off", "shadow", "on", c.A2AMode)
+	}
+	if mn, err := getFloat("A2A_MAX_NOTIONAL", 10000); err != nil {
+		return nil, err
+	} else if mn <= 0 {
+		return nil, fmt.Errorf("A2A_MAX_NOTIONAL must be > 0, got %g", mn)
+	} else {
+		c.A2AMaxNotional = mn
+	}
+	if sp, err := getInt("A2A_SHADOW_PASSES", 3); err != nil {
+		return nil, err
+	} else if sp < 0 {
+		return nil, fmt.Errorf("A2A_SHADOW_PASSES must be >= 0, got %d", sp)
+	} else {
+		c.A2AShadowPasses = sp
+	}
+	if c.A2AEnabled && strings.TrimSpace(c.A2AToken) == "" {
+		return nil, fmt.Errorf("A2A_ENABLED requires A2A_TOKEN to be set")
+	}
 	c.TradeLog = getEnv("TRADE_LOG", "data/trades.jsonl")
 	feed := strings.ToLower(strings.TrimSpace(getEnv("STREAM_FEED", "iex")))
 	c.StreamFeed = feed
@@ -224,6 +267,17 @@ func loadEnvFile(path string) error {
 		}
 	}
 	return sc.Err()
+}
+
+// splitCSV splits a comma-separated list, dropping empty entries.
+func splitCSV(v string) []string {
+	var out []string
+	for _, p := range strings.Split(v, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func getEnv(k, def string) string {

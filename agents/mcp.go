@@ -22,17 +22,37 @@ import (
 	"github.com/BROCKUGANDA/alpacaruns/tools"
 )
 
+// Toolset name groups understood by Alpaca's MCP server
+// (ALPACA_TOOLSETS). The data session gets read-only market-data
+// toolsets so it structurally CANNOT place an order; the execution
+// session gets the trading toolsets, whose order tools are wrapped by
+// the deterministic risk gate.
+const (
+	DataToolsetEnv   = "stock-data,crypto-data,options-data,news"
+	ExecToolsetEnv   = "trading,account,assets"
+)
+
 // alpacaToolset connects to Alpaca's official MCP server over stdio
 // (`uvx alpaca-mcp-server`). Keys are passed via env (read by the server).
 // When requireConfirmation is true every tool call triggers ADK's
 // Human-in-the-Loop confirmation (supervised mode).
-func alpacaToolset(cfg *config.Config, requireConfirmation bool) (tool.Toolset, func(), error) {
+//
+// The venue is pinned from the configured base URL: ALPACA_PAPER_TRADE is
+// derived from ALPACA_BASE_URL rather than left to the server's default,
+// so a live base URL can never be silently downgraded to paper (or the
+// other way round) behind the config's I_ALPACA_LIVE acknowledgement.
+func alpacaToolset(cfg *config.Config, requireConfirmation bool, toolsets string) (tool.Toolset, func(), error) {
 	cmd := exec.Command("uvx", "alpaca-mcp-server")
 	cmd.Env = append(cmd.Environ(),
 		"ALPACA_API_KEY="+cfg.AlpacaKeyID,
 		"ALPACA_SECRET_KEY="+cfg.AlpacaSecret,
+		"ALPACA_PAPER_TRADE="+strconv.FormatBool(isPaperVenue(cfg.AlpacaBaseURL)),
+		"DATA_API_URL="+cfg.AlpacaDataURL,
 		"CONDA_NO_PLUGINS=true",
 	)
+	if toolsets != "" {
+		cmd.Env = append(cmd.Env, "ALPACA_TOOLSETS="+toolsets)
+	}
 	ts, err := mcptoolset.New(mcptoolset.Config{
 		Transport:           &mcp.CommandTransport{Command: cmd},
 		RequireConfirmation: requireConfirmation,
@@ -49,6 +69,12 @@ func alpacaToolset(cfg *config.Config, requireConfirmation bool) (tool.Toolset, 
 		}
 	}
 	return ts, closeFn, nil
+}
+
+// isPaperVenue reports whether a trading base URL points at Alpaca's
+// paper environment.
+func isPaperVenue(baseURL string) bool {
+	return strings.Contains(strings.ToLower(baseURL), "paper-api")
 }
 
 // guardedTool wraps a single MCP tool and runs the deterministic risk
@@ -90,26 +116,63 @@ func (g *guardedTool) Run(ctx agent.ToolContext, args any) (map[string]any, erro
 
 var _ tool.Tool = (*guardedTool)(nil)
 
-// orderToolNames are the Alpaca MCP tools that can create or modify
-// orders. Everything else (data reads, status polls) passes unguarded so
-// the agent keeps full visibility even while trading is blocked.
-var orderToolNames = map[string]bool{
-	"place_order":         true,
-	"submit_order":        true,
-	"create_order":        true,
-	"cancel_order":        true,
-	"cancel_all_orders":   true,
-	"replace_order":       true,
-	"close_position":      true,
-	"close_all_positions": true,
-	"execute_order":       true,
+// toolClass says what an MCP tool is allowed to do.
+type toolClass int
+
+const (
+	// toolRead is a read-only lookup: it passes straight through.
+	toolRead toolClass = iota
+	// toolOrder creates or increases exposure: it must clear the
+	// deterministic risk gate first.
+	toolOrder
+	// toolControl reduces or reshapes existing exposure (cancel, close).
+	// It is allowed through — blocking a cancel or a flatten would make
+	// the system less safe — but it is journaled.
+	toolControl
+	// toolBlocked is never allowed from an agent.
+	toolBlocked
+)
+
+// classifyTool maps an Alpaca MCP tool name to its class.
+//
+// The classification is DEFAULT-DENY: a tool is read-only only when its
+// name carries an explicit read prefix, and any action tool that is not
+// explicitly recognised is blocked. The previous implementation matched
+// a short list of guessed names ("place_order"), while the real server
+// exposes "place_stock_order", "place_crypto_order" and
+// "place_option_order" — so every actual order tool bypassed the risk
+// gate entirely.
+func classifyTool(name string) toolClass {
+	n := strings.ToLower(strings.TrimSpace(name))
+	switch {
+	case strings.HasPrefix(n, "get_"), strings.HasPrefix(n, "search_"),
+		strings.HasPrefix(n, "fetch_"), strings.HasPrefix(n, "list_"):
+		return toolRead
+	}
+	switch n {
+	case "place_stock_order", "place_crypto_order", "place_option_order":
+		return toolOrder
+	case "replace_order_by_id", "exercise_options_position":
+		// Both change the size or existence of exposure.
+		return toolOrder
+	case "cancel_order_by_id", "cancel_all_orders", "close_position",
+		"close_all_positions", "do_not_exercise_options_position":
+		return toolControl
+	case "update_account_config", "create_locate":
+		// Account configuration and borrow locates are operator actions,
+		// never agent actions.
+		return toolBlocked
+	}
+	return toolBlocked
 }
 
 // riskGuardedToolset filters an execution toolset: order-placement tools
-// get wrapped with the deterministic validator; data tools pass through.
+// get wrapped with the deterministic validator; control tools are
+// journaled; blocked tools are refused; data tools pass through.
 type riskGuardedToolset struct {
 	inner tool.Toolset
 	val   *risk.Validator
+	log   func(format string, args ...any)
 }
 
 func (r *riskGuardedToolset) Name() string { return "risk_guarded_" + r.inner.Name() }
@@ -120,6 +183,11 @@ func (r *riskGuardedToolset) Description() string {
 	}
 	return "execution tools behind deterministic risk checks"
 }
+func (r *riskGuardedToolset) logf(format string, args ...any) {
+	if r.log != nil {
+		r.log(format, args...)
+	}
+}
 func (r *riskGuardedToolset) Tools(ctx agent.ReadonlyContext) ([]tool.Tool, error) {
 	innerTools, err := r.inner.Tools(ctx)
 	if err != nil {
@@ -127,35 +195,85 @@ func (r *riskGuardedToolset) Tools(ctx agent.ReadonlyContext) ([]tool.Tool, erro
 	}
 	out := make([]tool.Tool, 0, len(innerTools))
 	for _, t := range innerTools {
-		if !orderToolNames[strings.ToLower(t.Name())] {
-			out = append(out, t)
-			continue
-		}
 		tt := t
-		out = append(out, &guardedTool{
-			inner: tt,
-			run: func(tctx agent.ToolContext, args any) (map[string]any, error) {
-				p := proposalFromArgs(t.Name(), args)
-				verdict := r.val.Validate(p)
-				log.Printf("[risk-gate] %s %v -> %s", t.Name(), args, verdict.String())
-				if !verdict.Approved {
+		switch classifyTool(tt.Name()) {
+		case toolRead:
+			out = append(out, tt)
+		case toolBlocked:
+			out = append(out, &guardedTool{
+				inner: tt,
+				run: func(tctx agent.ToolContext, args any) (map[string]any, error) {
+					r.logf("[risk-gate] blocked tool %s: not permitted for agents", tt.Name())
 					return map[string]any{
 						"blocked": true,
-						"reason":  verdict.String(),
+						"reason":  "tool " + tt.Name() + " is not permitted for agent use",
 					}, nil
-				}
-				args = applyExtendedHoursDefault(r.val.Cfg, p, args)
-				type runner interface {
-					Run(agent.ToolContext, any) (map[string]any, error)
-				}
-				if rr, ok := tt.(runner); ok {
-					return rr.Run(tctx, args)
-				}
-				return nil, fmt.Errorf("order tool %q has no runnable implementation", t.Name())
-			},
-		})
+				},
+			})
+		case toolControl:
+			out = append(out, &guardedTool{
+				inner: tt,
+				run: func(tctx agent.ToolContext, args any) (map[string]any, error) {
+					r.logf("[risk-gate] control tool %s %v", tt.Name(), args)
+					type runner interface {
+						Run(agent.ToolContext, any) (map[string]any, error)
+					}
+					if rr, ok := tt.(runner); ok {
+						return rr.Run(tctx, args)
+					}
+					return nil, fmt.Errorf("control tool %q has no runnable implementation", tt.Name())
+				},
+			})
+		default: // toolOrder
+			out = append(out, &guardedTool{
+				inner: tt,
+				run: func(tctx agent.ToolContext, args any) (map[string]any, error) {
+					p := proposalFromArgs(tt.Name(), args)
+					if p.Confidence == nil {
+						p.Confidence = r.deriveConfidence(p.Symbol)
+					}
+					verdict := r.val.Validate(p)
+					r.logf("[risk-gate] %s %v -> %s", tt.Name(), args, verdict.String())
+					if !verdict.Approved {
+						return map[string]any{
+							"blocked": true,
+							"reason":  verdict.String(),
+						}, nil
+					}
+					args = applyExtendedHoursDefault(r.val.Cfg, p, args)
+					type runner interface {
+						Run(agent.ToolContext, any) (map[string]any, error)
+					}
+					if rr, ok := tt.(runner); ok {
+						return rr.Run(tctx, args)
+					}
+					return nil, fmt.Errorf("order tool %q has no runnable implementation", tt.Name())
+				},
+			})
+		}
 	}
 	return out, nil
+}
+
+// deriveConfidence produces the confidence value for a proposal the LLM
+// did not score. Alpaca's MCP order schema has no confidence parameter,
+// so the LLM cannot supply one; without a substitute every agent order
+// was rejected with "missing confidence score" and the agent path could
+// never trade. The deterministic factor composite stands in — it cannot
+// be self-reported away, and the gate still applies MIN_CONFIDENCE to
+// it. Returns nil when no factor score is available, which leaves the
+// proposal rejected (fail closed).
+func (r *riskGuardedToolset) deriveConfidence(symbol string) *float64 {
+	if r.val == nil || r.val.Factors == nil || strings.TrimSpace(symbol) == "" {
+		return nil
+	}
+	res, err := r.val.Factors.ScoreFactors(r.val.Context(), symbol)
+	if err != nil {
+		r.logf("[risk-gate] confidence derivation failed for %s: %v", symbol, err)
+		return nil
+	}
+	c := res.Composite
+	return &c
 }
 
 // NewValidator builds the deterministic pre-trade validator exactly as

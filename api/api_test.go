@@ -147,10 +147,14 @@ func TestSourceMatchesPath(t *testing.T) {
 		source, want string
 		match        bool
 	}{
-		{"strategy:auto", "agent", true},
+		{"strategy:auto", "auto", true},
+		{"strategy:auto", "agent", false},
 		{"strategy:ensemble", "ensemble", true},
 		{"cli:trade", "manual", true},
 		{"cli:factors", "manual", true},
+		{"trade_ideas", "agent", true},
+		{"executions", "agent", true},
+		{"dashboard:manual", "manual", true},
 		{"strategy:auto", "manual", false},
 		{"something:weird", "something:weird", true},
 		{"strategy:auto", "strategy:auto", true},

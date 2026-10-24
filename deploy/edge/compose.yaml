@@ -1,0 +1,95 @@
+# Alpacaruns — the API and its own edge, as one compose project.
+#
+# Two containers:
+#   api  — the dashboard HTTP API (the Go binary), reading the SAME data
+#          directory the bot writes to. It lives on this project's
+#          network only; nothing reaches it except this edge.
+#   edge — this project's own Caddy. It terminates TLS for this
+#          product's names and publishes on the host's LOOPBACK; the
+#          shared front door forwards to it.
+#
+# The bot itself runs as a systemd service (deploy/alpacaruns.service):
+# it owns the trade log, and it must not be restarted by a container
+# rebuild.
+#
+# This directory is self-contained: the cross-compiled binary, the CA
+# bundle, the Caddyfile and the app's .env all live next to it, so the
+# image build needs nothing but the files in this folder.
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: alpacaruns-api:local
+    restart: unless-stopped
+    # The bot writes /opt/alpacaruns/data as the alpacaruns user; the
+    # API must read the journal and write the pause flag, so both run
+    # as the same uid. Set ALPACARUNS_UID/GID in .env to match.
+    user: "${ALPACARUNS_UID:-65532}:${ALPACARUNS_GID:-65532}"
+    volumes:
+      # The .env carries the Alpaca credentials. Read-only.
+      - /opt/alpacaruns/.env:/opt/alpacaruns/.env:ro
+      # The shared state directory: trades.jsonl, strategy-state.json,
+      # a2a-state.json, paused.
+      - /opt/alpacaruns/data:/opt/alpacaruns/data:rw
+    working_dir: /opt/alpacaruns
+    command:
+      - serve
+      - --port
+      - "8090"
+      - --env
+      - /opt/alpacaruns/.env
+    environment:
+      # The API is reached from inside this compose network, so it binds
+      # every interface of the container (the host never sees it).
+      # The process environment wins over the mounted .env file, so this
+      # overrides the host deployment's loopback bind.
+      ALPACA_API_PORT: "8090"
+      ALPACA_API_BIND: "0.0.0.0"
+      TRADE_LOG: /opt/alpacaruns/data/trades.jsonl
+      # The dashboard is same-origin, so CORS is only needed for a
+      # separately hosted UI. Pinning it stops any other site from
+      # reading the account and position data.
+      CORS_ORIGIN: "${CORS_ORIGIN:-https://run.57.130.80.158.sslip.io}"
+      # The dashboard's operator token for the state-changing endpoints.
+      DASHBOARD_TOKEN: "${DASHBOARD_TOKEN:-}"
+    networks:
+      - alpacaruns_default
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/alpacaruns", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  edge:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      # Host loopback only. The shared front door forwards here.
+      - "127.0.0.1:8083:80"
+      - "127.0.0.1:8446:443"
+    environment:
+      # The ACME contact address for expiry notices. The default
+      # (admin@example.com) is REJECTED by Let's Encrypt — the contact
+      # domain must not be a reserved example domain — so a real address
+      # is required for the certificate to be issued at all.
+      ACME_EMAIL: "${ACME_EMAIL:-otemaach@gmail.com}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data:rw
+      - caddy-config:/config:rw
+    networks:
+      - alpacaruns_default
+
+volumes:
+  caddy-data:
+  caddy-config:
+
+networks:
+  alpacaruns_default:
+    name: alpacaruns_default

@@ -1,0 +1,15 @@
+# ALPACARUNS — the names this product answers for on plaintext HTTP.
+#
+# One entry per line:  <hostname>  <address:port>;
+#
+# This table is what makes the ACME HTTP-01 challenge work: Let's Encrypt
+# fetches http://<hostname>/.well-known/acme-challenge/... over port 80, the
+# front door looks the Host header up here, and the request lands on this
+# project's edge, which serves the challenge. The front door does not answer
+# the challenge itself, and it holds no certificate.
+#
+# Format note: nginx's map reads each entry as "name value;" — the trailing
+# semicolon is REQUIRED. It is not a nicety: "nginx -t" refuses the whole
+# configuration without it, and the front door is what every public name on
+# this box depends on.
+run.57.130.80.158.sslip.io 127.0.0.1:8083;

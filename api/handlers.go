@@ -26,6 +26,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/BROCKUGANDA/alpacaruns/options"
 	"github.com/BROCKUGANDA/alpacaruns/pnl"
 	"github.com/BROCKUGANDA/alpacaruns/risk"
 	"github.com/BROCKUGANDA/alpacaruns/tools"
@@ -136,6 +137,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 // loaded config and strategy settings. Both may be nil (cold start);
 // every field is then zero, which the dashboard renders as "n/a".
 func (s *Server) buildStatusConfig() StatusConfig {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
 	if s.cfg == nil {
 		return StatusConfig{}
 	}
@@ -151,7 +154,10 @@ func (s *Server) buildStatusConfig() StatusConfig {
 		out.TotalDDHalt = s.strat.TotalDD
 		out.OptionsEnabled = s.strat.OptionsEnabled
 		out.Symbols = append([]string{}, s.strat.EquitySymbols...)
+		out.Symbols = append(out.Symbols, s.strat.ETFSymbols...)
+		out.Symbols = append(out.Symbols, s.strat.IndexSymbols...)
 		out.Symbols = append(out.Symbols, s.strat.CryptoSymbols...)
+		out.Symbols = append(out.Symbols, s.strat.OptionUnderlyings...)
 	}
 	return out
 }
@@ -999,6 +1005,8 @@ func (s *Server) snapshotConfigWith(req ConfigUpdateRequest) ConfigResponse {
 // in-memory cfg is nil (cold start / dashboard-only bring-up), so
 // the GET never 500s on missing state.
 func (s *Server) snapshotConfig() ConfigResponse {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
 	out := ConfigResponse{
 		MaxPositionUSD:       10000,
 		MaxPortfolioPct:      0.20,
@@ -1052,6 +1060,7 @@ func (s *Server) applyConfigUpdate(req ConfigUpdateRequest) error {
 	if req.TotalDDHalt != nil && !validFraction(*req.TotalDDHalt) {
 		return fmt.Errorf("total_dd_halt must be in [0, 1], got %v", *req.TotalDDHalt)
 	}
+	s.cfgMu.Lock()
 	if s.cfg != nil {
 		if req.MaxPositionUSD != nil {
 			s.cfg.MaxPositionUSD = *req.MaxPositionUSD
@@ -1077,6 +1086,7 @@ func (s *Server) applyConfigUpdate(req ConfigUpdateRequest) error {
 			s.strat.TotalDD = *req.TotalDDHalt
 		}
 	}
+	s.cfgMu.Unlock()
 	if s.settings.StateFile != "" {
 		if err := s.persistConfig(); err != nil {
 			log.Printf("[api] persist config: %v", err)
@@ -1096,8 +1106,15 @@ func (s *Server) persistConfig() error {
 	}
 	cur := map[string]any{}
 	if b, err := os.ReadFile(s.settings.StateFile); err == nil && len(b) > 0 {
+		// A file containing the literal "null" unmarshals into a nil map;
+		// writing to it panics. Start from an empty map in that case.
 		_ = json.Unmarshal(b, &cur)
+		if cur == nil {
+			cur = map[string]any{}
+		}
 	}
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
 	if s.cfg != nil {
 		cur["max_position_usd"] = s.cfg.MaxPositionUSD
 		cur["max_portfolio_pct"] = s.cfg.MaxPortfolioPct
@@ -1288,7 +1305,7 @@ func (s *Server) validateProposal(req TradeProposalRequest) riskVerdict {
 		// the bot's own validator on the auto path.
 		return riskVerdict{Approved: true, Notional: 0}
 	}
-	v := s.buildValidator()
+	v := s.buildValidator(priceFromRequest(req))
 	proposal := risk.Proposal{
 		Symbol:        req.Symbol,
 		Side:          strings.ToLower(strings.TrimSpace(req.Side)),
@@ -1331,11 +1348,13 @@ type riskVerdict struct {
 // portfolio-percentage gate still works against the (in-memory) state.
 // In production, a real bot alongside the dashboard wires a real
 // Portfolio snapshot.
-func (s *Server) buildValidator() *risk.Validator {
+func (s *Server) buildValidator(fallbackPrice float64) *risk.Validator {
 	halt := &serverHaltSource{paused: &s.pauseFlag}
 	v := &risk.Validator{
-		Cfg:  s.cfg,
-		Kill: halt,
+		Cfg:   s.cfg,
+		Kill:  halt,
+		Clock: s.marketClock(),
+		Prices: apiPriceSource{client: s.client, fallback: fallbackPrice},
 	}
 	// Portfolio hook: when a real Alpaca client is wired, validate
 	// against the LIVE account so the portfolio-percentage cap is real
@@ -1388,6 +1407,108 @@ func (s *Server) buildValidator() *risk.Validator {
 		v.Positions = func(symbol string) float64 { return 0 }
 	}
 	return v
+}
+
+// priceFromRequest extracts a usable price hint from the proposal: the
+// limit price when the operator pinned one. It is only a fallback for
+// cold-start mode where no broker is wired.
+func priceFromRequest(req TradeProposalRequest) float64 {
+	if lp := strings.TrimSpace(req.LimitPrice); lp != "" {
+		if f, err := strconv.ParseFloat(lp, 64); err == nil && f > 0 {
+			return f
+		}
+	}
+	return 0
+}
+
+// apiPriceSource prices a proposal for the dashboard's validator. With
+// a broker client it uses the live market price, so the notional the
+// dashboard shows is the notional the broker would see. In cold-start
+// mode (no client) it falls back to the request's limit price.
+type apiPriceSource struct {
+	client   *tools.Client
+	fallback float64
+}
+
+func (p apiPriceSource) Price(ctx context.Context, symbol string, isOption bool) (float64, error) {
+	if p.client != nil {
+		if isOption {
+			oc := options.NewClient(p.client)
+			snaps, err := oc.GetSnapshots(ctx, []string{symbol})
+			if err == nil {
+				if s, ok := snaps[symbol]; ok {
+					if mid := s.MidQuote(); mid > 0 {
+						return mid, nil
+					}
+				}
+			}
+		} else {
+			snaps, err := p.client.GetSnapshots(ctx, []string{symbol})
+			if err == nil {
+				if s, ok := snaps[symbol]; ok {
+					if px := s.MidPrice(); px > 0 {
+						return px, nil
+					}
+				}
+			}
+		}
+	}
+	if p.fallback > 0 {
+		return p.fallback, nil
+	}
+	if p.client == nil {
+		// Cold-start bring-up (no broker wired): the dashboard can still
+		// demonstrate the gate, so the notional is computed from a
+		// nominal price. This mirrors the synthetic portfolio used in
+		// this mode and never reaches a broker, because order placement
+		// is unreachable without a client.
+		return nominalColdStartPrice, nil
+	}
+	return 0, fmt.Errorf("no price available for %s", symbol)
+}
+
+// nominalColdStartPrice is the per-share price used to size a proposal
+// when the dashboard runs without a broker client.
+const nominalColdStartPrice = 100.0
+
+// marketClock adapts Alpaca's /v2/clock to the risk gate's
+// MarketClock interface. Without it the manual-order path had NO
+// market-hours check at all — a dashboard order could be submitted at
+// 3am and only the broker would refuse it. An unreadable clock fails
+// closed (market considered closed).
+func (s *Server) marketClock() risk.MarketClock {
+	if s.client == nil {
+		return nil
+	}
+	return apiClock{client: s.client}
+}
+
+// apiClock reads the Alpaca market clock for the risk gate.
+type apiClock struct{ client *tools.Client }
+
+func (c apiClock) MarketOpen() bool {
+	cl, err := c.client.GetClock(context.Background())
+	if err != nil || cl == nil {
+		return false
+	}
+	return cl.IsOpen
+}
+
+func (c apiClock) SessionOpen(p risk.Proposal) bool {
+	cl, err := c.client.GetClock(context.Background())
+	if err != nil || cl == nil {
+		return false
+	}
+	ts, err := time.Parse(time.RFC3339, cl.Timestamp)
+	if err != nil {
+		return false
+	}
+	return risk.InExtendedSession(ts.Weekday(), ts.Hour(), ts.Minute())
+}
+
+func (c apiClock) SessionKnown() bool {
+	cl, err := c.client.GetClock(context.Background())
+	return err == nil && cl != nil
 }
 
 // serverHaltSource is a one-method adapter so the live pause flag

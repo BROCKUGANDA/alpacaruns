@@ -10,6 +10,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strconv"
+	"strings"
 
 	"google.golang.org/adk/agent"
 	"google.golang.org/adk/agent/llmagent"
@@ -93,15 +95,18 @@ func Build(ctx context.Context, cfg *config.Config, log *slog.Logger) (*Graph, e
 	supervised := cfg.Mode == config.ModeSupervised
 
 	// Two MCP connections to Alpaca's official server:
-	//  - dataToolset: read-only market/account tools, no confirmation needed
-	//  - execToolset: order placement/status/cancel; in supervised mode every
-	//    call triggers ADK Human-in-the-Loop confirmation.
-	dataTS, closeData, err := alpacaToolset(cfg, false)
+	//  - dataToolset: read-only market-data toolsets, no confirmation needed.
+	//    The server is told which toolsets to expose, so this session
+	//    structurally has no order tools at all.
+	//  - execToolset: trading toolsets; in supervised mode every call
+	//    triggers ADK Human-in-the-Loop confirmation, and every order
+	//    tool is additionally wrapped by the deterministic risk gate.
+	dataTS, closeData, err := alpacaToolset(cfg, false, DataToolsetEnv)
 	if err != nil {
 		return buildErr(fmt.Errorf("connect alpaca mcp (data): %w", err))
 	}
 	g.closers = append(g.closers, closeData)
-	execTS, closeExec, err := alpacaToolset(cfg, supervised)
+	execTS, closeExec, err := alpacaToolset(cfg, supervised, ExecToolsetEnv)
 	if err != nil {
 		return buildErr(fmt.Errorf("connect alpaca mcp (execution): %w", err))
 	}
@@ -121,7 +126,29 @@ func Build(ctx context.Context, cfg *config.Config, log *slog.Logger) (*Graph, e
 			tools.NewClient(cfg.AlpacaKeyID, cfg.AlpacaSecret, cfg.AlpacaBaseURL, cfg.AlpacaDataURL),
 			nil, factors.Options{}),
 	}
-	execTS = &riskGuardedToolset{inner: execTS, val: val}
+	// Additive exposure cap: the per-symbol position value has to be
+	// known for the combined-exposure check to run at all.
+	val.Positions = func(symbol string) float64 {
+		ps, err := tools.NewClient(cfg.AlpacaKeyID, cfg.AlpacaSecret, cfg.AlpacaBaseURL, cfg.AlpacaDataURL).GetPositions(context.Background())
+		if err != nil {
+			return 0
+		}
+		want := strings.ToUpper(strings.TrimSpace(symbol))
+		for _, p := range ps {
+			if strings.ToUpper(p.Symbol) != want {
+				continue
+			}
+			q, _ := strconv.ParseFloat(p.Qty, 64)
+			px, _ := strconv.ParseFloat(p.CurrentPrice, 64)
+			if v := q * px; v > 0 {
+				return v
+			}
+		}
+		return 0
+	}
+	execTS = &riskGuardedToolset{inner: execTS, val: val, log: func(format string, args ...any) {
+		log.Info(fmt.Sprintf(format, args...))
+	}}
 
 	ts := []tool.Toolset{dataTS}
 	execTs := []tool.Toolset{execTS}

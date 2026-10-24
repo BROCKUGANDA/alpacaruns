@@ -22,10 +22,15 @@ import (
 // Settings holds every knob of the deterministic engine. All values come
 // from environment variables with sane paper-trading defaults.
 type Settings struct {
-	// Universes. Equities follow TRADING_WINDOWS; crypto follows
-	// CRYPTO_WINDOWS (24/7 market, so the default is always open).
-	EquitySymbols []string
-	CryptoSymbols []string
+	// Universes. Equities, ETFs and index trackers follow
+	// TRADING_WINDOWS; crypto follows CRYPTO_WINDOWS (24/7 market, so
+	// the default is always open). OptionUnderlyings are expanded into
+	// concrete contracts by the picker.
+	EquitySymbols     []string
+	ETFSymbols        []string
+	IndexSymbols      []string
+	CryptoSymbols     []string
+	OptionUnderlyings []string
 
 	// HH:MM-HH:MM comma-separated execution windows in US/Eastern wall
 	// time. Orders fire ONLY inside a window. Raw specs kept for logs.
@@ -141,25 +146,28 @@ type Settings struct {
 
 // defaults for every tunable; documented in README.md.
 const (
-	defEquitySymbols  = "AAPL,MSFT,NVDA"
-	defCryptoSymbols  = "BTC/USD,ETH/USD"
-	defEquityWindows  = "09:35-10:15,15:45-16:00"
-	defCryptoWindows  = "00:00-23:59"
-	defPositionPct    = 0.05
-	defTPPct          = 0.08
-	defSLPct          = 0.04
-	defTrendBuy       = 0.7
-	defMomentumBuy    = 0.6
-	defExitComposite  = 0.4
-	defExitMomentum   = 0.35
-	defOptionsEnabled = true
-	defOptDeltaMin    = 0.60
-	defOptDeltaMax    = 0.70
-	defOptMinDTE      = 30
-	defOptMaxDTE      = 45
-	defDailyDD        = 0.05
-	defWeeklyDD       = 0.10
-	defTotalDD        = 0.15
+	defEquitySymbols     = "AAPL,MSFT,NVDA"
+	defETFSymbols        = ""
+	defIndexSymbols      = ""
+	defCryptoSymbols     = "BTC/USD,ETH/USD"
+	defOptionUnderlyings = ""
+	defEquityWindows     = "09:35-10:15,15:45-16:00"
+	defCryptoWindows     = "00:00-23:59"
+	defPositionPct       = 0.05
+	defTPPct             = 0.08
+	defSLPct             = 0.04
+	defTrendBuy          = 0.7
+	defMomentumBuy       = 0.6
+	defExitComposite     = 0.4
+	defExitMomentum      = 0.35
+	defOptionsEnabled    = true
+	defOptDeltaMin       = 0.60
+	defOptDeltaMax       = 0.70
+	defOptMinDTE         = 30
+	defOptMaxDTE         = 45
+	defDailyDD           = 0.05
+	defWeeklyDD          = 0.10
+	defTotalDD           = 0.15
 )
 
 // LoadSettings parses every strategy env variable. Call it strictly AFTER
@@ -168,7 +176,10 @@ const (
 func LoadSettings(getenv func(string) string, pollSeconds int) (Settings, error) {
 	s := Settings{
 		EquitySymbols:     splitSymbols(getenv("STRATEGY_EQUITY_SYMBOLS"), defEquitySymbols),
+		ETFSymbols:        splitSymbols(getenv("STRATEGY_ETF_SYMBOLS"), defETFSymbols),
+		IndexSymbols:      splitSymbols(getenv("STRATEGY_INDEX_SYMBOLS"), defIndexSymbols),
 		CryptoSymbols:     splitSymbols(getenv("STRATEGY_CRYPTO_SYMBOLS"), defCryptoSymbols),
+		OptionUnderlyings: splitSymbols(getenv("STRATEGY_OPTION_UNDERLYINGS"), defOptionUnderlyings),
 		EquityWindowsSpec: firstNonEmpty(getenv("TRADING_WINDOWS"), defEquityWindows),
 		CryptoWindowsSpec: firstNonEmpty(getenv("CRYPTO_WINDOWS"), defCryptoWindows),
 		PollSeconds:       pollSeconds,
@@ -430,6 +441,26 @@ func IsCrypto(symbol string) bool {
 	return strings.Contains(strings.ToUpper(symbol), "/")
 }
 
+// CanonicalSymbol maps a venue symbol onto the single form the strategy
+// uses internally. Alpaca's trading API reports crypto without the
+// separator ("BTCUSD") while the market-data API and the strategy
+// universe use "BTC/USD"; comparing the two forms directly made every
+// crypto position look like it was not held.
+func CanonicalSymbol(symbol string) string {
+	s := strings.ToUpper(strings.TrimSpace(symbol))
+	if s == "" {
+		return ""
+	}
+	if !strings.Contains(s, "/") {
+		for _, pair := range []string{"BTC/USD", "ETH/USD", "SOL/USD", "DOGE/USD", "AVAX/USD"} {
+			if strings.ReplaceAll(pair, "/", "") == s {
+				return pair
+			}
+		}
+	}
+	return s
+}
+
 // SizingFor returns the appropriate Sizing for a symbol. Equities use
 // PositionPct + cfg.MaxPositionUSD; crypto uses the Crypto* overrides
 // when set, falling back to the equity values when unset. This lets the
@@ -445,7 +476,6 @@ func (s Settings) SizingFor(symbol string, cfgMaxPositionUSD float64) Sizing {
 	}
 	return Sizing{PositionPct: s.PositionPct, MaxPositionUSD: cfgMaxPositionUSD}
 }
-
 
 // SanitizeSymbol renders a venue symbol safe for embedding in
 // client_order_id strings ("/" and spaces removed).

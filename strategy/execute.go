@@ -34,6 +34,21 @@ type RiskGate interface {
 	Validate(p risk.Proposal) risk.Verdict
 }
 
+// strategyNotional returns the USD exposure to hand the risk gate. The
+// strategy already knows the dollar value of an entry (qty x reference
+// price), so the gate sizes against that instead of re-fetching a price:
+// a share count on its own is not a dollar amount and the caps would be
+// meaningless.
+func strategyNotional(explicit string, computed float64) string {
+	if s := strings.TrimSpace(explicit); s != "" {
+		return s
+	}
+	if computed > 0 {
+		return strconv.FormatFloat(computed, 'f', 2, 64)
+	}
+	return ""
+}
+
 func (x *Executor) ExecuteEntry(ctx context.Context, p EntryPlan, conf float64) error {
 	isNotional := p.Notional > 0
 	if isNotional && !p.Crypto {
@@ -93,8 +108,11 @@ func (x *Executor) ExecuteEntry(ctx context.Context, p EntryPlan, conf float64) 
 		req.Qty = strconv.Itoa(p.Qty)
 	}
 	verdict := x.Validator.Validate(risk.Proposal{
-		Symbol: p.Symbol, Side: "buy", Qty: req.Qty, Notional: req.Notional,
-		Confidence: &conf, OrderType: req.Type, TimeInForce: req.TimeInForce,
+		Symbol: p.Symbol, Side: "buy", Qty: req.Qty,
+		Notional:    strategyNotional(req.Notional, notionalUSD),
+		Confidence:  &conf,
+		OrderType:   req.Type,
+		TimeInForce: req.TimeInForce,
 	})
 	if !verdict.Approved {
 		return fmt.Errorf("risk gate rejected %s entry: %s", p.Symbol, strings.Join(verdict.Reasons, "; "))
@@ -112,6 +130,7 @@ func (x *Executor) ExecuteEntry(ctx context.Context, p EntryPlan, conf float64) 
 			Detail: fmt.Sprintf("entry %s qty=%s notional=%.2f price=%.4f tp=%.4f sl=%.4f crypto=%t order=%s",
 				p.Symbol, req.Qty, p.Notional, p.Price, p.Brackets.TakeProfit, p.Brackets.StopLoss, p.Crypto, o.ID),
 		})
+		x.journalFill(o)
 	}
 	if p.Crypto {
 		if err := x.State.SetLevel(PositionLevels{
@@ -123,6 +142,32 @@ func (x *Executor) ExecuteEntry(ctx context.Context, p EntryPlan, conf float64) 
 		}
 	}
 	return nil
+}
+
+// journalFill records a filled order in the trade log. The auto loop
+// placed orders but never wrote fill records, so the drawdown halts saw
+// a realized P/L of zero forever and the stats ledger never populated.
+func (x *Executor) journalFill(o *tools.Order) {
+	if x.Journal == nil || o == nil {
+		return
+	}
+	if o.FilledQty == "" || o.FilledQty == "0" {
+		return
+	}
+	price := strings.TrimSpace(o.FilledAvgPrice)
+	if price == "" || price == "0" {
+		return
+	}
+	_ = x.Journal.Append(pnl.Record{
+		Kind:    pnl.KindFill,
+		OrderID: o.ID,
+		Symbol:  o.Symbol,
+		Side:    strings.ToLower(o.Side),
+		Qty:     o.FilledQty,
+		Price:   price,
+		Status:  o.Status,
+		TS:      time.Now().UTC(),
+	})
 }
 
 // ExecuteOptionEntry places a deep-ITM call entry through the SAME risk
@@ -252,7 +297,10 @@ func (x *Executor) ExecutePreOrder(ctx context.Context, p EntryPlan, conf float6
 	}
 	verdict := x.Validator.Validate(risk.Proposal{
 		Symbol: p.Symbol, Side: "buy", Qty: req.Qty,
-		Confidence: &conf, OrderType: req.Type, TimeInForce: req.TimeInForce,
+		Notional:    strategyNotional("", notionalUSD),
+		Confidence:  &conf,
+		OrderType:   req.Type,
+		TimeInForce: req.TimeInForce,
 	})
 	if !verdict.Approved {
 		return fmt.Errorf("risk gate rejected %s pre-order: %s", p.Symbol, strings.Join(verdict.Reasons, "; "))

@@ -130,38 +130,61 @@ func (v *Validator) priceSource() PriceSource {
 	return alpacaPrices{client: c}
 }
 
-// alpacaPrices is the default PriceSource: stock snapshots for equities,
-// option snapshots for OCC symbols.
+// alpacaPrices is the default PriceSource: stock snapshots for equities
+// and ETFs, crypto snapshots for crypto pairs, option snapshots for OCC
+// symbols.
 type alpacaPrices struct {
 	client *tools.Client
 }
 
 func (a alpacaPrices) Price(ctx context.Context, symbol string, isOption bool) (float64, error) {
-	if !isOption {
-		snaps, err := a.client.GetSnapshots(ctx, []string{symbol})
+	if isOption {
+		oc := options.NewClient(a.client)
+		snaps, err := oc.GetSnapshots(ctx, []string{symbol})
 		if err != nil {
 			return 0, err
 		}
 		s, ok := snaps[symbol]
 		if !ok {
-			return 0, fmt.Errorf("no snapshot for %s", symbol)
+			return 0, fmt.Errorf("no options snapshot for %s", symbol)
 		}
-		return s.LatestTradePrice, nil
+		mid := s.MidQuote()
+		if mid <= 0 {
+			return 0, fmt.Errorf("no quotable price for option %s", symbol)
+		}
+		return mid, nil
 	}
-	oc := options.NewClient(a.client)
-	snaps, err := oc.GetSnapshots(ctx, []string{symbol})
+	if tools.IsCryptoSymbol(symbol) {
+		snaps, err := a.client.GetCryptoSnapshots(ctx, []string{symbol})
+		if err != nil {
+			return 0, err
+		}
+		s, ok := snaps[tools.CryptoOrderSymbol(symbol)]
+		if !ok {
+			return 0, fmt.Errorf("no crypto snapshot for %s", symbol)
+		}
+		px := s.LatestTrade
+		if px <= 0 {
+			px = s.DailyBarClose
+		}
+		if px <= 0 {
+			return 0, fmt.Errorf("no quotable price for %s", symbol)
+		}
+		return px, nil
+	}
+	snaps, err := a.client.GetSnapshots(ctx, []string{symbol})
 	if err != nil {
 		return 0, err
 	}
 	s, ok := snaps[symbol]
 	if !ok {
-		return 0, fmt.Errorf("no options snapshot for %s", symbol)
+		return 0, fmt.Errorf("no snapshot for %s", symbol)
 	}
-	mid := s.MidQuote()
-	if mid <= 0 {
-		return 0, fmt.Errorf("no quotable price for option %s", symbol)
+	px := s.MidPrice()
+	if px <= 0 {
+		return 0, fmt.Errorf("no quotable price for %s", symbol)
 	}
-	return mid, nil
+	return px, nil
 }
 
 // Validate runs every deterministic check against one proposal. It never
@@ -169,6 +192,9 @@ func (a alpacaPrices) Price(ctx context.Context, symbol string, isOption bool) (
 // treated as a rejection (fail closed).
 func (v *Validator) Validate(p Proposal) Verdict {
 	var reasons []string
+	if v == nil || v.Cfg == nil {
+		return Verdict{Approved: false, Reasons: []string{"validator is not configured"}}
+	}
 	isOption := tools.IsOCCSymbol(p.Symbol)
 
 	// 0. Options-specific hard rules, mirroring Alpaca's server-side
@@ -234,16 +260,12 @@ func (v *Validator) Validate(p Proposal) Verdict {
 	qty := parsePositive(p.Qty)
 	notional := parsePositive(p.Notional)
 
-	if p.Confidence == nil {
-		reasons = append(reasons, "missing confidence score")
-	} else if *p.Confidence < v.Cfg.MinConfidence {
-		reasons = append(reasons, fmt.Sprintf("confidence %.2f < minimum %.2f", *p.Confidence, v.Cfg.MinConfidence))
-	}
-
 	// 3b. Multi-factor gate: when a FactorScorer is wired in, the proposal
 	// must clear BOTH the LLM confidence threshold AND the composite
 	// factor score (FACTOR_MIN_SCORE). Rejection reasons name every
 	// failing factor with its score. Scorer errors reject — fail closed.
+	// The gate runs BEFORE the confidence check so that a proposal with
+	// no self-reported confidence can inherit the deterministic score.
 	var factorRes *FactorResult
 	if v.Factors != nil {
 		fr, err := v.Factors.ScoreFactors(v.contextOrBackground(), sym)
@@ -263,11 +285,21 @@ func (v *Validator) Validate(p Proposal) Verdict {
 		}
 	}
 
-	// 4. Sizing. For OCC proposals the USD exposure is the premium outlay:
-	// qty x contract multiplier (100) x mark price from the injected
-	// PriceSource (quote mid or last trade). Price fetch failure rejects —
-	// fail closed. Equities keep the legacy behavior: explicit notional
-	// wins; otherwise fall back to a qty-only sanity check.
+	// 4. Confidence. Every proposal must carry a confidence value. The
+	// agent path has no field to carry one (Alpaca's MCP order schema
+	// has no confidence parameter), so the MCP guard derives it from the
+	// deterministic factor composite before validating. With no
+	// confidence at all there is nothing to judge, so reject.
+	if p.Confidence == nil {
+		reasons = append(reasons, "missing confidence score")
+	} else if *p.Confidence < v.Cfg.MinConfidence {
+		reasons = append(reasons, fmt.Sprintf("confidence %.2f < minimum %.2f", *p.Confidence, v.Cfg.MinConfidence))
+	}
+
+	// 5. Sizing. The USD exposure of the order must be computed from real
+	// prices: a share count is NOT a dollar amount. Treating qty as
+	// notional made a 1,000-share order look like a $1,000 order and
+	// sailed under the per-position and portfolio caps.
 	if isOption && qty > 0 {
 		price, err := v.priceSource().Price(v.contextOrBackground(), sym, true)
 		if err != nil {
@@ -275,47 +307,64 @@ func (v *Validator) Validate(p Proposal) Verdict {
 			return Verdict{Approved: false, Reasons: reasons}
 		}
 		notional = qty * OptionContractMultiplier * price
-	} else if notional <= 0 && p.Qty != "" {
-		notional = parsePositive(p.Qty) // without a price we can only sanity-check qty>0 below
+	} else if notional > 0 {
+		// An explicit notional wins.
+	} else if qty > 0 {
+		price, err := v.priceSource().Price(v.contextOrBackground(), sym, false)
+		if err != nil {
+			reasons = append(reasons, fmt.Sprintf("price unavailable (%v)", err))
+			return Verdict{Approved: false, Reasons: reasons}
+		}
+		notional = qty * price
+	} else {
+		reasons = append(reasons, "no positive qty or notional to size the order")
 	}
 
-	// 5. Portfolio-level checks need live equity — fail closed on error.
+	// 6. Portfolio-level checks need live equity — fail closed on error.
+	if v.Portfolio == nil {
+		reasons = append(reasons, "account unavailable (no portfolio source configured)")
+		return Verdict{Approved: false, Reasons: reasons}
+	}
 	pf, err := v.Portfolio()
 	if err != nil {
 		reasons = append(reasons, fmt.Sprintf("account unavailable (%v)", err))
 		return Verdict{Approved: false, Reasons: reasons}
-	} else {
-		if notional > 0 {
-			perCap := v.Cfg.MaxPositionUSD
-			if isCrypto {
-				perCap = v.Cfg.CryptoMaxPositionUSD
-			}
-			if notional > perCap {
-				reasons = append(reasons, fmt.Sprintf("notional %.2f exceeds per-position cap %.2f", notional, perCap))
-			}
-			base := pf.Equity
-			if base <= 0 {
-				base = pf.PortfolioValue
-			}
-			if base > 0 && !isCrypto && notional/base > v.Cfg.MaxPortfolioPct {
+	}
+	if notional > 0 {
+		perCap := v.Cfg.MaxPositionUSD
+		if isCrypto {
+			perCap = v.Cfg.CryptoMaxPositionUSD
+		}
+		if notional > perCap {
+			reasons = append(reasons, fmt.Sprintf("notional %.2f exceeds per-position cap %.2f", notional, perCap))
+		}
+		base := pf.Equity
+		if base <= 0 {
+			base = pf.PortfolioValue
+		}
+		if base <= 0 {
+			// Without a usable equity base the percentage caps cannot be
+			// evaluated — refusing is the only safe reading.
+			reasons = append(reasons, "account equity unavailable for percentage caps")
+		} else {
+			if notional/base > v.Cfg.MaxPortfolioPct {
 				reasons = append(reasons, fmt.Sprintf("notional %.2f is %.1f%% of portfolio, exceeds cap %.1f%%",
 					notional, 100*notional/base, 100*v.Cfg.MaxPortfolioPct))
 			}
 			// Additive exposure: existing stake in this symbol plus the new order.
-			if v.Positions != nil && sym != "" && base > 0 {
+			if v.Positions != nil && sym != "" {
 				existing := math.Abs(v.Positions(sym))
 				if (existing+notional)/base > v.Cfg.MaxPortfolioPct {
 					reasons = append(reasons, fmt.Sprintf("combined exposure %.2f (%.1f%% of portfolio) exceeds cap %.1f%%",
 						existing+notional, 100*(existing+notional)/base, 100*v.Cfg.MaxPortfolioPct))
 				}
 			}
-		} else if !(isOption && qty > 0) || notional <= 0 {
-			reasons = append(reasons, "no positive qty or notional to size the order")
 		}
 	}
 
 	return Verdict{Approved: len(reasons) == 0, Reasons: reasons, Notional: notional, Factors: factorRes}
 }
+
 
 // sortedFactorNames returns factor names in deterministic order so
 // rejection reasons are stable for logs and tests.
@@ -342,6 +391,15 @@ func (v *Validator) WithContext(ctx context.Context) *Validator {
 	cp := *v
 	cp.ctx = ctx
 	return &cp
+}
+
+// Context returns the context the validator uses for live lookups
+// (context.Background when none was bound).
+func (v *Validator) Context() context.Context {
+	if v == nil {
+		return context.Background()
+	}
+	return v.contextOrBackground()
 }
 
 // parsePositive parses a float, returning -1 on any failure so callers

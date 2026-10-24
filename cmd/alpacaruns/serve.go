@@ -35,6 +35,7 @@ type serveFlags struct {
 	trustedProxy bool
 	tlsCert      string
 	tlsKey       string
+	bindAddr     string
 }
 
 // newServeFlagSet builds and binds the `serve` flag set; extracted
@@ -51,6 +52,7 @@ func newServeFlagSet(f *serveFlags) *flag.FlagSet {
 	fs.BoolVar(&f.trustedProxy, "trusted-proxy", false, "honor X-Forwarded-For/Host for rate limiting (also TRUSTED_PROXY=1)")
 	fs.StringVar(&f.tlsCert, "tls-cert", "", "TLS certificate file for a direct-HTTPS listener (also TLS_CERT env)")
 	fs.StringVar(&f.tlsKey, "tls-key", "", "TLS key file for a direct-HTTPS listener (also TLS_KEY env)")
+	fs.StringVar(&f.bindAddr, "bind", "", "address to bind (e.g. 127.0.0.1 for a proxied deployment; also ALPACA_API_BIND env)")
 	return fs
 }
 
@@ -81,10 +83,22 @@ func cmdServe(args []string) int {
 	client := tools.NewClient(cfg.AlpacaKeyID, cfg.AlpacaSecret, cfg.AlpacaBaseURL, cfg.AlpacaDataURL)
 	client.Log = func(format string, a ...any) { log.Printf("[alpaca] "+format, a...) }
 
+	// An explicitly-passed flag wins over the environment variable; the
+	// env is the fallback for deployments that cannot pass flags.
+	explicit := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
+	bind := fl.bindAddr
+	if !explicit["bind"] {
+		if env := strings.TrimSpace(os.Getenv("ALPACA_API_BIND")); env != "" {
+			bind = env
+		}
+	}
 	port := fl.port
-	if env := os.Getenv("ALPACA_API_PORT"); env != "" {
-		if n, err := strconv.Atoi(env); err == nil && n > 0 && n < 65536 {
-			port = n
+	if !explicit["port"] {
+		if env := os.Getenv("ALPACA_API_PORT"); env != "" {
+			if n, err := strconv.Atoi(env); err == nil && n > 0 && n < 65536 {
+				port = n
+			}
 		}
 	}
 	cors := fl.corsOrigin
@@ -119,6 +133,7 @@ func cmdServe(args []string) int {
 
 	settings := api.ServerSettings{
 		Port:         port,
+		Bind:         bind,
 		CORSOrigin:   cors,
 		TradeLog:     cfg.TradeLog,
 		StateFile:    dataSibling(cfg.TradeLog, "strategy-state.json"),
@@ -135,8 +150,8 @@ func cmdServe(args []string) int {
 	srv := api.New(cfg, client, settings, &set)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	log.Printf("[serve] alpacaruns dashboard api on :%d (trade_log=%s state=%s pause=%s cors=%s)",
-		port, settings.TradeLog, settings.StateFile, settings.PauseFlag, cors)
+	log.Printf("[serve] alpacaruns dashboard api on %s:%d (trade_log=%s state=%s pause=%s cors=%s)",
+		settings.Addr(), port, settings.TradeLog, settings.StateFile, settings.PauseFlag, cors)
 	if err := srv.Run(ctx); err != nil {
 		log.Printf("serve: %v", err)
 		return 1

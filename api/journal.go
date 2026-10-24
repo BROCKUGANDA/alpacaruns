@@ -10,8 +10,10 @@ package api
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -56,6 +58,13 @@ func readAllRecords(path string) ([]pnl.Record, error) {
 		out = append(out, r)
 	}
 	if err := sc.Err(); err != nil && err != io.EOF {
+		// A single oversized line makes the scanner stop. Skip the
+		// offending row and keep the records read so far: losing one
+		// line is better than failing every dashboard query.
+		if errors.Is(err, bufio.ErrTooLong) {
+			log.Printf("[api] trade log %s: oversized line skipped", path)
+			return out, nil
+		}
 		return out, fmt.Errorf("scan trade log %s: %w", path, err)
 	}
 	return out, nil
@@ -109,17 +118,35 @@ func readDecisions(records []pnl.Record, path string, since, until time.Time) []
 }
 
 // sourceMatchesPath is a small taxonomy: the journal's Source is
-// "subsystem:verb" (strategy:auto, cli:trade, ...). The dashboard
-// groups them into "agent", "ensemble", "manual" so the UI can keep
-// a stable vocabulary even when new subsystems are added.
+// "subsystem:verb" (strategy:auto, cli:trade, trade_ideas, ...). The
+// dashboard groups them into "auto", "agent", "ensemble" and "manual"
+// so the UI can keep a stable vocabulary even when new subsystems are
+// added.
+//
+// The buckets are disjoint and every one of them has real producers:
+//
+//	auto    strategy:auto                     the deterministic bot loop
+//	agent   trade_ideas / risk_assessment /   the LLM agent cycle
+//	        executions / monitor
+//	ensemble strategy:ensemble                the multi-expert layer
+//	manual  cli:*, dashboard:*, boot          operator-driven actions
+//
+// Before this split the "auto" filter matched nothing at all, so the
+// dashboard's auto tab was permanently empty, and "agent" swallowed
+// the deterministic loop's decisions.
 func sourceMatchesPath(source, want string) bool {
 	switch want {
+	case "auto":
+		return source == "strategy:auto"
 	case "agent":
-		return source == "strategy:auto" || source == "monitor"
+		return source == "trade_ideas" || source == "risk_assessment" ||
+			source == "executions" || source == "monitor" ||
+			strings.HasPrefix(source, "agent:")
 	case "ensemble":
 		return source == "strategy:ensemble"
 	case "manual":
-		return source == "cli:trade" || source == "cli:chain" || source == "cli:factors"
+		return source == "cli:trade" || source == "cli:chain" || source == "cli:factors" ||
+			strings.HasPrefix(source, "dashboard:") || source == "boot"
 	}
 	// Unknown bucket: treat as exact match.
 	return source == want

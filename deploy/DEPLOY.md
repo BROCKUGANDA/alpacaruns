@@ -318,13 +318,99 @@ is always live the moment the bot ticks.
 
 Public URL options (in order of operational simplicity):
 
-1. **Direct IP** — `http://5.22.215.51/` (current production bind).
-2. **Cloudflare Tunnel** — see `deploy/cloudflare-tunnel.md` for the
-   current tunnel setup (tunnel ID `8a06d87d-...`, ingress
-   `demo.svalley.tech → http://localhost:80`). The tunnel runs as
-   `cloudflared-alpacaruns-demo.service`; logs are at
-   `journalctl -u cloudflared-alpacaruns-demo -f`. Note that the
-   `svalley.tech` zone currently returns `UserProjectAccountProblem`
-   (closed Cloudflare billing), so the tunnel is up but the
-   proxied hostname is unreachable until the account billing is
-   restored — for now, hit the dashboard over the raw IP.
+1. **Direct IP** — bind the API to a high port and hit it directly.
+   Only for a throwaway bring-up: the control endpoints and the account
+   data are on it.
+2. **A product edge of your own** — `deploy/edge/` is a complete,
+   reviewable edge for this product: a Caddyfile, a compose file and a
+   Dockerfile for the API image. See "The product edge" below.
+3. **Cloudflare Tunnel** — see `deploy/cloudflare-tunnel.md` for a
+   tunnel-based alternative that needs no inbound ports.
+
+## The product edge (`deploy/edge/`)
+
+The API is served by Caddy, and the edge that serves it belongs to
+this project rather than to whoever owns the box. Three pieces:
+
+| File | What it is |
+|---|---|
+| `deploy/edge/Caddyfile` | This product's site block: TLS, security headers, the upstream |
+| `deploy/edge/compose.yaml` | The API container and the edge container, on this project's network |
+| `deploy/edge/Dockerfile` | The API image: the static binary + a CA bundle, on `scratch` |
+| `deploy/edge/alpacaruns.sni.map` | The front door's TLS table entry for this product's names |
+| `deploy/edge/alpacaruns.host.map` | The front door's HTTP table entry (this is what serves the ACME challenge) |
+
+The API image is built from the **cross-compiled static binary**, so no
+Go toolchain is needed on the host:
+
+```bash
+# 1. build the binary and stage the edge context
+GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o alpacaruns.linux ./cmd/alpacaruns
+mkdir -p ~/alpacaruns-edge && cp alpacaruns.linux deploy/edge/{Caddyfile,compose.yaml,Dockerfile} ~/alpacaruns-edge/
+cp /etc/ssl/certs/ca-certificates.crt ~/alpacaruns-edge/   # the image needs a CA bundle
+chmod +x ~/alpacaruns-edge/alpacaruns.linux                 # COPY preserves the mode
+
+# 2. the compose variables (uid = the bot's user, ACME contact, CORS, token)
+cat > ~/alpacaruns-edge/.env <<'EOF'
+ALPACARUNS_UID=994
+ALPACARUNS_GID=982
+ACME_EMAIL=you@example.org
+CORS_ORIGIN=https://run.example.com
+DASHBOARD_TOKEN=<long random token>
+EOF
+
+# 3. run it
+cd ~/alpacaruns-edge && sudo docker compose up -d
+```
+
+The edge publishes on the host's **loopback only** (`127.0.0.1:8083`
+and `127.0.0.1:8446`). The box's shared front door is an L4 SNI
+router: it reads the SNI out of the ClientHello and forwards the
+connection to the address this product's `*.sni.map` names, so the
+front door terminates no TLS and holds no certificate.
+
+To publish the name, copy the two map files into the front door's
+`edge.d/` directory and reload it:
+
+```bash
+cp deploy/edge/alpacaruns.sni.map deploy/edge/alpacaruns.host.map ~/edge/nginx/edge.d/
+sudo docker exec edge-router-router-1 nginx -t        # MUST pass before the reload
+sudo docker exec edge-router-router-1 nginx -s reload  # zero downtime
+```
+
+`nginx -t` is not optional: the map syntax requires the trailing
+semicolon, and a malformed map takes down **every** name on the box,
+not just this one.
+
+The ACME contact address matters: Let's Encrypt rejects a contact on a
+reserved example domain (`admin@example.com`), and the certificate is
+not issued at all until a real address is configured.
+
+## The live deployment (2026-10-24)
+
+| | |
+|---|---|
+| Host | `ubuntu@57.130.80.158` (the "work" box) |
+| Public URL | `https://run.57.130.80.158.sslip.io` |
+| Dashboard | `https://run.57.130.80.158.sslip.io/` |
+| Picker page | `https://run.57.130.80.158.sslip.io/picker/` |
+| Bot | systemd `alpacaruns` (`alpacaruns auto`, paper) |
+| API | container `alpacaruns-edge-api-1` + edge `alpacaruns-edge-edge-1` |
+| Data | `/opt/alpacaruns/data` (bot writes, API reads/writes the pause flag) |
+| Env | `/opt/alpacaruns/.env` (root:alpacaruns, 640) |
+
+The previous host (`5.22.215.51`, the old `run.svalley.tech`) is
+powered off — every port refuses connections — so the old demo was
+already down. The new host serves the dashboard over TLS through its
+own edge.
+
+The box's port map matters when deploying: `8080`, `8081` and `8082`
+are the three products' edge containers, `8443`/`8444`/`8445` are their
+TLS ports, and `3100` is the astrolabe app. This product uses `8083`
+and `8446`.
+
+The bot and the API run under different supervision on purpose: the
+bot is a systemd service (it owns the trade log and must not be
+restarted by a container rebuild), the API is a container (it needs the
+network and the edge). They share one data directory, and both run as
+the same uid so the API can write the pause flag the bot reads.

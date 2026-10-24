@@ -99,45 +99,44 @@ func TestPauseFlagEngaged(t *testing.T) {
 	}
 }
 
-// TestAutoTickHonorsPauseFlag asserts that when data/paused is "true",
-// autoLoop.tick returns nil (no Alpaca call, no journal append) and
-// crucially never increments an entry counter. We use a fake journal
-// via pnl.Open on a temp dir and a kill-switch style stub.
+// TestAutoTickHonorsPauseFlag asserts that a paused tick does NOT
+// short-circuit the whole loop. Pause blocks NEW ENTRIES; the monitor
+// pass (drawdown halts, TP/SL exits) must keep running so open
+// positions stay protected while the operator has the bot paused.
+//
+// The loop is built by hand with no broker client: reaching the client
+// call is the proof that the pause check did not abort the tick, and
+// the tick reports an error instead of panicking.
 func TestAutoTickHonorsPauseFlag(t *testing.T) {
 	dir := t.TempDir()
-	// Empty Alpaca client (would panic if we got past the pause check).
-	// The pause flag is the FIRST check, so the loop never touches it.
 	flagPath := filepath.Join(dir, "paused")
 	if err := os.WriteFile(flagPath, []byte("true\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	// Build a minimal autoLoop whose tick() should bail out before
-	// touching the Alpaca client. We give it the smallest viable
-	// struct by hand rather than going through buildAutoLoop, which
-	// requires a real network round-trip in LoadSettings.
 	loop := &autoLoop{
 		pauseFlagPath: flagPath,
 	}
 
-	if err := loop.tick(context.Background()); err != nil {
-		t.Fatalf("tick with pause flag set should return nil, got %v", err)
+	err := loop.tick(context.Background())
+	if err == nil {
+		t.Fatal("a paused tick must still run the monitor path (it reaches the broker), not return early")
+	}
+	if !strings.Contains(err.Error(), "broker client") {
+		t.Fatalf("tick error = %v, want the broker-client error proving the monitor path ran", err)
 	}
 	if !loop.pausedLogged {
 		t.Fatalf("pausedLogged should be true after first tick")
 	}
-	// Second tick still no-op, no error.
-	if err := loop.tick(context.Background()); err != nil {
-		t.Fatalf("second paused tick should return nil, got %v", err)
+	// Second tick still behaves the same.
+	if err := loop.tick(context.Background()); err == nil {
+		t.Fatal("second paused tick must still reach the monitor path")
 	}
 }
 
 // TestAutoTickResumesWhenFlagCleared asserts that clearing the flag
-// re-enables the entry pipeline. We can't run the full pipeline here
-// (it would touch the network), so we assert on the side-effects we
-// CAN observe without network: the pausedLogged bool flips back to
-// false and the loop reaches the Alpaca client (which is nil). A nil
-// pointer dereference is the proof that the pause check passed.
+// re-enables the entry pipeline. The pausedLogged flag flips back to
+// false once the tick sees the cleared file.
 func TestAutoTickResumesWhenFlagCleared(t *testing.T) {
 	dir := t.TempDir()
 	flagPath := filepath.Join(dir, "paused")
@@ -155,19 +154,10 @@ func TestAutoTickResumesWhenFlagCleared(t *testing.T) {
 	if err := os.Remove(flagPath); err != nil {
 		t.Fatal(err)
 	}
-	// With pauseFlagPath still pointing at the now-missing file,
-	// pauseFlagEngaged returns false. We expect the loop to advance
-	// past the pause check and then call l.client.GetAccount, which
-	// panics on a nil client. Recover and verify.
-	defer func() {
-		if r := recover(); r == nil {
-			t.Fatalf("expected nil-client panic to indicate pause bypass")
-		}
-		if loop.pausedLogged {
-			t.Fatalf("pausedLogged should be false after resume")
-		}
-	}()
 	_ = loop.tick(context.Background())
+	if loop.pausedLogged {
+		t.Fatalf("pausedLogged should be false after resume")
+	}
 }
 
 // defaultPauseFlagPath derives the sidecar path next to the trade log.

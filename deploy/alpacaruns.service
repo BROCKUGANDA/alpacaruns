@@ -14,7 +14,11 @@ User=alpacaruns
 Group=alpacaruns
 WorkingDirectory=/opt/alpacaruns
 EnvironmentFile=/opt/alpacaruns/.env
-ExecStart=/usr/local/bin/alpacaruns monitor
+# The deterministic loop is the production path: it needs no LLM, so it
+# runs 24/7 on a bare box. Use `alpacaruns monitor` instead when an LLM
+# provider (llama.cpp / Oxlo / Gemini) is reachable and you want the
+# agent cycle to drive decisions.
+ExecStart=/usr/local/bin/alpacaruns auto
 Restart=always
 RestartSec=10
 # Graceful shutdown: SIGTERM lets the monitor finish in-flight order polling.

@@ -99,30 +99,49 @@ func (s *StateStore) load() (*State, error) {
 		// rewrite will downgrade to what we know.
 		st.Version = stateVersion
 	}
-	migrateIntradayPrefix(&st)
+	migrateLevelKeys(&st)
 	return &st, nil
 }
 
-// migrateIntradayPrefix rewrites legacy "intraday:SYM" level keys into
-// plain-symbol keys with Track="intraday" (the pre-track layout never
-// matched broker symbols in the monitor, so those TP/SL levels were
-// dead). Runs on every load; the rewrite is idempotent and the next
-// Save persists it.
-func migrateIntradayPrefix(st *State) {
+// levelKey is the map key for a position's TP/SL levels. The swing book
+// uses the plain venue symbol; any other track is suffixed, so the
+// intraday and swing books can hold the same symbol at the same time
+// without one clobbering the other's levels.
+func levelKey(symbol, track string) string {
+	if track == "" {
+		return symbol
+	}
+	return symbol + "|" + track
+}
+
+// migrateLevelKeys rewrites legacy level keys into the track-aware
+// layout. Two legacy shapes existed: "intraday:SYM" prefixed keys, and
+// plain keys carrying a non-empty Track. Both are normalised here so an
+// intraday entry can no longer overwrite the swing book's levels for
+// the same symbol.
+func migrateLevelKeys(st *State) {
 	for key, lv := range st.Levels {
-		if !strings.HasPrefix(key, "intraday:") {
+		if lv == nil {
+			delete(st.Levels, key)
 			continue
 		}
-		base := strings.TrimPrefix(key, "intraday:")
-		delete(st.Levels, key)
-		if base == "" {
-			continue
-		}
-		if lv != nil {
+		base := strings.TrimSpace(lv.Symbol)
+		if strings.HasPrefix(key, "intraday:") {
+			base = strings.TrimPrefix(key, "intraday:")
 			lv.Symbol = base
 			lv.Track = "intraday"
 		}
-		st.Levels[base] = lv
+		if base == "" {
+			delete(st.Levels, key)
+			continue
+		}
+		lv.Symbol = base
+		want := levelKey(base, lv.Track)
+		if want == key {
+			continue
+		}
+		delete(st.Levels, key)
+		st.Levels[want] = lv
 	}
 }
 
@@ -162,7 +181,7 @@ func (s *StateStore) SetLevel(lv PositionLevels) error {
 		return err
 	}
 	lv.Crypto = IsCrypto(lv.Symbol)
-	st.Levels[lv.Symbol] = &lv
+	st.Levels[levelKey(lv.Symbol, lv.Track)] = &lv
 	return s.saveLocked(st)
 }
 
@@ -182,8 +201,9 @@ func (s *StateStore) ClearLevelTrack(symbol, track string) error {
 	if err != nil {
 		return err
 	}
-	if lv, ok := st.Levels[symbol]; ok && lv.Track == track {
-		delete(st.Levels, symbol)
+	key := levelKey(symbol, track)
+	if lv, ok := st.Levels[key]; ok && lv.Track == track {
+		delete(st.Levels, key)
 	}
 	return s.saveLocked(st)
 }

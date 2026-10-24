@@ -150,9 +150,15 @@ func (m *PositionMonitor) enforceTPSL(ctx context.Context, prices map[string]flo
 		side := ""
 		reason := ""
 		switch {
-		case price >= lv.TakeProfit:
+		case lv.TakeProfit <= 0 && lv.StopLoss <= 0:
+			// No protective levels were ever stored (a bracket that failed
+			// to compute leaves zeros behind). Treating zero as a trigger
+			// would market-sell the position on the very next tick, so
+			// zero levels mean "no local enforcement".
+			continue
+		case lv.TakeProfit > 0 && price >= lv.TakeProfit:
 			side, reason = "sell", "take-profit"
-		case price <= lv.StopLoss:
+		case lv.StopLoss > 0 && price <= lv.StopLoss:
 			side, reason = "sell", "stop-loss"
 		default:
 			continue
@@ -214,20 +220,26 @@ func (m *PositionMonitor) verifyEquityBrackets(ctx context.Context, track string
 		return err
 	}
 	syms := make([]string, 0, len(st.Levels))
-	for sym, lv := range st.Levels {
+	for key, lv := range st.Levels {
 		if lv.Track != track {
 			continue
 		}
 		if !lv.Crypto && lv.StopLoss > 0 {
-			syms = append(syms, sym)
+			syms = append(syms, key)
 		}
 	}
 	sort.Strings(syms)
-	for _, sym := range syms {
+	for _, key := range syms {
+		lv := st.Levels[key]
+		if lv == nil {
+			continue
+		}
+		// The map key carries the track suffix; the broker only knows
+		// the venue symbol.
+		sym := lv.Symbol
 		if protected[sym] {
 			continue
 		}
-		lv := st.Levels[sym]
 		pos, err := m.findPosition(ctx, sym)
 		if err != nil {
 			m.log().Printf("[monitor] %s: position lookup failed: %v", sym, err)

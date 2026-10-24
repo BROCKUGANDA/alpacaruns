@@ -88,6 +88,11 @@ func run(argv []string) int {
 		// directory the bot writes; never places orders. Documented
 		// in DEPLOY.md alongside alpacaruns-api.service.
 		return cmdServe(rest)
+	case "healthcheck":
+		// `healthcheck` probes a running API. It is the container
+		// health check: the API image has no shell, so the binary
+		// carries the probe.
+		return cmdHealthcheck(rest)
 	}
 
 	// LLM-backed subcommands share a common flag prefix.
@@ -137,6 +142,12 @@ func run(argv []string) int {
 		log.Printf("config: %v", err)
 		return 1
 	}
+	// Publish the loaded config to the package-level accessors used by
+	// the monitor loop (market-hours gate, POLL_SECONDS pacing) and the
+	// decision journal. Without this the monitor ran with no market-hours
+	// check, no pacing and no audit trail, because cfgFromMain was
+	// declared but never assigned.
+	cfgFromMain = cfg
 	if err := applyProviderOverride(cfg, provider); err != nil {
 		fmt.Fprintf(os.Stderr, "%s: %v\n", sub, err)
 		return 2

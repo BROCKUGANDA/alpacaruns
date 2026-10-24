@@ -52,8 +52,20 @@ func parseDefensiveFloat(s string) float64 {
 // contractsResponse wraps the list endpoint envelope.
 type contractsResponse struct {
 	Contracts []Contract `json:"option_contracts"`
-	PageToken string     `json:"page_token"`
-	Limit     int        `json:"limit"`
+	// Alpaca returns the pagination cursor as "next_page_token"; older
+	// payloads used "page_token". Both are accepted so the chain can
+	// actually be paged through instead of stopping at 100 contracts.
+	NextPageToken string `json:"next_page_token"`
+	PageToken     string `json:"page_token"`
+	Limit         int    `json:"limit"`
+}
+
+// nextToken returns whichever cursor the payload carried.
+func (r contractsResponse) nextToken() string {
+	if t := strings.TrimSpace(r.NextPageToken); t != "" {
+		return t
+	}
+	return strings.TrimSpace(r.PageToken)
 }
 
 // ContractsQuery filters the option chain lookup. Zero values are omitted.
@@ -93,9 +105,11 @@ func (q ContractsQuery) values() url.Values {
 }
 
 // GetContracts searches option contracts. When Status is empty it defaults
-// to "active"; when Limit is empty it defaults to 100; when both
-// ExpirationDate bounds are unset it caps the window at next weekend —
-// mirroring Alpaca's documented defaults so ad-hoc queries stay small.
+// to "active"; when Limit is empty it defaults to 100. The default
+// expiration window spans the next 45 days — Alpaca's own default
+// ("until the next weekend") returns an EMPTY chain for monthly-only
+// underlyings such as AAPL's third-Friday expiry, which is what the
+// options overlay needs.
 func (c *Client) GetContracts(ctx context.Context, q ContractsQuery) ([]Contract, string, error) {
 	if q.Status == "" {
 		q.Status = "active"
@@ -104,19 +118,39 @@ func (c *Client) GetContracts(ctx context.Context, q ContractsQuery) ([]Contract
 		q.Limit = 100
 	}
 	if q.ExpirationDateGTE == "" && q.ExpirationDateLTE == "" {
-		// Next Saturday from today, formatted YYYY-MM-DD.
 		now := time.Now().UTC()
-		days := (int(time.Saturday) - int(now.Weekday()) + 7) % 7
-		if days == 0 {
-			days = 7
-		}
-		q.ExpirationDateLTE = now.AddDate(0, 0, days).Format("2006-01-02")
+		q.ExpirationDateGTE = now.Format("2006-01-02")
+		q.ExpirationDateLTE = now.AddDate(0, 0, 45).Format("2006-01-02")
 	}
 	var out contractsResponse
 	if err := c.Do(ctx, http.MethodGet, c.BaseURL+"/options/contracts", q.values(), nil, &out); err != nil {
 		return nil, "", err
 	}
-	return out.Contracts, out.PageToken, nil
+	return out.Contracts, out.nextToken(), nil
+}
+
+// GetAllContracts pages through the whole chain for the given query and
+// returns every contract. Alpaca caps a page at 100 contracts, so a
+// single-page fetch silently truncates a chain to its first 100 entries.
+func (c *Client) GetAllContracts(ctx context.Context, q ContractsQuery) ([]Contract, error) {
+	if q.Limit <= 0 {
+		q.Limit = 100
+	}
+	var all []Contract
+	token := ""
+	for page := 0; page < 20; page++ {
+		q.PageToken = token
+		contracts, next, err := c.GetContracts(ctx, q)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, contracts...)
+		if next == "" || len(contracts) == 0 {
+			break
+		}
+		token = next
+	}
+	return all, nil
 }
 
 // GetContract fetches a single contract by OCC symbol or contract ID.
@@ -170,11 +204,14 @@ type snapshotsResponse struct {
 // GetSnapshots fetches option snapshots for OCC symbols via
 // GET /v1beta1/options/snapshots?symbols=... .
 func (c *Client) GetSnapshots(ctx context.Context, symbols []string) (map[string]Snapshot, error) {
+	if len(symbols) == 0 {
+		return nil, nil
+	}
 	v := url.Values{"symbols": {strings.Join(symbols, ",")}}
 	var raw struct {
 		Snapshots map[string]rawSnapshot `json:"snapshots"`
 	}
-	if err := c.Do(ctx, http.MethodGet, c.DataURL+"/v1beta1/options/snapshots", v, nil, &raw); err != nil {
+	if err := c.Do(ctx, http.MethodGet, c.OptionsDataURL()+"/snapshots", v, nil, &raw); err != nil {
 		return nil, err
 	}
 	out := make(map[string]Snapshot, len(raw.Snapshots))
@@ -185,12 +222,14 @@ func (c *Client) GetSnapshots(ctx context.Context, symbols []string) (map[string
 }
 
 // ChainSnapshots fetches every contract snapshot for one underlying via
-// GET /v1beta1/options/snapshots/{underlying}/chain, keyed by OCC symbol.
+// GET /v1beta1/options/snapshots/{underlying}, keyed by OCC symbol.
+// Alpaca has no "/chain" suffix on this path — appending one makes the
+// API reject the underlying as an invalid symbol.
 func (c *Client) ChainSnapshots(ctx context.Context, underlying string) (map[string]Snapshot, error) {
 	var raw struct {
 		Snapshots map[string]rawSnapshot `json:"snapshots"`
 	}
-	path := c.DataURL + "/v1beta1/options/snapshots/" + url.PathEscape(strings.ToUpper(strings.TrimSpace(underlying))) + "/chain"
+	path := c.OptionsDataURL() + "/snapshots/" + url.PathEscape(strings.ToUpper(strings.TrimSpace(underlying)))
 	if err := c.Do(ctx, http.MethodGet, path, nil, nil, &raw); err != nil {
 		return nil, err
 	}
@@ -273,11 +312,14 @@ func (s Snapshot) MidQuote() float64 {
 type Client struct {
 	c       *tools.Client
 	BaseURL string // trading API root, e.g. https://paper-api.alpaca.markets/v2
-	DataURL string // market data root, e.g. https://data.alpaca.markets/v1beta1
+	DataURL string // options market-data root, e.g. https://data.alpaca.markets/v1beta1/options
 }
 
 // NewClient adapts an existing tools.Client, deriving the trading and
-// market-data roots from it.
+// market-data roots from it. The options data root is version-specific
+// (/v1beta1/options) and must not inherit the equities /v2 prefix — the
+// old code produced https://data.alpaca.markets/v2/v1beta1/options/...,
+// which 404s.
 func NewClient(c *tools.Client) *Client {
 	if c == nil {
 		panic("options.NewClient: nil tools.Client")
@@ -285,12 +327,13 @@ func NewClient(c *tools.Client) *Client {
 	return &Client{
 		c:       c,
 		BaseURL: strings.TrimSuffix(c.BaseURL, "/"),
-		DataURL: strings.TrimSuffix(c.DataURL, "/"),
+		DataURL: c.OptionsDataURL(),
 	}
 }
 
-// Do forwards to tools.Client.Do — exported so this package (and tests)
-// issue typed requests through the shared transport.
+// OptionsDataURL returns the options market-data root this client talks
+// to (e.g. https://data.alpaca.markets/v1beta1/options).
+func (c *Client) OptionsDataURL() string { return c.DataURL }
 func (c *Client) Do(ctx context.Context, method, rawURL string, query url.Values, body, out any) error {
 	return c.c.Do(ctx, method, rawURL, query, body, out)
 }

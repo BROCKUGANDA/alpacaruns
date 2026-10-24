@@ -91,7 +91,7 @@ func (s *Server) authorizeControl(w http.ResponseWriter, r *http.Request) bool {
 		}
 		return true
 	}
-	if sameOrigin(r) {
+	if s.sameOrigin(r) {
 		return true
 	}
 	writeError(w, http.StatusForbidden, "forbidden", "control endpoint rejects cross-origin requests")
@@ -126,8 +126,8 @@ func (s *Server) validBearer(r *http.Request) bool {
 // sameOrigin reports whether the request's Origin (preferred) or
 // Referer names the same host the request was sent to. Host
 // comparison ignores port; scheme is irrelevant for authority.
-func sameOrigin(r *http.Request) bool {
-	host := requestHost(r)
+func (s *Server) sameOrigin(r *http.Request) bool {
+	host := s.requestHost(r)
 	if host == "" {
 		return false
 	}
@@ -157,8 +157,30 @@ func untrustedClientKey(r *http.Request) string {
 }
 
 // requestHost returns the request's host without port, lowercased by
-// EqualFold callers. Prefers X-Forwarded-Host only when the operator
-// explicitly trusts the proxy (same trust gate as X-Forwarded-For).
+// EqualFold callers. When the operator runs behind a trusted proxy
+// (--trusted-proxy / TRUSTED_PROXY=1) the proxy's X-Forwarded-Host is
+// preferred, because a proxy that rewrites Host (Caddy, nginx with a
+// different upstream name) otherwise makes the same-origin CSRF check
+// compare the public hostname against the internal one and reject every
+// control POST.
+func (s *Server) requestHost(r *http.Request) string {
+	if s.settings.TrustedProxy {
+		if fh := strings.TrimSpace(r.Header.Get("X-Forwarded-Host")); fh != "" {
+			// A forwarded host may carry a port and may be a comma list.
+			if i := strings.IndexByte(fh, ','); i > 0 {
+				fh = strings.TrimSpace(fh[:i])
+			}
+			if host, _, err := net.SplitHostPort(fh); err == nil {
+				return host
+			}
+			return fh
+		}
+	}
+	return requestHost(r)
+}
+
+// requestHost returns the request's host without port, lowercased by
+// EqualFold callers.
 func requestHost(r *http.Request) string {
 	h := r.Host
 	if h == "" {

@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/BROCKUGANDA/alpacaruns/a2a"
 	"github.com/BROCKUGANDA/alpacaruns/agents"
 	"github.com/BROCKUGANDA/alpacaruns/config"
 	"github.com/BROCKUGANDA/alpacaruns/strategy"
@@ -48,6 +49,22 @@ type Server struct {
 
 	// Coordination.
 	wg sync.WaitGroup
+
+	// cfgMu guards the live config knobs (cfg/strat) that POST
+	// /api/config mutates while other handlers read them. Without the
+	// lock a config write races every status/pnl read.
+	cfgMu sync.RWMutex
+
+	// a2aCfg is the agent-to-agent bridge configuration and bridge is
+	// the bridge itself. The bridge state lives on disk so the bot and
+	// this API process agree on the ramp position.
+	a2aCfg a2a.Config
+	bridge *a2a.Bridge
+
+	// catalogue is the broker's cached asset catalogue (guarded by
+	// cfgMu) and catalogueAt is when it was fetched.
+	catalogue   map[string]tools.Asset
+	catalogueAt time.Time
 }
 
 // ServerSettings bundles the file paths and HTTP knobs. The defaults
@@ -68,6 +85,10 @@ type ServerSettings struct {
 	// normally run an actual decision cycle; in showcase mode we keep
 	// it on so the operator can poke the engine from the UI).
 	AllowStep bool
+	// Bind is the address the server listens on (e.g. 127.0.0.1). Empty
+	// means every interface. A proxied deployment should bind loopback
+	// so the API is not reachable from outside the host.
+	Bind string
 	// AllowPause, when false, refuses /api/control/pause and
 	// /api/control/resume (production deployments may want this off).
 	AllowPause bool
@@ -135,9 +156,11 @@ func New(cfg *config.Config, client *tools.Client, set ServerSettings, strat *st
 		limiter:   NewRateLimiter(60, 60*time.Second),
 		startTime: time.Now(),
 	}
+	s.a2aCfg = a2aConfig(cfg)
+	s.bridge = a2a.NewBridge(s.a2aCfg, a2a.NewStore(set.TradeLog))
 	s.refreshPauseFlag()
 	s.httpSrv = &http.Server{
-		Addr:              ":" + strconv.Itoa(set.Port),
+		Addr:              set.Addr(),
 		Handler:           s.routes(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
@@ -153,6 +176,12 @@ func New(cfg *config.Config, client *tools.Client, set ServerSettings, strat *st
 			"Set --cors-origin to the dashboard origin in production.")
 	}
 	return s
+}
+
+// Addr returns the listen address: the bind address (when set) plus
+// the port.
+func (s ServerSettings) Addr() string {
+	return s.Bind + ":" + strconv.Itoa(s.Port)
 }
 
 // routes registers every handler behind the rate-limit + CORS
@@ -177,6 +206,12 @@ func (s *Server) routes() http.Handler {
 		mux.HandleFunc("/api/decisions", s.handleDecisions)
 		mux.HandleFunc("/api/positions", s.handlePositions)
 		mux.HandleFunc("/api/config", s.handleConfigRouter)
+	mux.HandleFunc("/api/instruments", s.handleInstruments)
+	mux.HandleFunc("/api/signals", s.handleSignals)
+	mux.HandleFunc("/api/a2a", s.handleA2AEnabled)
+	mux.HandleFunc("/api/a2a/signals", s.handleA2ASignal)
+	mux.HandleFunc("/api/a2a/agents", s.handleA2AAgents)
+	mux.HandleFunc("/api/a2a/agents/{id}/ramp", s.withControlGuard(s.handleA2ARamp))
 		mux.HandleFunc("/api/trade/simulate", s.withControlGuard(s.handleTradeSimulate))
 		mux.HandleFunc("/api/trade/execute", s.withControlGuard(s.handleTradeExecute))
 		mux.HandleFunc("/api/control/pause", s.withControlGuard(s.handleControlPause))

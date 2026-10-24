@@ -158,7 +158,14 @@ func (l *statsLedger) recordClose(symbol string, pct, pnl float64, hold time.Dur
 	if s.Symbol == "" {
 		s.Symbol = symbol
 	}
-	now := time.Now().UTC()
+	applyClose(&s, pct, pnl, hold, time.Now().UTC())
+	l.cache[symbol] = s
+}
+
+// applyClose folds one closed round-trip into a stats record. It is
+// shared by the live path (recordClose) and the journal rebuild so both
+// compute the same numbers.
+func applyClose(s *TradeStats, pct, pnl float64, hold time.Duration, now time.Time) {
 	s.TotalFills++
 	s.TotalPnL += pnl
 	s.LastTradeAt = now
@@ -187,8 +194,7 @@ func (l *statsLedger) recordClose(symbol string, pct, pnl float64, hold time.Dur
 	// (raise the bar for losers, lower it for winners). Range -0.20
 	// to +0.20. Below 30% win rate after 5+ trades -> -0.20 (block).
 	// Above 60% win rate with positive expectancy -> up to +0.15.
-	s.ConfidenceBias = computeConfidenceBias(s)
-	l.cache[symbol] = s
+	s.ConfidenceBias = computeConfidenceBias(*s)
 }
 
 // computeConfidenceBias translates the rolling record into a per-
@@ -335,21 +341,39 @@ func (l *statsLedger) refreshFromJournal(j *pnl.Journal) error {
 	if err != nil {
 		return err
 	}
-	// Reset cache for symbols that have fills in the journal; we
-	// rebuild from scratch to avoid double-counting on restarts.
+	// Rebuild from scratch so the ledger always reflects the journal
+	// exactly: every fill for a symbol is collected first, then the FIFO
+	// book is replayed ONCE per symbol and the per-symbol stats are
+	// REPLACED (not added to). The previous behaviour replayed the
+	// growing prefix per record and then added the results on top of the
+	// persisted cache, so every refresh inflated wins, losses and win
+	// rate — permanently, because the inflated numbers were saved.
 	fillsBySym := map[string][]pnl.Record{}
 	for _, r := range recs {
 		sym := r.Symbol
 		if sym == "" {
 			continue
 		}
-		fills := fillsBySym[sym]
-		fills = append(fills, r)
-		fillsBySym[sym] = fills
-		outcomes := closedRoundTrips(fills)
-		for _, o := range outcomes {
-			l.recordClose(o.Symbol, o.Pct, o.PnL, o.Hold)
+		fillsBySym[sym] = append(fillsBySym[sym], r)
+	}
+	syms := make([]string, 0, len(fillsBySym))
+	for sym := range fillsBySym {
+		syms = append(syms, sym)
+	}
+	sort.Strings(syms)
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, sym := range syms {
+		outcomes := closedRoundTrips(fillsBySym[sym])
+		if len(outcomes) == 0 {
+			continue
 		}
+		s := TradeStats{Symbol: sym}
+		for _, o := range outcomes {
+			applyClose(&s, o.Pct, o.PnL, o.Hold, o.Closed)
+		}
+		l.cache[sym] = s
 	}
 	return nil
 }

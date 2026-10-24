@@ -26,6 +26,8 @@ import (
 	"github.com/BROCKUGANDA/alpacaruns/config"
 	"github.com/BROCKUGANDA/alpacaruns/factors"
 	"github.com/BROCKUGANDA/alpacaruns/options"
+	"github.com/BROCKUGANDA/alpacaruns/a2a"
+	"github.com/BROCKUGANDA/alpacaruns/picker"
 	"github.com/BROCKUGANDA/alpacaruns/pnl"
 	"github.com/BROCKUGANDA/alpacaruns/strategy"
 	"github.com/BROCKUGANDA/alpacaruns/strategy/ensemble"
@@ -73,6 +75,60 @@ type autoLoop struct {
 	// size — exactly how a small account trips the API rate limit and
 	// starves the price/bar fetches that matter.
 	posCache []tools.Position
+	// bridge is the agent-to-agent bridge: inbound signals from peer
+	// agents, evaluated by the deterministic risk gate. nil when the
+	// bridge is disabled.
+	bridge *a2a.Bridge
+	// registry is the classified universe (equities, ETFs, index
+	// trackers, crypto) built by the universal signal picker. It is
+	// refreshed on a timer because the broker asset catalogue is a
+	// large, rarely-changing payload.
+	registry *picker.Registry
+	// registryAt is when the registry was last refreshed.
+	registryAt time.Time
+}
+
+// registryTTL is how long the classified universe is reused before it
+// is rebuilt from the broker's asset catalogue.
+const registryTTL = time.Hour
+
+// universe returns the symbols the auto loop scores this tick. It
+// covers every configured class: equities, ETFs, index trackers and
+// crypto. Options are handled by the overlay (an option has no series
+// of its own — its signal is the underlying's).
+func (l *autoLoop) universe(ctx context.Context) []string {
+	reg, err := l.refreshRegistry(ctx)
+	if err != nil || reg == nil {
+		// Fall back to the flat configured lists so a catalogue outage
+		// never stops the bot from trading what it always traded.
+		out := append([]string{}, l.set.EquitySymbols...)
+		out = append(out, l.set.ETFSymbols...)
+		out = append(out, l.set.IndexSymbols...)
+		out = append(out, l.set.CryptoSymbols...)
+		return out
+	}
+	return reg.Symbols()
+}
+
+// refreshRegistry returns the classified universe, rebuilding it when
+// it is missing or stale.
+func (l *autoLoop) refreshRegistry(ctx context.Context) (*picker.Registry, error) {
+	if l.registry != nil && time.Since(l.registryAt) < registryTTL {
+		return l.registry, nil
+	}
+	spec := picker.Spec{
+		Equities:   l.set.EquitySymbols,
+		ETFs:       l.set.ETFSymbols,
+		Indices:    l.set.IndexSymbols,
+		Crypto:     l.set.CryptoSymbols,
+	}
+	reg, err := picker.Build(ctx, l.client, spec)
+	if err != nil {
+		return nil, err
+	}
+	l.registry = reg
+	l.registryAt = time.Now()
+	return reg, nil
 }
 
 // autoFlags holds the parsed `auto` subcommand flags.
@@ -238,6 +294,7 @@ func buildAutoLoop(ctx context.Context, cfg *config.Config, set strategy.Setting
 	exec := &strategy.Executor{
 		Client: client, Validator: val, Kill: kill, State: state, Journal: j,
 	}
+
 	var planner *strategy.OptionPlanner
 	if set.OptionsEnabled {
 		planner, err = strategy.NewOptionPlanner(options.NewClient(client), set,
@@ -258,6 +315,24 @@ func buildAutoLoop(ctx context.Context, cfg *config.Config, set strategy.Setting
 		monitor: monitor, optPlanner: planner, journal: j, client: client,
 		dryRun:        dryRun,
 		pauseFlagPath: defaultPauseFlagPath(cfg.TradeLog),
+	}
+
+	// Agent-to-agent bridge: enabled only when A2A_ENABLED=true and a
+	// token is configured. The bridge state lives next to the trade log
+	// so the dashboard API and the bot agree on the ramp position.
+	if cfg.A2AEnabled {
+		bridge := a2a.NewBridge(a2a.Config{
+			Enabled:           cfg.A2AEnabled,
+			Token:             cfg.A2AToken,
+			Agents:            cfg.A2AAgents,
+			DefaultMode:       a2a.Mode(cfg.A2AMode),
+			ShadowPasses:      cfg.A2AShadowPasses,
+			MaxNotional:       cfg.A2AMaxNotional,
+			MaxSignalsPerHour: 60,
+		}, a2a.NewStore(j.Path()))
+		loop.bridge = bridge
+		log.Printf("[a2a] bridge enabled: agents=%v mode=%s shadow_passes=%d max_notional=%.2f",
+			cfg.A2AAgents, cfg.A2AMode, cfg.A2AShadowPasses, cfg.A2AMaxNotional)
 	}
 
 	// Per-symbol win/loss ledger. Load existing data; rebuild from the
@@ -378,24 +453,26 @@ func (l *autoLoop) tick(ctx context.Context) error {
 	// New tick, new world: drop the previous tick's /positions snapshot
 	// so the per-symbol cap sees fills placed since.
 	l.posCache = nil
-	// Pause flag check FIRST (before any Alpaca call). When the operator
-	// toggles "Pause new trades" in the dashboard (POST /api/control/pause),
-	// data/paused is written with content "true". The bot reads the file
-	// here, logs once per engagement change, and skips entry planning.
-	// The monitor loop (positions, drawdown halts, TP/SL exits, EOD
-	// flatten, profit targets) keeps running — pause only blocks NEW
-	// entries. The file is allowed to be missing or non-"true"; that
-	// means running.
-	if pauseFlagEngaged(l.pauseFlagPath) {
+	// Pause flag: when the operator toggles "Pause new trades" in the
+	// dashboard (POST /api/control/pause), data/paused is written with
+	// content "true". The bot reads the file here and logs once per
+	// engagement change. Pause blocks NEW ENTRIES only — the monitor
+	// pass (positions, drawdown halts, TP/SL exits, EOD flatten, profit
+	// targets) still runs, so a paused bot keeps protecting open
+	// positions. The file may be missing or non-"true"; that means
+	// running.
+	paused := pauseFlagEngaged(l.pauseFlagPath)
+	if paused {
 		if !l.pausedLogged {
 			log.Printf("[control] paused: data/paused=true; new entries skipped, monitor loop alive")
 			l.pausedLogged = true
 		}
-		return nil
-	}
-	if l.pausedLogged {
+	} else if l.pausedLogged {
 		log.Printf("[control] resumed: data/paused cleared; entries re-enabled")
 		l.pausedLogged = false
+	}
+	if l.client == nil {
+		return fmt.Errorf("auto: no broker client configured")
 	}
 	acct, err := l.client.GetAccount(ctx)
 	if err != nil {
@@ -451,7 +528,12 @@ func (l *autoLoop) tick(ctx context.Context) error {
 		if q == 0 {
 			continue
 		}
-		held[p.Symbol] = true
+		// The broker reports crypto in trading form ("BTCUSD") while the
+		// strategy universe uses "BTC/USD". Keying the held-map on the
+		// broker form meant a crypto position never looked held, so the
+		// engine re-bought it every tick and the per-symbol cap never
+		// fired. Canonicalise both sides before comparing.
+		held[strategy.CanonicalSymbol(p.Symbol)] = true
 		posSymbols = append(posSymbols, p.Symbol)
 	}
 
@@ -492,7 +574,7 @@ func (l *autoLoop) tick(ctx context.Context) error {
 		l.takeProfits(ctx, l.set.ProfitTargetPct)
 	}
 
-	universe := append(append([]string{}, l.set.EquitySymbols...), l.set.CryptoSymbols...)
+	universe := l.universe(ctx)
 
 	// Freeze the tick's positions view for all per-symbol cap checks in
 	// this pass (handleBuy -> positionUsd reads it without re-fetching).
@@ -513,14 +595,25 @@ func (l *autoLoop) tick(ctx context.Context) error {
 	// the swing path entirely when ensemble was on, leaving the deterministic
 	// engine dormant for the entire 5-min tick.
 	if l.ensemble != nil {
-		if err := l.tickEnsemble(ctx, universe, held, pfv); err != nil {
+		if paused {
+			log.Printf("[ensemble] tick skipped: paused")
+		} else if err := l.tickEnsemble(ctx, universe, held, pfv); err != nil {
 			log.Printf("[ensemble] tick error: %v", err)
 		}
 	}
 
+	// Inbound signals from peer agents are evaluated through the same
+	// risk gate as the bot's own decisions. The ramp decides whether
+	// they are executed, only shadowed, or refused.
+	l.processA2A(ctx, pfv)
+
 	decisions := l.engine.RunTick(ctx, universe, held)
 	conf := 1.0 // deterministic engine: confidence IS the factor gate
 	for _, dec := range decisions {
+		if paused && dec.Signal == strategy.SignalBuy {
+			log.Printf("[auto] %s BUY skipped: paused", dec.Symbol)
+			continue
+		}
 		switch dec.Signal {
 		case strategy.SignalBuy:
 			l.handleBuy(ctx, dec, pfv, conf)
@@ -703,7 +796,7 @@ func (l *autoLoop) positionUsd(ctx context.Context, symbol string) float64 {
 		return 0
 	}
 	for _, p := range pos {
-		if p.Symbol != symbol {
+		if !tools.SameSymbol(p.Symbol, symbol) {
 			continue
 		}
 		q, _ := strconv.ParseFloat(p.Qty, 64)
@@ -726,7 +819,7 @@ func (l *autoLoop) closePosition(ctx context.Context, symbol, reason string) {
 	}
 	var found *tools.Position
 	for i := range pos {
-		if pos[i].Symbol == symbol {
+		if tools.SameSymbol(pos[i].Symbol, symbol) {
 			found = &pos[i]
 			break
 		}
@@ -807,7 +900,7 @@ func (l *autoLoop) rebalanceAfterClose(ctx context.Context, pfv float64) {
 	if l.ensemble == nil {
 		return // swing-only mode: nothing to rebalance against
 	}
-	universe := append(append([]string{}, l.set.EquitySymbols...), l.set.CryptoSymbols...)
+	universe := l.universe(ctx)
 	pos, err := l.client.GetPositions(ctx)
 	if err != nil {
 		return
@@ -978,6 +1071,30 @@ func formatVotes(votes []ensemble.VoiceVote) string {
 	return strings.Join(parts, ", ")
 }
 func (l *autoLoop) handleBuy(ctx context.Context, dec strategy.Decision, pfv, conf float64) {
+	// Market state decides the ENTRY MODE: with PRE_ORDERS enabled an
+	// equity entry while the market is closed is queued as a resting
+	// limit/GTC bracket at the last close; otherwise a closed market
+	// means no entry at all. Crypto trades 24/7, so the equity clock
+	// does not gate it.
+	if !strategy.IsCrypto(dec.Symbol) {
+		open := l.equityMarketOpen(ctx)
+		if !open {
+			if l.cfg.PreOrders {
+				l.preOrder(ctx, dec, pfv, conf)
+				return
+			}
+			log.Printf("[auto] %s BUY skipped: market closed", dec.Symbol)
+			return
+		}
+	}
+	// Execution window: entries fire ONLY inside the configured window
+	// for the asset class (equities/options -> TRADING_WINDOWS, crypto ->
+	// CRYPTO_WINDOWS). The risk gate only knows "market open", so
+	// without this check the bot traded at any hour the market was open.
+	if l.windows != nil && !l.windows.CanTrade(dec.Symbol) {
+		log.Printf("[auto] %s BUY skipped: outside trading window", dec.Symbol)
+		return
+	}
 	// Per-symbol adaptive confidence: chronic losers need higher
 	// confidence to clear the risk gate, proven winners get a
 	// discount. The bias is set by the stats ledger; this just adds it
@@ -1052,6 +1169,19 @@ func (l *autoLoop) handleBuy(ctx context.Context, dec strategy.Decision, pfv, co
 	if err := l.exec.ExecuteEntry(ctx, plan, conf); err != nil {
 		log.Printf("[auto] %s entry rejected/failed: %v", plan.Symbol, err)
 	}
+}
+
+// equityMarketOpen reports whether the US equity market is currently
+// open, using Alpaca's clock. A clock failure is treated as CLOSED for
+// entry purposes: the risk gate still enforces its own market-hours
+// check, and failing closed here cannot open a position by accident.
+func (l *autoLoop) equityMarketOpen(ctx context.Context) bool {
+	cl, err := l.client.GetClock(ctx)
+	if err != nil || cl == nil {
+		log.Printf("[auto] clock check failed (%v); treating market as closed", err)
+		return false
+	}
+	return cl.IsOpen
 }
 
 // preOrder queues one off-hours equity entry: reference-priced plan,
@@ -1150,7 +1280,7 @@ func positionQtyFor(ctx context.Context, c *tools.Client, symbol string) (float6
 		return 0, err
 	}
 	for _, p := range ps {
-		if p.Symbol == symbol {
+		if tools.SameSymbol(p.Symbol, symbol) {
 			return strconv.ParseFloat(p.Qty, 64)
 		}
 	}

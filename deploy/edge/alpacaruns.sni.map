@@ -1,0 +1,19 @@
+# ALPACARUNS — the names this product answers for on TLS.
+#
+# One entry per line:  <hostname>  <address:port>;
+#
+# The front door is an L4 SNI router: it reads the SNI out of the ClientHello
+# and forwards the connection to the address this table names. It terminates
+# no TLS, parses no HTTP and holds no certificate, so this table is the ONLY
+# thing this product shares with the other products on this box.
+#
+# The address is where this project's edge publishes 443 on the HOST's
+# loopback (the "ports:" in deploy/edge/compose.yaml). The two must agree.
+#
+# Format note: nginx's map reads each entry as "name value;", so the value
+# is written as address:port with no scheme and no path — and the trailing
+# semicolon is REQUIRED. It is not a nicety: "nginx -t" refuses the whole
+# configuration without it, and the front door is what every public name on
+# this box depends on. A missing semicolon is a total outage of every name,
+# not just this one.
+run.57.130.80.158.sslip.io 127.0.0.1:8446;

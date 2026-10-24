@@ -1,0 +1,75 @@
+# ---------------------------------------------------------------------------
+# ALPACARUNS — this project's own edge.
+#
+# Run as its own compose project (`deploy/edge/compose.yaml`), publishing
+# on the host's LOOPBACK only. The shared front door (an L4 SNI router)
+# forwards this product's names here; this file terminates TLS and
+# proxies to the Alpacaruns API container.
+#
+# Why the edge is this project's own (the same reasoning the astrolabe
+# edge carries):
+#
+#   · BLAST RADIUS. One edge, one process, one config file, one product.
+#   · TRUST BOUNDARY. A shared edge can reach another project's
+#     containers by name; this edge reaches only this project's.
+#   · THIS FILE IS REVIEWED. The hostname list here and the front door's
+#     edge.d/*.sni.map are supposed to agree; nothing about this site's
+#     routing lives in an untracked file on someone else's box.
+#
+# The certificate is issued by this Caddy over HTTP-01, served on this
+# edge's own :80. The front door forwards the plaintext request for this
+# hostname to this edge (edge.d/<product>.host.map); it does not answer
+# the challenge and holds no certificate.
+# ---------------------------------------------------------------------------
+
+{
+	# ACME contact address for expiry notices.
+	email {$ACME_EMAIL:admin@example.com}
+	# The admin API stays internal to the container; never exposed. It
+	# also means there is no reload endpoint, so a change to this file
+	# needs a container recreate — not a reload.
+	admin off
+}
+
+# ---- snippets: define before use ------------------------------------------------
+
+# The security headers the shared edge applied to this site. They are
+# repeated here rather than shared, because a snippet is global only
+# within one Caddy process: each edge carries its own copy, and each
+# copy is reviewed with the product it belongs to.
+(secure_defaults) {
+	header {
+		Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		# This process is a reverse proxy, never a browser-reachable document.
+		-Server
+	}
+	encode zstd gzip
+}
+
+# The name this edge serves. It must be the only name in
+# nginx/edge.d/alpacaruns.sni.map — the front door's table and this file
+# are the contract, and a name in one but not the other is a 404 or a
+# TLS failure.
+run.57.130.80.158.sslip.io {
+	import secure_defaults
+
+	reverse_proxy api:8090 {
+		# The client address, and NOT whatever the caller sent. The
+		# application reads the RIGHT-most X-Forwarded-For entry as the
+		# client, so a caller that prepends an entry gets a fresh
+		# rate-limit bucket per request — which is the exact bypass the
+		# limiter exists to prevent.
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Real-IP {remote_host}
+		header_up X-Forwarded-Proto {scheme}
+		header_up X-Forwarded-Host {host}
+	}
+
+	log {
+		# Trade and account data must not end up in an access log.
+		output discard
+	}
+}

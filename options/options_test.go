@@ -200,9 +200,12 @@ func TestSnapshotMidQuoteFallbacks(t *testing.T) {
 }
 
 // TestChainSnapshotsPath checks the per-underlying chain endpoint path.
+// Alpaca serves the chain at /v1beta1/options/snapshots/{underlying} —
+// there is no "/chain" suffix; appending one makes the API reject the
+// underlying as an invalid symbol.
 func TestChainSnapshotsPath(t *testing.T) {
 	c, _ := newOptionsTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1beta1/options/snapshots/AAPL/chain" {
+		if r.URL.Path != "/v1beta1/options/snapshots/AAPL" {
 			t.Fatalf("path = %s", r.URL.Path)
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"snapshots": map[string]any{}})

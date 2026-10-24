@@ -14,6 +14,7 @@ const NAV = [
   { href: "/live", label: "Live" },
   { href: "/trades", label: "Trades" },
   { href: "/brain", label: "Brain" },
+  { href: "/picker", label: "Picker" },
   { href: "/controls", label: "Controls" },
 ];
 

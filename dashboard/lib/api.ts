@@ -292,9 +292,13 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
       if (!headers.has(k)) headers.set(k, v);
     });
   }
-  // Only control endpoints need auth; read endpoints stay anonymous
-  // so the dashboard renders without any setup.
-  if (path.startsWith("/api/control/") && (init?.method || "GET") !== "GET") {
+  // Every state-changing endpoint needs auth, not just /api/control/*:
+  // POST /api/config, POST /api/trade/simulate and POST /api/trade/execute
+  // are guarded by the same bearer check, so a deployment with
+  // DASHBOARD_TOKEN set rejected every config save and every manual
+  // order with 401/403. Read endpoints stay anonymous so the dashboard
+  // renders without any setup.
+  if ((init?.method || "GET") !== "GET") {
     const token = typeof window !== "undefined" ? getDashboardToken() : null;
     if (token && !headers.has("Authorization")) {
       headers.set("Authorization", `Bearer ${token}`);
@@ -330,3 +334,66 @@ export class ApiError extends Error {
 // Convenience fetcher for the most common endpoints. SWR's
 // `fetcher` prop accepts any (url) => Promise<T> function.
 export const swrFetcher = <T>(path: string) => apiFetch<T>(path);
+// ---- Universal signal picker ----
+
+export type AssetClass = "equity" | "etf" | "index" | "option" | "crypto";
+
+export type Instrument = {
+  symbol: string;
+  class: AssetClass;
+  family: string;
+  exchange?: string;
+  name?: string;
+  tradable: boolean;
+  fractional: boolean;
+  shortable: boolean;
+  window: string;
+  underlying?: string;
+  expiration?: string;
+  strike?: number;
+  option_type?: string;
+  delta?: number;
+  implied_vol?: number;
+  premium?: number;
+  source: string;
+};
+
+export type InstrumentsResponse = {
+  instruments: Instrument[];
+  classes: Record<string, number>;
+};
+
+export type SignalCandidate = {
+  instrument: Instrument;
+  composite: number;
+  factors?: Record<string, number>;
+  rationales?: Record<string, string>;
+  price: number;
+  signal: "buy" | "hold" | "sell";
+  reason: string;
+  error?: string;
+};
+
+export type SignalsResponse = {
+  signals: SignalCandidate[];
+  scanned: number;
+  scored: number;
+};
+
+// ---- Agent-to-agent bridge ----
+
+export type A2AAgentState = {
+  agent: string;
+  mode: "off" | "shadow" | "on";
+  shadow_passes: number;
+  shadow_fails: number;
+  accepted: number;
+  refused: number;
+  traded: number;
+  last_signal_at?: string;
+  last_reason?: string;
+};
+
+export type A2AAgentsResponse = { agents: A2AAgentState[] };
+
+export type A2AEnabledResponse = { enabled: boolean };

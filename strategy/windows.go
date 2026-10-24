@@ -95,9 +95,11 @@ type TradingWindows struct {
 	now func() time.Time
 }
 
-// NewTradingWindows parses both env specs. loc should be *time.Location
-// with a FIXED UTC offset so wall-clock comparisons never drift with DST;
-// production passes fixedET(). now defaults to time.Now.
+// NewTradingWindows parses both env specs. loc should be a location with
+// a FIXED UTC offset so wall-clock comparisons never drift with DST;
+// production passes fixedET(). When loc is nil the US/Eastern zone is
+// used — the windows are documented as US/Eastern times, so falling
+// back to UTC silently shifted every window by 4-5 hours.
 func NewTradingWindows(equitySpec, cryptoSpec string, loc *time.Location, now func() time.Time) (*TradingWindows, error) {
 	eq, err := ParseWindows(equitySpec)
 	if err != nil {
@@ -108,7 +110,7 @@ func NewTradingWindows(equitySpec, cryptoSpec string, loc *time.Location, now fu
 		return nil, fmt.Errorf("CRYPTO_WINDOWS: %w", err)
 	}
 	if loc == nil {
-		loc = time.UTC
+		loc = fixedET()
 	}
 	if now == nil {
 		now = time.Now

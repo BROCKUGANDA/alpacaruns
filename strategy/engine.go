@@ -203,7 +203,7 @@ func (e *Engine) RunTick(ctx context.Context, universe []string, held map[string
 			e.log.Printf("[strategy] %s: scoring unavailable: %v", sym, err)
 			continue
 		}
-		out = append(out, Decide(sym, held[sym], fs.Composite, fs.Trend, fs.Momentum, e.threshold))
+		out = append(out, Decide(sym, held[CanonicalSymbol(sym)], fs.Composite, fs.Trend, fs.Momentum, e.threshold))
 	}
 	return out
 }
