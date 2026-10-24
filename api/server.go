@@ -208,6 +208,8 @@ func (s *Server) routes() http.Handler {
 		mux.HandleFunc("/api/config", s.handleConfigRouter)
 	mux.HandleFunc("/api/instruments", s.handleInstruments)
 	mux.HandleFunc("/api/signals", s.handleSignals)
+	mux.HandleFunc("/api/learning", s.handleLearning)
+	mux.HandleFunc("/api/selfheal", s.handleSelfHeal)
 	mux.HandleFunc("/api/a2a", s.handleA2AEnabled)
 	mux.HandleFunc("/api/a2a/signals", s.handleA2ASignal)
 	mux.HandleFunc("/api/a2a/agents", s.handleA2AAgents)

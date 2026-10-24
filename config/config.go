@@ -79,6 +79,28 @@ type Config struct {
 	A2AMode         string   // default ramp position: off | shadow | on
 	A2AMaxNotional  float64  // per-signal USD cap
 	A2AShadowPasses int      // shadow evaluations needed before ramp-on
+
+	// Learning: the bot recalibrates its own entry bar, sizing and stops
+	// from realized results once enough trades have closed. Every bound
+	// moves only in the risk-reducing direction (see the learning
+	// package), and the whole feature is off unless LEARN_ENABLED=true.
+	LearnEnabled          bool
+	LearnMinTrades        int     // closed trades needed before first calibration
+	LearnEveryTrades      int     // recalibrate every N further closed trades
+	LearnMinSizeMult      float64 // floor on how far learning may shrink sizing
+	LearnMaxTightenMult   float64 // floor on how far learning may tighten stops
+	LearnQuarantineWinPct float64 // win rate below which a symbol is quarantined
+	LearnQuarantineTrades int     // trades a symbol needs before quarantine applies
+	LearnMinPerClass      int     // samples a class needs before it gets an adjustment
+	LearnScoreBuckets     int     // entry-score buckets used for the expectancy curve
+
+	// Self-heal: detect and repair degraded state (orphaned protective
+	// orders, duplicate brackets, stale resting entries, corrupt state).
+	SelfHealEnabled     bool
+	SelfHealReportOnly  bool // find and journal, but never act
+	SelfHealLiftHalt    bool // opt-in: allow an engaged halt to be lifted
+	SelfHealOrphanHours int  // age after which an orphan order is cancelled
+	SelfHealEveryTicks  int  // run the pass every N ticks
 }
 
 // Load reads config from the environment, applying defaults.
@@ -189,6 +211,104 @@ func Load(envFile string) (*Config, error) {
 	if c.LLMProvider == ProviderOxlo && strings.TrimSpace(c.LLMModel) == "" {
 		c.LLMModel = DefaultOxloModel
 	}
+	// Learning configuration. Off by default: an autonomous parameter
+	// change should be a deliberate act, and the engine needs a real
+	// trade history before any estimate is worth applying.
+	if le, err := getBool("LEARN_ENABLED", false); err != nil {
+		return nil, err
+	} else {
+		c.LearnEnabled = le
+	}
+	if n, err := getInt("LEARN_MIN_TRADES", 12); err != nil {
+		return nil, err
+	} else if n < 2 {
+		return nil, fmt.Errorf("LEARN_MIN_TRADES must be >= 2, got %d", n)
+	} else {
+		c.LearnMinTrades = n
+	}
+	if n, err := getInt("LEARN_EVERY_TRADES", 5); err != nil {
+		return nil, err
+	} else if n < 1 {
+		return nil, fmt.Errorf("LEARN_EVERY_TRADES must be >= 1, got %d", n)
+	} else {
+		c.LearnEveryTrades = n
+	}
+	if f, err := getFloat("LEARN_MIN_SIZE_MULTIPLIER", 0.25); err != nil {
+		return nil, err
+	} else if f <= 0 || f > 1 {
+		return nil, fmt.Errorf("LEARN_MIN_SIZE_MULTIPLIER must be in (0,1], got %g", f)
+	} else {
+		c.LearnMinSizeMult = f
+	}
+	if f, err := getFloat("LEARN_MAX_TIGHTEN_FACTOR", 0.75); err != nil {
+		return nil, err
+	} else if f <= 0 || f > 1 {
+		return nil, fmt.Errorf("LEARN_MAX_TIGHTEN_FACTOR must be in (0,1], got %g", f)
+	} else {
+		c.LearnMaxTightenMult = f
+	}
+	if f, err := getFloat("LEARN_QUARANTINE_WIN_RATE", 0.25); err != nil {
+		return nil, err
+	} else if f < 0 || f > 1 {
+		return nil, fmt.Errorf("LEARN_QUARANTINE_WIN_RATE must be in [0,1], got %g", f)
+	} else {
+		c.LearnQuarantineWinPct = f
+	}
+	if n, err := getInt("LEARN_QUARANTINE_TRADES", 6); err != nil {
+		return nil, err
+	} else if n < 2 {
+		return nil, fmt.Errorf("LEARN_QUARANTINE_TRADES must be >= 2, got %d", n)
+	} else {
+		c.LearnQuarantineTrades = n
+	}
+	if n, err := getInt("LEARN_MIN_SAMPLES_PER_CLASS", 8); err != nil {
+		return nil, err
+	} else if n < 2 {
+		return nil, fmt.Errorf("LEARN_MIN_SAMPLES_PER_CLASS must be >= 2, got %d", n)
+	} else {
+		c.LearnMinPerClass = n
+	}
+	if n, err := getInt("LEARN_SCORE_BUCKETS", 5); err != nil {
+		return nil, err
+	} else if n < 2 {
+		return nil, fmt.Errorf("LEARN_SCORE_BUCKETS must be >= 2, got %d", n)
+	} else {
+		c.LearnScoreBuckets = n
+	}
+
+	// Self-heal configuration. On by default: leaving an orphaned
+	// protective order resting against a position that no longer exists
+	// is a short sale waiting to happen, and that should fix itself.
+	if sh, err := getBool("SELFHEAL_ENABLED", true); err != nil {
+		return nil, err
+	} else {
+		c.SelfHealEnabled = sh
+	}
+	if ro, err := getBool("SELFHEAL_REPORT_ONLY", false); err != nil {
+		return nil, err
+	} else {
+		c.SelfHealReportOnly = ro
+	}
+	if lh, err := getBool("SELFHEAL_LIFT_HALT", false); err != nil {
+		return nil, err
+	} else {
+		c.SelfHealLiftHalt = lh
+	}
+	if n, err := getInt("SELFHEAL_ORPHAN_MAX_AGE_HOURS", 24); err != nil {
+		return nil, err
+	} else if n < 0 {
+		return nil, fmt.Errorf("SELFHEAL_ORPHAN_MAX_AGE_HOURS must be >= 0, got %d", n)
+	} else {
+		c.SelfHealOrphanHours = n
+	}
+	if n, err := getInt("SELFHEAL_EVERY_TICKS", 6); err != nil {
+		return nil, err
+	} else if n < 1 {
+		return nil, fmt.Errorf("SELFHEAL_EVERY_TICKS must be >= 1, got %d", n)
+	} else {
+		c.SelfHealEveryTicks = n
+	}
+
 	// Agent-to-agent bridge configuration. Off by default: an open
 	// signal ingress is an attack surface, so it has to be enabled
 	// deliberately and needs a token.

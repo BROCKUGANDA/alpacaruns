@@ -22,17 +22,18 @@ refuses to start a live session without that acknowledgement.
 3. [The universal signal picker](#3-the-universal-signal-picker)
 4. [Position-aware TP/SL](#4-position-aware-tpsl)
 5. [The agent-to-agent bridge](#5-the-agent-to-agent-bridge)
-6. [Safety rails](#6-safety-rails)
-7. [Configuration](#7-configuration)
-8. [CLI](#8-cli)
-9. [HTTP API](#9-http-api)
-10. [Dashboard](#10-dashboard)
-11. [Data flow and state files](#11-data-flow-and-state-files)
-12. [Deployment](#12-deployment)
-13. [Tests and gates](#13-tests-and-gates)
-14. [What was fixed in this pass](#14-what-was-fixed-in-this-pass)
-15. [Layout](#15-layout)
-
+6. [Learning from its own trades](#6-learning-from-its-own-trades)
+7. [Self-heal](#7-self-heal)
+8. [Safety rails](#8-safety-rails)
+9. [Configuration](#9-configuration)
+10. [CLI](#10-cli)
+11. [HTTP API](#11-http-api)
+12. [Dashboard](#12-dashboard)
+13. [Data flow and state files](#13-data-flow-and-state-files)
+14. [Deployment](#14-deployment)
+15. [Tests and gates](#15-tests-and-gates)
+16. [What was fixed in this pass](#16-what-was-fixed-in-this-pass)
+17. [Layout](#17-layout)
 ---
 
 ## 1. What this is
@@ -112,6 +113,8 @@ Two optional layers sit on top:
 | `cmd/alpacaruns` | CLI: `auto`, `serve`, `cycle`, `monitor`, `query`, `trade`, `chain`, `factors`, `pl` |
 | `picker/` | The universal signal picker: instrument registry, class-aware data ingestion, ranked candidates |
 | `a2a/` | The agent-to-agent bridge: signal ingress, ramp state machine, persisted state |
+| `learning/` | The learner: bounded score-floor, sizing, stop and quarantine adjustments computed from closed trades |
+| `selfheal/` | Degraded-state detection and repair: orphaned and duplicate protective orders, stale resting entries, unreadable state, stuck halts |
 | `agents/` | LLM agent graph (ADK) + the Alpaca MCP tool surface with the risk guard |
 | `risk/` | The deterministic pre-trade validator |
 | `strategy/` | The deterministic engine: scoring, decisions, brackets, execution, monitoring, TP/SL state |
@@ -348,7 +351,166 @@ Every evaluation — approved, rejected or refused — is journaled to
 
 ---
 
-## 6. Safety rails
+## 6. Learning from its own trades
+
+A factor score is a hypothesis. Until a trade closes, nobody knows
+whether a composite of 0.62 meant anything — and the same 0.62 can be a
+good entry in one asset class and a consistent loser in another. Only
+realised outcomes can say which.
+
+So the bot measures its own results and adjusts. `learning/` computes,
+and `cmd/alpacaruns/learning.go` applies, four things:
+
+| Knob | What it may do | What it may never do |
+|---|---|---|
+| Entry score floor | RAISE it above `FACTOR_MIN_SCORE` when low scores demonstrably lose | Lower the operator's bar |
+| Position size | SHRINK a class's size toward `LEARN_MIN_SIZE_MULTIPLIER` | Grow any position |
+| Stop distance | TIGHTEN a class's stop toward `LEARN_MAX_TIGHTEN_FACTOR` | Widen a stop |
+| Symbol set | QUARANTINE a symbol whose win rate stays under the bar | Unblock a risk gate |
+
+**The learner is a brake, not an accelerator.** Every knob it can touch
+moves in the direction that reduces risk or increases selectivity. A
+mis-calibrated estimate, a regime change, or a run of bad luck can make
+the bot trade less; none of them can make it trade bigger, take looser
+entries, or hold a wider stop than the operator authorised. That property
+is enforced in three places, not just asserted: `Config.Validate()`
+rejects a bound above 1.0 at startup (`learning may only shrink, never
+grow`), `Adjustments.SizeMultiplierFor` and `StopMultiplierFor` re-clamp
+on every read, and `Store.Load` re-clamps again after deserialising — so
+a hand-edited `data/learning-state.json` cannot scale a position up.
+
+### How it gets its evidence
+
+Each fill is journalled with the composite the bot acted on
+(`EntryPlan.Score` → `pnl.Record.Confidence`), so a closed round-trip
+carries both the decision and its result. The stats ledger keeps a
+bounded window of those trades (`data/strategy-stats.json`, 600 samples)
+and the engine splits them into equal-width score buckets and per-class
+groups.
+
+Two honesty rules follow from that:
+
+- **Unscored trades are excluded from calibration.** A fill the bot did
+  not make — placed by hand, or backfilled by order id — has no score.
+  Filing it at 0.00 would invent evidence that low scores lose, and the
+  learner would raise its own floor to escape a number it fabricated.
+- **A self-reported 1.00 confidence is not a score either.** Proposals
+  that claim perfect confidence are recorded as unattributed.
+
+### When it speaks
+
+Not on a timer. Nothing changes until `LEARN_MIN_TRADES` round-trips
+exist, and after that it recomputes every `LEARN_EVERY_TRADES` new closed
+trades. A single recomputation may not raise the floor by more than 0.15
+— silently stopping all trading is indistinguishable from a bug, so the
+move is bounded and the note says why.
+
+The engine runs whether or not `LEARN_ENABLED` is true: with it off, the
+samples accumulate and the snapshot records what the learner *would*
+conclude, so turning it on is a decision made against data.
+
+### Where it is applied
+
+Every entry path, and only in the risk-reducing direction: `handleBuy`
+(swing), `preOrder` (off-hours queue), `intraEntry` (intraday book) and
+`evaluateA2A` (peer-agent signals — an agent cannot ask for more than the
+learner allows for that class). A shrink that would erase the position
+refuses the trade instead of sending a zero-unit order to the broker.
+
+### The per-symbol ledger's one-way bias
+
+`strategy-stats.json` also computes a confidence bias per symbol. Only
+the penalty side is applied: a chronic loser has its signal confidence
+reduced, so the unchanged risk floor rejects it. A winner's bonus would
+push a fresh signal over a bar it did not clear, so the positive branch is
+computed for reporting and deliberately never applied.
+
+### Configuration
+
+| Key | Default | Meaning |
+|---|---|---|
+| `LEARN_ENABLED` | `false` | Apply the conclusions (evidence is recorded either way) |
+| `LEARN_MIN_TRADES` | `12` | Closed round-trips before the first adjustment |
+| `LEARN_EVERY_TRADES` | `5` | Recalibrate after N more closed trades |
+| `LEARN_MIN_SIZE_MULTIPLIER` | `0.25` | Floor on how far sizing may shrink |
+| `LEARN_MAX_TIGHTEN_FACTOR` | `0.75` | Floor on how far a stop may tighten |
+| `LEARN_QUARANTINE_WIN_RATE` | `0.25` | Win rate at or below which a symbol is blocked |
+| `LEARN_QUARANTINE_TRADES` | `6` | Trades a symbol needs before quarantine applies |
+| `LEARN_MIN_SAMPLES_PER_CLASS` | `8` | Samples a class needs before size or stop moves |
+| `LEARN_SCORE_BUCKETS` | `5` | Bucket count in the calibration table |
+
+Read it at `GET /api/learning` or on the dashboard's **Learning** page,
+which shows the buckets, the per-class multipliers, the quarantined
+symbols and the note the learner wrote when it changed something.
+Changes are journalled to `data/trades.jsonl` under source `learning`.
+
+---
+
+## 7. Self-heal
+
+A long-running trading process fails in ways that are silent, and some of
+those states are unsafe. `selfheal/` runs a pass that finds them and — by
+default — repairs them, without an operator reading logs at 3am.
+
+| Check | Severity | State it catches | Repair |
+|---|---|---|---|
+| `orphan-protective-order` | high | A resting sell order with **no position behind it** — that is a short-sale instruction, reachable by closing a position by hand and leaving the pair the bot placed | Cancel it |
+| `duplicate-protection` | high | Two protective pairs on one position; both may fill and sell twice what is held | Keep the newest parent, cancel the rest |
+| `stale-resting-entry` | medium | An unfilled entry limit from days ago that would fill on a spike nobody re-checked, at a price the factors would not accept | Cancel it past `SELFHEAL_ORPHAN_MAX_AGE_HOURS` |
+| `state-file` | critical | `strategy-state.json` is not parseable, so intended TP/SL levels and the drawdown peak are unreadable | **Reported, not repaired** |
+| `journal-tail` | low | A crash left a truncated final line in `trades.jsonl` | Reported |
+| `halt-still-engaged` | medium | A drawdown halt still engaged after the breach healed | Re-base the peak, opt-in |
+
+The state file is deliberately *not* auto-repaired: setting it aside
+deletes the only record of the stop levels the bot intended to hold, so
+the position-aware reconciliation pass re-derives what it can from the
+broker and an operator decides about the file.
+
+**The pass may only cancel.** It never places an order, never increases
+size, never widens a stop, and never deletes a file. Cancelling an
+orphaned protective order is risk-reducing in every case; inventing one
+would be the bot trading, which is not this package's job. So the worst a
+bug in here can do is leave the book exactly as exposed as it already was.
+
+### A skipped check is not a clean pass
+
+`Report.Clean()` is `len(Actions) == 0 && len(Errors) == 0`. If the
+positions or open-orders read fails, every remaining check is
+un-evaluable, and that is recorded as an error and journalled — not
+reported as healthy. The difference between "examined and clean" and "not
+examined" is the whole point of the pass.
+
+Lifting a halt is opt-in (`SELFHEAL_LIFT_HALT`) because a halt is the
+operator's brake, and the daily/weekly halts are computed from the
+journal's realised fills — a bookkeeping re-base must not erase the
+losses that earned the halt. Only the total-drawdown peak is re-based.
+
+### Cadence, output and configuration
+
+Runs on the first tick and then every `SELFHEAL_EVERY_TICKS`, because
+these states do not appear between two polls and each pass reads the whole
+order list. Every action is journalled under source `selfheal:<check>`
+with risk `HEAL_REQUIRED` or `HEAL_NOTED`, and the last report is
+persisted to `data/selfheal-report.json` for the separate API process.
+The report also carries the **posture the pass ran with** (report-only,
+halt-lift, orphan TTL), and the API prefers that over its own
+environment — after a config change plus a bot restart the two disagree,
+and the dashboard must describe what acted on the account, not what the
+API container happens to think.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `SELFHEAL_ENABLED` | `true` | Run the pass at all |
+| `SELFHEAL_EVERY_TICKS` | `6` | Tick cadence |
+| `SELFHEAL_REPORT_ONLY` | `false` | Find and journal, change nothing |
+| `SELFHEAL_ORPHAN_MAX_AGE_HOURS` | `24` | Age after which a resting entry is stale (`0` disables) |
+| `SELFHEAL_LIFT_HALT` | `false` | Allow re-basing the drawdown peak |
+
+Read it at `GET /api/selfheal` or on the dashboard's **Learning** page.
+
+---
+
+## 8. Safety rails
 
 | Control | Mechanism | Where |
 |---|---|---|
@@ -370,7 +532,7 @@ Every evaluation — approved, rejected or refused — is journaled to
 
 ---
 
-## 7. Configuration
+## 9. Configuration
 
 Every knob lives in `.env`; `.env.example` is the canonical list.
 
@@ -419,7 +581,7 @@ Every knob lives in `.env`; `.env.example` is the canonical list.
 
 ### Agent bridge
 
-See [the bridge section](#4-the-agent-to-agent-bridge).
+See [the bridge section](#5-the-agent-to-agent-bridge).
 
 ### LLM providers
 
@@ -429,7 +591,7 @@ Qwen3's own tool-call template is used) → `LLM_PROVIDER=oxlo` with
 
 ---
 
-## 8. CLI
+## 10. CLI
 
 ```bash
 cp .env.example .env          # add your paper keys
@@ -451,7 +613,7 @@ available.
 
 ---
 
-## 9. HTTP API
+## 11. HTTP API
 
 Responses carry the bare typed object on success and
 `{"error": "...", "code": "..."}` on failure — the HTTP status carries
@@ -473,6 +635,8 @@ the outcome, there is no `success` flag.
 | POST | `/api/control/{pause,resume,step}` | Operator controls |
 | GET | `/api/instruments` | The classified universe (the picker) |
 | GET | `/api/signals` | Ranked signals with per-factor scores |
+| GET | `/api/learning` | The adjustments the learner is applying, its bounds and the calibration table |
+| GET | `/api/selfheal` | The last self-heal pass: actions taken, findings, skipped checks |
 | GET | `/api/a2a` | Whether the agent bridge is enabled |
 | POST | `/api/a2a/signals` | Inbound signal (bridge token) |
 | GET | `/api/a2a/agents` | Agent ramp positions |
@@ -496,10 +660,10 @@ deterministic loop), `agent` (the LLM cycle), `ensemble` and `manual`.
 
 ---
 
-## 10. Dashboard
+## 12. Dashboard
 
 The Next.js app is statically exported and embedded into the binary at
-`api/ui/`. Five pages:
+`api/ui/`. Seven pages:
 
 | Page | What it shows |
 |---|---|
@@ -508,6 +672,7 @@ The Next.js app is statically exported and embedded into the binary at
 | Trades | Cursor-paginated trade log with path filters |
 | Brain | Open positions, decision feed, factor weights |
 | **Picker** | The classified universe, the ranked signals, and the agent bridge with its ramp controls |
+| **Learning** | The learner's floor uplift, per-class size/stop multipliers, the score→outcome calibration table, quarantined symbols, and the last self-heal report |
 | Controls | Read-only config table + Pause / Resume / Step |
 
 Rebuilding after a dashboard change:
@@ -524,14 +689,16 @@ different origin.
 
 ---
 
-## 11. Data flow and state files
+## 13. Data flow and state files
 
 | File | Written by | Read by |
 |---|---|---|
 | `data/trades.jsonl` | Every path (bot, agent, dashboard, bridge) | P/L, the dashboard, the stats ledger |
 | `data/strategy-state.json` | The bot (heartbeat, TP/SL levels, peak equity) | The dashboard, the bot |
 | `data/a2a-state.json` | The bridge (ramp positions, counters, pending signals) | The bot, the dashboard |
-| `data/strategy-stats.json` | The stats ledger (per-symbol win/loss) | The bot (confidence bias) |
+| `data/strategy-stats.json` | The stats ledger (per-symbol win/loss + the bounded trade window) | The bot (confidence bias), the learner |
+| `data/learning-state.json` | The learner (the adjustments it computed) | The bot (entry gate), the dashboard |
+| `data/selfheal-report.json` | The self-heal pass (last report) | The dashboard |
 | `data/paused` | The dashboard's pause control | The bot, the API |
 
 The bot and the dashboard are **two separate processes** sharing these
@@ -540,7 +707,7 @@ levels all live on disk rather than in memory.
 
 ---
 
-## 12. Deployment
+## 14. Deployment
 
 See [`deploy/DEPLOY.md`](deploy/DEPLOY.md) for the full bring-up.
 
@@ -572,7 +739,7 @@ mixed-content or CORS hops.
 
 ---
 
-## 13. Tests and gates
+## 15. Tests and gates
 
 ```bash
 go test ./...   # every package
@@ -594,10 +761,22 @@ Gates are written so they can fail:
 - The ramp tests prove an agent cannot be ramped on without earning it,
   that a rejected evaluation resets the streak, and that the off ramp
   is never blocked.
+- The learner's tests prove it cannot grow anything: a multiplier above
+  1.0 is rejected at startup, re-clamped on read, and re-clamped again
+  after a hand-edited state file is loaded — and NaN is refused, because
+  a `<= 0 || > 1` rejection test lets NaN through.
+- The sample-window tests prove unscored trades never reach the
+  calibration table, and that rebuilding the ledger from the journal is
+  idempotent (the old code added each refresh on top of the last,
+  permanently inflating every win rate).
+- The self-heal tests prove a pass that could not read the account is
+  reported as skipped rather than clean, that report-only mode cancels
+  nothing, that the pass runs on its tick cadence rather than every tick,
+  and that every action reaches the journal.
 
 ---
 
-## 14. What was fixed in this pass
+## 16. What was fixed in this pass
 
 This pass audited the code, the broker layer, the risk gate, the agent
 layer and the API, and fixed the defects that mattered. The full list
@@ -647,10 +826,15 @@ order is rejected.
 | `X-Forwarded-Host` | The docstring promised it, the code never read it: behind a proxy every control POST was 403. |
 | `path=auto` | The dashboard's "auto" tab matched nothing and was permanently empty. |
 | Asset catalogue | `/v2/assets` ignores `limit`/`offset`; the paging loop re-fetched the full 14k-asset catalogue 50 times per call. |
+| Entry scoring | Every swing fill was journalled with the **gate confidence**, which the deterministic loop pins at 1.0 — so no score→outcome pair ever existed and a learner reading that journal would have "calibrated" on a constant. The plan now carries the decision composite (`EntryPlan.Score`). |
+| Option fills | The options overlay journalled the decision but not the fill, so option trades were invisible to realised P/L, the stats ledger and the learner. |
+| Confidence bias | The ledger's winner *discount* was added to the signal's own confidence, which lets a past win push a fresh signal over the risk floor it did not clear. Only the penalty side is applied now. |
+| Multiplier clamp | Rejection-style guards (`x <= 0 || x > 1`) let NaN through as a valid multiplier, and a NaN size factor silently zeroes a position. Every clamp is now an affirmative test, and a corrupt value means "no opinion" (1.0). |
+| Dead threshold | `statsLedger.confidenceRequired` computed a *lowered* threshold for losing symbols under a docstring claiming the opposite, and had no callers. Removed rather than fixed. |
 
 ---
 
-## 15. Layout
+## 17. Layout
 
 ```
 a2a/                agent-to-agent bridge (ingress, ramp, state)
@@ -664,11 +848,13 @@ data/               journal, state, stats, pause flag
 deploy/             systemd units, Dockerfile, DEPLOY.md
 docs/               hackathon writeup, hardening audit, slide decks
 factors/            factor engine
+learning/           bounded self-calibration from closed trades (engine + store)
 model/llamacpp/     llama.cpp / OpenAI-compatible model adapter
 options/            options chain, greeks, snapshots
 picker/             universal signal picker (registry, ingestion, ranking)
 pnl/                JSONL journal + FIFO P/L
 risk/               deterministic pre-trade validator
+selfheal/           degraded-state detection and repair (+ report store)
 stream/             market-data + trade-update streams
 strategy/           deterministic engine (decide, execute, monitor, state, windows)
 strategy/ensemble/  optional multi-expert layer

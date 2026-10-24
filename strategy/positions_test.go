@@ -170,6 +170,56 @@ func TestReconcileSkipsAlreadyProtected(t *testing.T) {
 	}
 }
 
+// TestStaleProtectivePairIsReplaced proves the point of comparing
+// prices: after a re-anchor the broker is still holding a pair at the OLD
+// cost basis, so the level the dashboard shows is not the stop actually
+// resting. A mismatched pair must be replaced, not merely noticed.
+func TestStaleProtectivePairIsReplaced(t *testing.T) {
+	m, fb := posMonitor(t, agents.NewKillSwitch(), defSettings(),
+		[]tools.Position{{
+			Symbol: "AAPL", Qty: "5", Side: "long",
+			AvgEntry: "320", CurrentPrice: "321", AssetClass: tools.AssetClassEquity,
+		}},
+		[]tools.Order{{
+			Symbol: "AAPL", Side: "sell", Type: "limit", OrderClass: "oco",
+			LimitPrice: "200.00", StopPrice: "150.00", ID: "stale-pair",
+		}})
+
+	if _, err := m.Tick(context.Background(), map[string]float64{}, 200000); err != nil {
+		t.Fatal(err)
+	}
+	if len(fb.cancelled) == 0 {
+		t.Fatal("the stale-priced pair must be cleared before a correct one is placed")
+	}
+	if len(fb.oco) != 1 {
+		t.Fatalf("expected one replacement pair, got %d", len(fb.oco))
+	}
+	got := fb.oco[0]
+	if math.Abs(got.TakeProfit-345.60) > 0.05 || math.Abs(got.StopLoss-307.20) > 0.05 {
+		t.Fatalf("replacement must sit at the NEW entry's levels, got %+v", got)
+	}
+}
+
+// TestUnreadablePairPricesAreLeftAlone proves the conservative half of
+// the rule: a resting pair whose prices cannot be read is NOT churned.
+// Cancelling and re-placing every tick over a missing payload field
+// would leave the position repeatedly unprotected.
+func TestUnreadablePairPricesAreLeftAlone(t *testing.T) {
+	m, fb := posMonitor(t, agents.NewKillSwitch(), defSettings(),
+		[]tools.Position{{
+			Symbol: "AAPL", Qty: "5", Side: "long",
+			AvgEntry: "320", CurrentPrice: "321", AssetClass: tools.AssetClassEquity,
+		}},
+		[]tools.Order{{Symbol: "AAPL", Side: "sell", Type: "limit", OrderClass: "oco", ID: "opaque-pair"}})
+
+	if _, err := m.Tick(context.Background(), map[string]float64{}, 200000); err != nil {
+		t.Fatal(err)
+	}
+	if len(fb.oco) != 0 || len(fb.cancelled) != 0 {
+		t.Fatalf("an unreadable but present pair must be left alone: oco=%d cancelled=%v", len(fb.oco), fb.cancelled)
+	}
+}
+
 // TestReconcileCryptoIsLocalOnly proves crypto pairs get levels and NO
 // broker order class — Alpaca rejects bracket/oco on crypto, and a
 // placement attempt would fail the position open.

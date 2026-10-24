@@ -138,4 +138,8 @@ type OptionLeg struct {
 	Premium   float64
 	Contracts int
 	Expiry    string
+	// Score is the underlying's composite that justified the trade. The
+	// option inherits its entry decision, so its outcome is evidence
+	// about that score and must be journaled with it.
+	Score float64
 }

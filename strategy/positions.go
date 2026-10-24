@@ -304,12 +304,29 @@ func (m *PositionMonitor) atrFor(ctx context.Context, sym string) (float64, bool
 // are enforced locally (Alpaca has no order class for either), so this
 // only acts on levels the broker can hold for us.
 func (m *PositionMonitor) ensureBrokerProtection(lv *PositionLevels, openOrders []tools.Order) bool {
-	if protectionState(openOrders, lv.Symbol) == protectionComplete {
-		return false
-	}
 	b := m.broker()
 	if b == nil {
 		return false
+	}
+	existing := inspectProtection(openOrders, lv.Symbol)
+	if existing.State == protectionComplete && sameProtection(existing, lv) && existing.Duplicates == 0 {
+		return false
+	}
+	// Something is resting but it is wrong: stale prices, only one leg,
+	// or more than one pair on the same position. Clear it first, then
+	// place exactly one correct pair. The order matters — placing before
+	// cancelling would leave two protective pairs live simultaneously.
+	if existing.State != protectionNone {
+		n, err := b.CancelSymbolOrders(context.Background(), lv.Symbol)
+		if err != nil {
+			m.log().Printf("[protect] %s: could not clear mismatched protection (%v); leaving the resting pair alone rather than stacking a second", lv.Symbol, err)
+			return false
+		}
+		m.log().Printf("[protect] %s: cleared %d stale/duplicate order(s) before re-placing tp=%.4f sl=%.4f",
+			lv.Symbol, n, lv.TakeProfit, lv.StopLoss)
+		m.journalProtect(lv.Symbol, "APPROVED", fmt.Sprintf(
+			"replaced stale protective pair: cleared %d order(s), new tp=%.4f sl=%.4f (entry %.4f)",
+			n, lv.TakeProfit, lv.StopLoss, lv.EntryPrice))
 	}
 	qty, _ := strconv.ParseFloat(lv.Qty, 64)
 	if qty <= 0 {
@@ -357,36 +374,78 @@ const (
 	protectionComplete
 )
 
-// protectionState inspects the open orders for a protective pair on the
-// symbol. An oco or bracket parent (or a leg of one) covers both sides
-// on its own.
-func protectionState(orders []tools.Order, symbol string) protectionClass {
+// restingProtection is what the broker currently holds for one position.
+type restingProtection struct {
+	State      protectionClass
+	TakeProfit float64
+	StopLoss   float64
+	// OrderIDs are the resting orders on the symbol that make up the
+	// protection.
+	OrderIDs []string
+	// Duplicates counts protective parents beyond the first. Two pairs on
+	// a five-share position can sell ten shares, so they must not coexist.
+	Duplicates int
+}
+
+// inspectProtection reads the open orders for a protective pair on the
+// symbol. An oco or bracket parent covers both sides on its own.
+func inspectProtection(orders []tools.Order, symbol string) restingProtection {
+	var out restingProtection
+	var parents int
 	var hasStop, hasTP bool
 	for _, o := range orders {
 		if !tools.SameSymbol(o.Symbol, symbol) {
 			continue
 		}
-		cls := strings.ToLower(o.OrderClass)
-		if cls == "oco" || cls == "bracket" {
-			return protectionComplete
+		out.OrderIDs = append(out.OrderIDs, o.ID)
+		if tp, err := strconv.ParseFloat(strings.TrimSpace(o.LimitPrice), 64); err == nil && tp > 0 {
+			out.TakeProfit = tp
+		}
+		if sp, err := strconv.ParseFloat(strings.TrimSpace(o.StopPrice), 64); err == nil && sp > 0 {
+			out.StopLoss = sp
+		}
+		switch strings.ToLower(o.OrderClass) {
+		case "oco", "bracket":
+			parents++
+			continue
 		}
 		switch strings.ToLower(o.Type) {
 		case "stop", "stop_limit", "trailing_stop":
 			hasStop = true
 		case "limit":
-			// A resting limit in the direction that CLOSES the position
-			// is the take-profit leg.
+			// A resting limit in the direction that CLOSES the position is
+			// the take-profit leg.
 			hasTP = true
 		}
 	}
-	switch {
-	case hasStop && hasTP:
-		return protectionComplete
-	case hasStop || hasTP:
-		return protectionPartial
-	default:
-		return protectionNone
+	if parents > 1 {
+		out.Duplicates = parents - 1
 	}
+	switch {
+	case parents > 0 || (hasStop && hasTP):
+		out.State = protectionComplete
+	case hasStop || hasTP:
+		out.State = protectionPartial
+	default:
+		out.State = protectionNone
+	}
+	return out
+}
+
+// sameProtection reports whether a resting pair still matches the level.
+//
+// A KNOWN mismatch means the broker is guarding at the old cost basis
+// after a re-anchor, so the pair is replaced. Missing price data is
+// treated as a match rather than a mismatch: cancelling and re-placing on
+// every tick because a payload omitted a field would churn a perfectly
+// good protective pair, and the position is safer left protected at
+// approximately the right level than repeatedly stripped and rebuilt.
+func sameProtection(r restingProtection, lv *PositionLevels) bool {
+	const tol = 0.011
+	if r.TakeProfit <= 0 || r.StopLoss <= 0 {
+		return true
+	}
+	return math.Abs(r.TakeProfit-lv.TakeProfit) <= tol && math.Abs(r.StopLoss-lv.StopLoss) <= tol
 }
 
 // levelStale reports whether a stored level no longer describes the

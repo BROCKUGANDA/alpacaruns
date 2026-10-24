@@ -397,3 +397,82 @@ export type A2AAgentState = {
 export type A2AAgentsResponse = { agents: A2AAgentState[] };
 
 export type A2AEnabledResponse = { enabled: boolean };
+
+// ---- Learning + self-heal ----
+
+export type LearningClassAdjustment = {
+  class: string;
+  samples: number;
+  win_rate: number;
+  expectancy_pct: number;
+  size_multiplier: number;
+  stop_multiplier: number;
+  reason: string;
+};
+
+export type LearningQuarantined = {
+  symbol: string;
+  samples: number;
+  win_rate: number;
+  reason: string;
+};
+
+export type LearningScoreBucket = {
+  from: number;
+  to: number;
+  samples: number;
+  win_rate: number;
+  expectancy_pct: number;
+};
+
+export type LearningAdjustments = {
+  computed_at?: string;
+  samples_seen: number;
+  active: boolean;
+  score_floor_add: number;
+  suggested_floor: number;
+  classes: Record<string, LearningClassAdjustment>;
+  quarantined?: LearningQuarantined[];
+  buckets?: LearningScoreBucket[];
+  notes?: string[];
+};
+
+export type LearningBounds = {
+  min_trades: number;
+  every_trades: number;
+  min_samples_per_class: number;
+  min_samples_per_bucket: number;
+  min_size_multiplier: number;
+  max_tighten_factor: number;
+  quarantine_win_rate: number;
+  quarantine_trades: number;
+  score_buckets: number;
+};
+
+export type LearningResponse = {
+  enabled: boolean;
+  bounds: LearningBounds;
+  adjustments: LearningAdjustments;
+};
+
+export type SelfHealAction = {
+  check: string;
+  detail: string;
+  repaired: boolean;
+  severity: string;
+};
+
+export type SelfHealReport = {
+  at?: string;
+  actions?: SelfHealAction[];
+  errors?: string[];
+};
+
+export type SelfHealResponse = {
+  enabled: boolean;
+  report_only: boolean;
+  halt_lift_enabled: boolean;
+  orphan_max_age_hours: number;
+  every_ticks: number;
+  report: SelfHealReport;
+};

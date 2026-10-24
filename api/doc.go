@@ -14,4 +14,4 @@ package api
 
 // Version is the bot version reported by /api/health. Kept in sync with
 // the showcase UI banner; bump together when shipping.
-const Version = "0.9.7"
+const Version = "0.9.8"

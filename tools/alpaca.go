@@ -740,6 +740,12 @@ type Order struct {
 	AssetClass string `json:"asset_class"`
 	Notional   string `json:"notional"`
 	OrderClass string `json:"order_class"`
+	// LimitPrice and StopPrice are the protective levels actually
+	// resting on an open order. Without them the monitor cannot tell
+	// whether a resting pair still matches the position's real entry,
+	// so a re-anchored position would keep protecting at the old prices.
+	LimitPrice string `json:"limit_price"`
+	StopPrice  string `json:"stop_price"`
 }
 
 // PlaceOrder submits an order, defaulting time_in_force to gtc when unset.

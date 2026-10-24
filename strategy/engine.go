@@ -208,8 +208,8 @@ func (e *Engine) RunTick(ctx context.Context, universe []string, held map[string
 	return out
 }
 
-// EntryPlan is an executable entry: sized quantity plus (for equities)
-// bracket levels computed off the current mark.
+// EntryPlan is an executable entry: sized quantity plus bracket levels
+// computed off the current mark.
 type EntryPlan struct {
 	Symbol   string
 	Side     string // "buy"
@@ -218,12 +218,16 @@ type EntryPlan struct {
 	Price    float64
 	Crypto   bool
 	Notional float64 // USD notional for fractional crypto (0 for qty orders)
-	Brackets BracketLevels // zero value for crypto (local TP/SL instead)
+	Brackets BracketLevels
+	// Score is the composite that justified this entry. It rides the plan
+	// to the journal so a closed trade can be traced back to the number
+	// the bot acted on; without it outcomes cannot be mapped to decisions
+	// and nothing is learnable from them.
+	Score float64
 }
 // PlanEntry sizes an equity/crypto BUY at mark price and computes bracket
-// levels for equities. Crypto returns Crypto=true with brackets zeroed:
-// Alpaca does not support order_class=bracket on crypto, so TP/SL levels
-// are persisted locally and enforced by PositionMonitor.
+// levels. Crypto brackets are enforced locally (see PositionMonitor)
+// because Alpaca rejects order_class=bracket on crypto orders.
 //
 // Bracket placement follows the engine's bracketMode: "pct" (default)
 // uses fixed TP_PCT/SL_PCT percentages; "atr" scales TP/SL off the
@@ -260,7 +264,7 @@ func (e *Engine) PlanEntry(ctx context.Context, d Decision, portfolioValue float
 		p := EntryPlan{
 			Symbol: d.Symbol, Side: "buy", Qty: 0,
 			Budget: notional, Price: price, Crypto: true,
-			Notional: notional,
+			Notional: notional, Score: d.Composite,
 		}
 		// Crypto TP/SL: Alpaca rejects server-side brackets on crypto
 		// orders, so we compute them locally from the engine's tpPct/
@@ -283,6 +287,7 @@ func (e *Engine) PlanEntry(ctx context.Context, d Decision, portfolioValue float
 	p := EntryPlan{
 		Symbol: d.Symbol, Side: "buy", Qty: qr.Qty,
 		Budget: qr.Budget, Price: price, Crypto: IsCrypto(d.Symbol),
+		Score: d.Composite,
 	}
 	if p.Crypto {
 		// Crypto qty-based entry: same TP/SL story as the notional branch.
@@ -352,6 +357,7 @@ func (e *Engine) PlanEntryFromReference(ctx context.Context, d Decision, portfol
 	p := EntryPlan{
 		Symbol: d.Symbol, Side: "buy", Qty: qr.Qty,
 		Budget: qr.Budget, Price: price, Crypto: IsCrypto(d.Symbol),
+		Score: d.Composite,
 	}
 	if p.Crypto {
 		// Crypto carries local TP/SL levels even on pre-orders: the

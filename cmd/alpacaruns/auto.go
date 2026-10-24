@@ -22,13 +22,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/BROCKUGANDA/alpacaruns/a2a"
 	"github.com/BROCKUGANDA/alpacaruns/agents"
 	"github.com/BROCKUGANDA/alpacaruns/config"
 	"github.com/BROCKUGANDA/alpacaruns/factors"
 	"github.com/BROCKUGANDA/alpacaruns/options"
-	"github.com/BROCKUGANDA/alpacaruns/a2a"
 	"github.com/BROCKUGANDA/alpacaruns/picker"
 	"github.com/BROCKUGANDA/alpacaruns/pnl"
+	"github.com/BROCKUGANDA/alpacaruns/selfheal"
 	"github.com/BROCKUGANDA/alpacaruns/strategy"
 	"github.com/BROCKUGANDA/alpacaruns/strategy/ensemble"
 	"github.com/BROCKUGANDA/alpacaruns/tools"
@@ -86,6 +87,26 @@ type autoLoop struct {
 	registry *picker.Registry
 	// registryAt is when the registry was last refreshed.
 	registryAt time.Time
+	// learn is the learner's ledger: the bounded adjustments it has
+	// earned from closed trades, and the cadence for recomputing them.
+	// Always constructed (nil only on a config error) so the evidence
+	// accumulates even while LEARN_ENABLED is off.
+	learn *learningLedger
+	// statsClassed marks that the ledger has been rebuilt once with the
+	// picker's real asset classes available, so a restarted bot files
+	// historical trades under the same classes as new ones.
+	statsClassed bool
+	// healOpts / healDeps wire the self-heal pass. It runs on a tick
+	// cadence, not every tick: the checks are broker-wide reads and the
+	// states they look for do not change between two 5-minute polls.
+	healOpts   selfheal.Options
+	healDeps   selfheal.Deps
+	healEvery  int64
+	healAtTick int64
+	healLast   selfheal.Report
+	// healStore persists the last report for the dashboard API, which is a
+	// separate process and cannot see the loop's memory.
+	healStore *selfheal.ReportStore
 }
 
 // registryTTL is how long the classified universe is reused before it
@@ -117,10 +138,10 @@ func (l *autoLoop) refreshRegistry(ctx context.Context) (*picker.Registry, error
 		return l.registry, nil
 	}
 	spec := picker.Spec{
-		Equities:   l.set.EquitySymbols,
-		ETFs:       l.set.ETFSymbols,
-		Indices:    l.set.IndexSymbols,
-		Crypto:     l.set.CryptoSymbols,
+		Equities: l.set.EquitySymbols,
+		ETFs:     l.set.ETFSymbols,
+		Indices:  l.set.IndexSymbols,
+		Crypto:   l.set.CryptoSymbols,
 	}
 	reg, err := picker.Build(ctx, l.client, spec)
 	if err != nil {
@@ -346,11 +367,57 @@ func buildAutoLoop(ctx context.Context, cfg *config.Config, set strategy.Setting
 	if err := loop.stats.load(); err != nil {
 		log.Printf("[auto] WARNING: stats load failed: %v", err)
 	}
-	if err := loop.stats.refreshFromJournal(j); err != nil {
+	if err := loop.stats.refreshFromJournalWith(j, loop.classResolver()); err != nil {
 		log.Printf("[auto] WARNING: stats refresh failed: %v", err)
 	}
 	if all := loop.stats.all(); len(all) > 0 {
 		log.Printf("[auto] trade stats loaded: %s", loop.stats.formatDump())
+	}
+
+	// Learner. Built unconditionally: the samples are already in the
+	// ledger, and running the engine while LEARN_ENABLED=false produces
+	// the evidence without acting on it — which is what makes turning it
+	// on a considered decision instead of a leap.
+	learn, err := newLearningLedger(cfg, j.Path())
+	if err != nil {
+		log.Printf("[auto] learning disabled: %v", err)
+	} else {
+		loop.learn = learn
+		adj := learn.snapshot()
+		if adj.Active {
+			log.Printf("[learn] restored %d learned adjustments over %d closed trades (floor +%.3f, quarantined=%d)",
+				len(adj.Classes), adj.SamplesSeen, adj.ScoreFloorAdd, len(adj.Quarantined))
+		} else {
+			log.Printf("[learn] learner armed but inactive: %d closed trades, needs %d (enabled=%t)",
+				adj.SamplesSeen, learn.eng.Config().MinTrades, learn.eng.Config().Enabled)
+		}
+	}
+
+	// Self-heal: the pass that finds and fixes the states this bot falls
+	// into on its own. Enabled by default because the most common one —
+	// a protective order resting over no position — is a short sale in
+	// waiting, not a cosmetic problem.
+	loop.healOpts = selfheal.Options{
+		ReportOnly:      cfg.SelfHealReportOnly,
+		HaltLiftEnabled: cfg.SelfHealLiftHalt,
+		OrphanMaxAge:    time.Duration(cfg.SelfHealOrphanHours) * time.Hour,
+	}
+	loop.healEvery = int64(cfg.SelfHealEveryTicks)
+	if loop.healEvery < 1 {
+		loop.healEvery = 1
+	}
+	loop.healStore = selfheal.NewReportStore(j.Path())
+	if cfg.SelfHealEnabled {
+		loop.healDeps = selfheal.Deps{
+			Broker:      selfHealBroker{client: client},
+			StatePath:   state.Path(),
+			JournalPath: j.Path(),
+			Halted:      kill.Halted,
+			ResetPeak:   loop.resetDrawdownPeak,
+			Equity:      loop.accountEquity,
+		}
+		log.Printf("[heal] self-heal enabled: every %d tick(s), report-only=%t, halt-lift=%t, orphan age=%s",
+			loop.healEvery, loop.healOpts.ReportOnly, loop.healOpts.HaltLiftEnabled, loop.healOpts.OrphanMaxAge)
 	}
 	// Intraday track: independent 15-minute-bar engine with its own
 	// windows and sizing. Shares client, validator, kill switch, state
@@ -526,6 +593,14 @@ func (l *autoLoop) tick(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("positions: %w", err)
 	}
+	// Self-heal before anything else reasons about the book: an orphan
+	// protective order resting over no position is a short sale waiting
+	// to fill, and the monitor should not have to work around it.
+	l.maybeHeal(ctx)
+	// Then fold newly closed round-trips into the ledger and let the
+	// learner recalibrate on its own cadence (every N closed trades, not
+	// every tick).
+	l.refreshAndLearn(time.Now().UTC())
 	held := map[string]bool{}
 	posSymbols := []string{}
 	for _, p := range positions {
@@ -691,6 +766,19 @@ func (l *autoLoop) intraEntry(ctx context.Context, dec strategy.Decision, pfv fl
 	if err != nil {
 		log.Printf("[intraday] %s plan skipped: %v", dec.Symbol, err)
 		return
+	}
+	// The learner gates and sizes intraday entries too: a faster book is
+	// not a reason to ignore what the same symbol just did in the swing
+	// book, and the samples are shared.
+	if ok, why := l.learningGate(dec.Symbol, dec.Composite); !ok {
+		log.Printf("[intraday] %s entry skipped: %s", dec.Symbol, why)
+		return
+	}
+	if whyPlan, okPlan := l.learningPlan(&plan); !okPlan {
+		log.Printf("[intraday] %s entry skipped: %s", dec.Symbol, whyPlan)
+		return
+	} else if whyPlan != "" {
+		log.Printf("[intraday] %s %s", dec.Symbol, whyPlan)
 	}
 	autoJournal(l.journal, fmt.Sprintf("intraday-buy %s qty=%d price=%.4f tp=%.4f sl=%.4f",
 		plan.Symbol, plan.Qty, plan.Price, plan.Brackets.TakeProfit, plan.Brackets.StopLoss),
@@ -1102,17 +1190,29 @@ func (l *autoLoop) handleBuy(ctx context.Context, dec strategy.Decision, pfv, co
 		log.Printf("[auto] %s BUY skipped: outside trading window", dec.Symbol)
 		return
 	}
-	// Per-symbol adaptive confidence: chronic losers need higher
-	// confidence to clear the risk gate, proven winners get a
-	// discount. The bias is set by the stats ledger; this just adds it
-	// to the signal confidence so the risk gate's MinConfidence check
-	// naturally rewards the good symbols and punishes the bad ones.
+	// Learning gate: after enough closed trades the learner may quarantine
+	// a symbol or raise the score bar above the configured floor. Both are
+	// brakes — it can refuse a trade, never authorise one the factors
+	// declined.
+	if ok, why := l.learningGate(dec.Symbol, dec.Composite); !ok {
+		log.Printf("[auto] %s BUY skipped: %s", dec.Symbol, why)
+		autoJournal(l.journal, "learning-blocked buy "+dec.Symbol+": "+why, dec.Symbol, "buy", dec.Composite)
+		return
+	}
+	// Per-symbol track record. A chronic loser has its signal confidence
+	// REDUCED, so the risk gate's unchanged floor now rejects it. Only the
+	// penalty side is applied: the ledger also computes a positive bias for
+	// proven winners, and adding that to the signal would let the bot
+	// inflate its own score and clear a bar it did not actually meet.
+	// Every self-adjusting knob in this system is therefore a brake — the
+	// learner's floor rises, the stop tightens, and a bad record costs
+	// confidence. Nothing earned by trading can buy more risk.
 	if l.stats != nil {
 		bias := l.stats.get(dec.Symbol).ConfidenceBias
 		if bias < 0 {
 			log.Printf("[auto] %s confidence bias: %+.2f (chronic loser — needing higher conf)", dec.Symbol, bias)
+			conf += bias
 		}
-		conf += bias
 	}
 	// Per-asset-class sizing for live entries.
 	dec.Sizing = l.set.SizingFor(dec.Symbol, l.cfg.MaxPositionUSD)
@@ -1144,11 +1244,38 @@ func (l *autoLoop) handleBuy(ctx context.Context, dec strategy.Decision, pfv, co
 		log.Printf("[auto] %s plan skipped: %v", dec.Symbol, err)
 		return
 	}
+	// Learned sizing and stop tightening for this asset class. Shrink and
+	// tighten only: a class that has been losing trades smaller and with a
+	// stop closer to entry, never larger or wider than the operator set.
+	whyPlan, okPlan := l.learningPlan(&plan)
+	if !okPlan {
+		log.Printf("[auto] %s BUY skipped: %s", dec.Symbol, whyPlan)
+		autoJournal(l.journal, "learning-shrunk buy "+dec.Symbol+": "+whyPlan, dec.Symbol, "buy", dec.Composite)
+		return
+	}
+	if whyPlan != "" {
+		log.Printf("[auto] %s %s", dec.Symbol, whyPlan)
+		autoJournal(l.journal, whyPlan, dec.Symbol, "buy", dec.Composite)
+	}
 	// Options overlay: prefer a deep-ITM call substitute when data allows;
 	// otherwise fall through to the equity entry.
 	if l.optPlanner != nil && !plan.Crypto {
 		leg, why := l.optPlanner.Plan(ctx, dec.Symbol, pfv)
 		if leg != nil {
+			leg.Score = dec.Composite
+			if m := l.learningSizeMult("option"); m < 1 {
+				n := int(math.Floor(float64(leg.Contracts) * m))
+				if n < 1 {
+					log.Printf("[auto] %s option entry skipped: learning shrank %d contracts to nothing (x%.2f)",
+						dec.Symbol, leg.Contracts, m)
+					autoJournal(l.journal, fmt.Sprintf(
+						"learning-shrunk option %s: %d contracts x%.2f is below one contract", leg.OCC, leg.Contracts, m),
+						dec.Symbol, "buy", dec.Composite)
+					return
+				}
+				log.Printf("[auto] %s option contracts x%.2f: %d -> %d", dec.Symbol, m, leg.Contracts, n)
+				leg.Contracts = n
+			}
 			autoJournal(l.journal, fmt.Sprintf("buy-option %s %s contracts=%d delta=%.2f premium=%.2f",
 				dec.Symbol, leg.OCC, leg.Contracts, leg.Delta, leg.Premium),
 				dec.Symbol, "buy", 0)
@@ -1198,6 +1325,13 @@ func (l *autoLoop) equityMarketOpen(ctx context.Context) bool {
 // so the position is captured in options when the market reopens.
 // Dry-run logs without placing.
 func (l *autoLoop) preOrder(ctx context.Context, dec strategy.Decision, pfv, conf float64) {
+	// Same learning gate as live entries: a queued entry is still an
+	// entry, and it fills later on a signal the learner may already have
+	// judged worthless.
+	if ok, why := l.learningGate(dec.Symbol, dec.Composite); !ok {
+		log.Printf("[auto] %s pre-order skipped: %s", dec.Symbol, why)
+		return
+	}
 	// Per-asset-class sizing for pre-orders (same routing as live entries).
 	dec.Sizing = l.set.SizingFor(dec.Symbol, l.cfg.MaxPositionUSD)
 	dec.NotionalUSD = l.set.CryptoNotionalUSD
@@ -1205,6 +1339,12 @@ func (l *autoLoop) preOrder(ctx context.Context, dec strategy.Decision, pfv, con
 	if err != nil {
 		log.Printf("[auto] %s pre-order skipped: %v", dec.Symbol, err)
 		return
+	}
+	if whyPlan, okPlan := l.learningPlan(&plan); !okPlan {
+		log.Printf("[auto] %s pre-order skipped: %s", dec.Symbol, whyPlan)
+		return
+	} else if whyPlan != "" {
+		log.Printf("[auto] %s %s (pre-order)", dec.Symbol, whyPlan)
 	}
 	open, err := l.client.ListOrders(ctx, "open", 500)
 	if err != nil {

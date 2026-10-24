@@ -77,6 +77,16 @@ func (l *autoLoop) evaluateA2A(ctx context.Context, sig a2a.Signal, pfv float64)
 	}
 	dec.Sizing = l.set.SizingFor(sig.Symbol, l.cfg.MaxPositionUSD)
 
+	// Learning applies to inbound signals as well: a symbol the bot has
+	// watched lose repeatedly stays quarantined no matter which agent
+	// asked for it, and a peer's confidence must clear the same bar the
+	// bot raised for itself.
+	if ok, why := l.learningGate(sig.Symbol, sig.Confidence); !ok {
+		l.journalA2A(sig, "REJECTED", "learning: "+why)
+		l.bridge.RecordOutcome(sig.Agent, false, why)
+		return
+	}
+
 	// The agent's own size wins, but never above the per-position cap.
 	budget := 0.0
 	if n, err := strconv.ParseFloat(strings.TrimSpace(sig.Notional), 64); err == nil && n > 0 {
@@ -121,6 +131,15 @@ func (l *autoLoop) evaluateA2A(ctx context.Context, sig a2a.Signal, pfv float64)
 	}
 
 	// The deterministic risk gate — the same one every other path uses.
+	// Learning has already had its say on size and stop: an agent asking
+	// for more than the learner allows for this class does not get it.
+	if whyPlan, okPlan := l.learningPlan(&plan); !okPlan {
+		l.journalA2A(sig, "REJECTED", "learning: "+whyPlan)
+		l.bridge.RecordOutcome(sig.Agent, false, whyPlan)
+		return
+	} else if whyPlan != "" {
+		l.journalA2A(sig, "APPROVED", whyPlan)
+	}
 	verdict := l.exec.Validator.Validate(riskProposalFor(plan, sig.Confidence))
 	if !verdict.Approved {
 		l.journalA2A(sig, "REJECTED", verdict.String())

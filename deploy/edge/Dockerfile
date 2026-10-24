@@ -6,8 +6,10 @@
 # Alpaca over HTTPS, and it is copied in rather than installed from a
 # package manager so the image build is deterministic and offline.
 #
-# Build context: this directory plus the binary. The binary is copied
-# in by deploy/edge/build.sh, which is where the cross-compile happens.
+# Build context: this directory plus the binary. deploy/DEPLOY.md
+# "Bring-up the edge stack" cross-compiles it to alpacaruns.linux and
+# copies it in next to this file; the image build then needs nothing
+# else, so it is deterministic and offline.
 
 FROM scratch
 

@@ -124,13 +124,18 @@ func (x *Executor) ExecuteEntry(ctx context.Context, p EntryPlan, conf float64) 
 	x.log().Printf("[strategy] ENTRY %s qty=%s notional=%.2f @~%.4f budget=%.2f crypto=%v tp=%.4f sl=%.4f order=%s",
 		p.Symbol, req.Qty, p.Notional, p.Price, p.Budget, p.Crypto, p.Brackets.TakeProfit, p.Brackets.StopLoss, o.ID)
 	if x.Journal != nil {
-		_ = x.Journal.Append(pnl.Record{
+		score := entryScoreOf(p.Score, conf)
+		rec := pnl.Record{
 			Kind: pnl.KindDecision, Source: "strategy:auto", Risk: "APPROVED",
-			Confidence: &conf,
 			Detail: fmt.Sprintf("entry %s qty=%s notional=%.2f price=%.4f tp=%.4f sl=%.4f crypto=%t order=%s",
 				p.Symbol, req.Qty, p.Notional, p.Price, p.Brackets.TakeProfit, p.Brackets.StopLoss, p.Crypto, o.ID),
-		})
-		x.journalFill(o)
+		}
+		if score > 0 {
+			sc := score
+			rec.Confidence = &sc
+		}
+		_ = x.Journal.Append(rec)
+		x.journalFill(o, score)
 	}
 	if p.Crypto {
 		if err := x.State.SetLevel(PositionLevels{
@@ -144,10 +149,30 @@ func (x *Executor) ExecuteEntry(ctx context.Context, p EntryPlan, conf float64) 
 	return nil
 }
 
+// entryScoreOf picks the number to journal as the decision's score. The
+// plan's own composite is the honest answer; the gate confidence is the
+// fallback for callers that have no factor score (an LLM proposal, whose
+// confidence IS its score). Zero when neither exists, so an unattributed
+// fill stays unattributed instead of silently counting as a 1.00 entry.
+func entryScoreOf(planScore, conf float64) float64 {
+	if planScore > 0 {
+		return planScore
+	}
+	if conf > 0 && conf < 1 {
+		return conf
+	}
+	return 0
+}
+
 // journalFill records a filled order in the trade log. The auto loop
 // placed orders but never wrote fill records, so the drawdown halts saw
 // a realized P/L of zero forever and the stats ledger never populated.
-func (x *Executor) journalFill(o *tools.Order) {
+//
+// entryScore rides on the record as its confidence. Without it the
+// ledger knows a trade won or lost but not what number the bot acted
+// on, so no score -> outcome relationship can ever be measured and the
+// learner has nothing to calibrate against.
+func (x *Executor) journalFill(o *tools.Order, entryScore float64) {
 	if x.Journal == nil || o == nil {
 		return
 	}
@@ -158,7 +183,7 @@ func (x *Executor) journalFill(o *tools.Order) {
 	if price == "" || price == "0" {
 		return
 	}
-	_ = x.Journal.Append(pnl.Record{
+	rec := pnl.Record{
 		Kind:    pnl.KindFill,
 		OrderID: o.ID,
 		Symbol:  o.Symbol,
@@ -167,7 +192,12 @@ func (x *Executor) journalFill(o *tools.Order) {
 		Price:   price,
 		Status:  o.Status,
 		TS:      time.Now().UTC(),
-	})
+	}
+	if entryScore > 0 {
+		sc := entryScore
+		rec.Confidence = &sc
+	}
+	_ = x.Journal.Append(rec)
 }
 
 // ExecuteOptionEntry places a deep-ITM call entry through the SAME risk
@@ -217,12 +247,21 @@ func (x *Executor) ExecuteOptionEntry(ctx context.Context, leg *OptionLeg, conf 
 	x.log().Printf("[strategy] OPTION ENTRY %s x%d premium=%.2f/contract outlay=%.2f order=%s",
 		leg.OCC, leg.Contracts, leg.Premium, outlay, o.ID)
 	if x.Journal != nil {
-		_ = x.Journal.Append(pnl.Record{
+		score := entryScoreOf(leg.Score, conf)
+		rec := pnl.Record{
 			Kind: pnl.KindDecision, Source: "strategy:auto", Risk: "APPROVED",
-			Confidence: &conf,
 			Detail: fmt.Sprintf("option-entry %s x%d premium=%.2f outlay=%.2f order=%s",
 				leg.OCC, leg.Contracts, leg.Premium, outlay, o.ID),
-		})
+		}
+		if score > 0 {
+			sc := score
+			rec.Confidence = &sc
+		}
+		_ = x.Journal.Append(rec)
+		// The option fill belongs in the ledger too: an option position is
+		// a trade with an outcome, and excluding it would teach the
+		// learner only about the classes it happened to record.
+		x.journalFill(o, score)
 	}
 	return nil
 }
@@ -312,12 +351,16 @@ func (x *Executor) ExecutePreOrder(ctx context.Context, p EntryPlan, conf float6
 	x.log().Printf("[strategy] PRE-ORDER %s qty=%d @limit %.4f budget=%.2f tp=%.4f sl=%.4f order=%s (resting until open)",
 		p.Symbol, p.Qty, p.Price, p.Budget, p.Brackets.TakeProfit, p.Brackets.StopLoss, o.ID)
 	if x.Journal != nil {
-		_ = x.Journal.Append(pnl.Record{
+		rec := pnl.Record{
 			Kind: pnl.KindDecision, Source: "strategy:auto", Risk: "APPROVED",
-			Confidence: &conf,
 			Detail: fmt.Sprintf("pre-order %s qty=%d limit=%.4f tp=%.4f sl=%.4f order=%s",
 				p.Symbol, p.Qty, p.Price, p.Brackets.TakeProfit, p.Brackets.StopLoss, o.ID),
-		})
+		}
+		if score := entryScoreOf(p.Score, conf); score > 0 {
+			sc := score
+			rec.Confidence = &sc
+		}
+		_ = x.Journal.Append(rec)
 	}
 	return nil
 }
