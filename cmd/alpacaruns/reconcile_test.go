@@ -220,6 +220,8 @@ func TestReconcileRespectsLookback(t *testing.T) {
 	old := fillOrder("o-4", "alp-entry-OLD-1", "AMD", "buy", "4", "200.0", "filled",
 		time.Now().UTC().Add(-(fillLookback + 24*time.Hour)))
 	l, j, _ := newReconcileLoop(t, []map[string]any{old})
+	// Steady state: the first, wide bootstrap window has already been spent.
+	l.fillBackfilled = true
 	n, err := l.reconcileFills(context.Background())
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
@@ -315,5 +317,26 @@ func TestTickRunsReconciliationBeforeTheTradingPass(t *testing.T) {
 	fills, _ := j.Fills(time.Time{})
 	if len(fills) != 1 {
 		t.Fatalf("the tick did not recover the lost fill before trading: %d rows", len(fills))
+	}
+}
+
+// The gap the pass exists to close is usually historical: the fills that
+// were missing on the live account had been accepted weeks before the fix
+// shipped, so a 72-hour window recovered nothing on its own.
+func TestBootstrapPassRecoversOlderFills(t *testing.T) {
+	older := fillOrder("o-9", "alp-entry-OLD-2", "AMD", "buy", "4", "200.0", "filled",
+		time.Now().UTC().Add(-10*24*time.Hour))
+	l, j, _ := newReconcileLoop(t, []map[string]any{older})
+	if n, err := l.reconcileFills(context.Background()); err != nil || n != 1 {
+		t.Fatalf("bootstrap pass recovered n=%d err=%v", n, err)
+	}
+	if !l.fillBackfilled {
+		t.Fatal("a successful pass did not spend the bootstrap window")
+	}
+	if n, _ := l.reconcileFills(context.Background()); n != 0 {
+		t.Fatalf("the wide window was reused: %d", n)
+	}
+	if f, _ := j.Fills(time.Time{}); len(f) != 1 {
+		t.Fatalf("want one recovered fill, got %d", len(f))
 	}
 }

@@ -882,6 +882,14 @@ in this repo has ever been validated out-of-sample); reference-data
 versioning for corporate actions and delistings; per-actor operator
 identity; and pinning the Alpaca MCP server version.
 
+One verified defect is knowingly left open, because fixing it changes halt
+semantics and deserves its own pass: the **daily and weekly drawdown halts
+sum fill cash flow, not realized P/L** (`fillPL` returns `-qty*price` for a
+buy), so deploying cash into a new position reads as a same-day loss. The
+total-drawdown halt is unaffected — it uses marked equity. Until this is
+fixed, a day of heavy entry activity can engage the daily halt without a
+single losing trade.
+
 ---
 
 ## 17. Layout

@@ -31,11 +31,20 @@ import (
 	"github.com/BROCKUGANDA/alpacaruns/tools"
 )
 
-// fillLookback bounds how far the reconciliation reach goes back. Broker
-// history is unlimited; a trading day's worth of orders is not the point
-// of a per-tick pass, and an unbounded read would grow the tick's cost
-// forever as the account ages.
+// fillLookback bounds how far the reconciliation reach goes back on a
+// normal tick. Broker history is unlimited; a trading day's worth of orders
+// is not the point of a per-tick pass, and an unbounded read would grow the
+// tick's cost forever as the account ages.
 const fillLookback = 72 * time.Hour
+
+// firstFillBackfillWindow is the order-history span the FIRST pass scans.
+//
+// It is "everything the broker will return in one page" (zero cutoff), not a
+// date arithmetic guess: the fills that were missing on the live account had
+// been accepted 47 days earlier, so a 30-day window recovered nothing. The
+// pass runs once per start, and the order limit bounds it; later ticks fall
+// back to fillLookback.
+const firstFillBackfillLimit = 500
 
 // fillScanLimit caps the orders inspected per pass.
 const fillScanLimit = 200
@@ -51,7 +60,14 @@ func (l *autoLoop) reconcileFills(ctx context.Context) (int, error) {
 	if l.client == nil || l.journal == nil {
 		return 0, nil
 	}
-	orders, err := l.client.ListRecentOrders(ctx, fillScanLimit)
+	limit := fillScanLimit
+	var cutoff time.Time // zero cutoff = no age filter (bootstrap pass)
+	if l.fillBackfilled {
+		cutoff = time.Now().UTC().Add(-fillLookback)
+	} else {
+		limit = firstFillBackfillLimit
+	}
+	orders, err := l.client.ListRecentOrders(ctx, limit)
 	if err != nil {
 		return 0, fmt.Errorf("list broker orders: %w", err)
 	}
@@ -63,7 +79,6 @@ func (l *autoLoop) reconcileFills(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("read intents: %w", err)
 	}
-	cutoff := time.Now().UTC().Add(-fillLookback)
 
 	written := 0
 	for _, o := range orders {
@@ -89,6 +104,13 @@ func (l *autoLoop) reconcileFills(ctx context.Context) (int, error) {
 		written++
 		filled[o.ID] += oc.delta // so a second row for the same order is right too
 		l.journalReconciled(o, oc.delta)
+	}
+	// The wide window is spent only by a pass that actually read the broker.
+	// A failed lookup returns above, so the bootstrap is retried next tick
+	// rather than silently downgraded to the narrow window.
+	if !l.fillBackfilled {
+		l.fillBackfilled = true
+		log.Printf("[reconcile] bootstrap pass scanned %d broker order(s) and recovered %d fill(s)", len(orders), written)
 	}
 	return written, nil
 }
@@ -116,7 +138,7 @@ func (l *autoLoop) fillDeltaFor(o tools.Order, filled map[string]float64, cutoff
 	if created.IsZero() {
 		created = o.CreatedAt
 	}
-	if !created.IsZero() && created.Before(cutoff) {
+	if !cutoff.IsZero() && !created.IsZero() && created.Before(cutoff) {
 		return openFill{}, nil // outside the lookback: not this pass's job
 	}
 	price := strings.TrimSpace(o.FilledAvgPrice)

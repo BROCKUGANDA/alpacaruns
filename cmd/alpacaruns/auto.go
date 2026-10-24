@@ -63,6 +63,10 @@ type autoLoop struct {
 	// overridesAt is the mtime of the dashboard's config-overrides file
 	// when it was last applied, so the file is re-read only when it changes.
 	overridesAt time.Time
+	// fillBackfilled is set once a reconciliation pass has actually read the
+	// broker, which is what downgrades the first-pass wide window to the
+	// per-tick one.
+	fillBackfilled bool
 	// ensemble is non-nil only when ENSEMBLE_ENABLED=true; nil keeps the
 	// original single-expert tick path bit-for-bit.
 	ensemble *ensemble.Runner
