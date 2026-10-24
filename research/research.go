@@ -118,12 +118,25 @@ type Fold struct {
 	Metrics Metrics   `json:"metrics"`
 }
 
+// Diagnostics explains a result, particularly a zero-trade one: how many
+// bars were scored, how many failed each gate, and whether the scorer
+// errored. "No trades" and "the replay never ran" must not look the same.
+type Diagnostics struct {
+	BarsScored    int `json:"bars_scored"`
+	ScoreErrors   int `json:"score_errors"`
+	BelowMinScore int `json:"below_min_score"`
+	TrendGate     int `json:"failed_trend_gate"`
+	MomentumGate  int `json:"failed_momentum_gate"`
+	Entries       int `json:"entries"`
+}
+
 // Report is the whole experiment.
 type Report struct {
-	From    time.Time `json:"from"`
-	To      time.Time `json:"to"`
-	Folds   []Fold    `json:"folds"`
-	Overall Metrics   `json:"overall"`
+	From    time.Time   `json:"from"`
+	To      time.Time   `json:"to"`
+	Folds   []Fold      `json:"folds"`
+	Overall Metrics     `json:"overall"`
+	Diag    Diagnostics `json:"diagnostics"`
 	// Notes state what the numbers do NOT prove, so a reader is not left to
 	// infer that a backtest is evidence of future returns.
 	Notes []string `json:"notes"`
@@ -148,16 +161,18 @@ func Run(bars map[string][]tools.Bar, cfg Config) (Report, error) {
 	folds := splitFolds(cfg.From, cfg.To, cfg.Folds)
 	rep := Report{From: cfg.From, To: cfg.To}
 	var all []Trade
+	diag := Diagnostics{}
 	for i, f := range folds {
 		var trades []Trade
 		for sym, series := range bars {
-			trades = append(trades, replaySymbol(sym, series, f.Start, f.End, cfg)...)
+			trades = append(trades, replaySymbol(sym, series, f.Start, f.End, cfg, &diag)...)
 		}
 		sort.Slice(trades, func(a, b int) bool { return trades[a].EntryAt.Before(trades[b].EntryAt) })
 		all = append(all, trades...)
 		rep.Folds = append(rep.Folds, Fold{Index: i, Start: f.Start, End: f.End, Trades: trades, Metrics: summarise(trades)})
 	}
 	rep.Overall = summarise(all)
+	rep.Diag = diag
 	rep.Notes = []string{
 		"Walk-forward folds are reported separately; a rule that only worked in one fold is not a rule.",
 		"Signals execute at the NEXT bar's open; a bar that covers both stop and target is booked as a stop.",
@@ -212,7 +227,7 @@ func splitFolds(from, to time.Time, n int) []fold {
 
 // replaySymbol walks one series. Signals are computed on bars[:i+1] and acted
 // on at bars[i+1].Open.
-func replaySymbol(sym string, series []tools.Bar, from, to time.Time, cfg Config) []Trade {
+func replaySymbol(sym string, series []tools.Bar, from, to time.Time, cfg Config, diag *Diagnostics) []Trade {
 	if len(series) < factors.MinBarsForScore+1 {
 		return nil
 	}
@@ -231,7 +246,7 @@ func replaySymbol(sym string, series []tools.Bar, from, to time.Time, cfg Config
 
 	for i := factors.MinBarsForScore - 1; i < len(sorted)-1; i++ {
 		bar := sorted[i]
-		at := time.Unix(bar.Time, 0).UTC()
+		at := bar.At()
 		if at.Before(from) {
 			continue
 		}
@@ -262,7 +277,7 @@ func replaySymbol(sym string, series []tools.Bar, from, to time.Time, cfg Config
 				// at the next open — identical to the live rule.
 				res, err := factors.ScoreBars(sym, sorted[:i+1], cfg.Weights, cfg.FactorOptions, nil)
 				if err == nil && (res.Composite <= cfg.Strategy.ExitCompos || factorScore(res, "momentum") <= cfg.Strategy.ExitMomentum) {
-					out = append(out, closeTrade(sym, pos.entry, next.Open, pos.at, time.Unix(next.Time, 0).UTC(), pos.score, "signal", held, cfg))
+					out = append(out, closeTrade(sym, pos.entry, next.Open, pos.at, next.At(), pos.score, "signal", held, cfg))
 					pos = nil
 				}
 			}
@@ -273,12 +288,24 @@ func replaySymbol(sym string, series []tools.Bar, from, to time.Time, cfg Config
 			continue
 		}
 		res, err := factors.ScoreBars(sym, sorted[:i+1], cfg.Weights, cfg.FactorOptions, nil)
-		if err != nil || res.Composite < cfg.Strategy.MinScore {
+		if err != nil {
+			diag.ScoreErrors++
 			continue
 		}
-		if factorScore(res, "trend") < cfg.Strategy.TrendBuy || factorScore(res, "momentum") < cfg.Strategy.MomentumBuy {
+		diag.BarsScored++
+		if res.Composite < cfg.Strategy.MinScore {
+			diag.BelowMinScore++
 			continue
 		}
+		if factorScore(res, "trend") < cfg.Strategy.TrendBuy {
+			diag.TrendGate++
+			continue
+		}
+		if factorScore(res, "momentum") < cfg.Strategy.MomentumBuy {
+			diag.MomentumGate++
+			continue
+		}
+		diag.Entries++
 		next := sorted[i+1]
 		entry := next.Open
 		if entry <= 0 {
@@ -288,7 +315,7 @@ func replaySymbol(sym string, series []tools.Bar, from, to time.Time, cfg Config
 			entry: entry,
 			tp:    entry * (1 + cfg.Strategy.TPPct),
 			sl:    entry * (1 - cfg.Strategy.SLPct),
-			at:    time.Unix(next.Time, 0).UTC(),
+			at:    next.At(),
 			// The position is held from the execution bar onward.
 			barIndex: i + 1,
 			score:    res.Composite,

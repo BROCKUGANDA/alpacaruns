@@ -154,6 +154,17 @@ func printReport(rep research.Report, cfg research.Config, syms []string) {
 		"ALL", o.Trades, 100*o.WinRate, o.NetPL, 100*o.ExpectancyPct, o.Costs, 100*o.MaxDrawdownPct)
 	fmt.Printf("return on staked capital: %.2f%%   gross %.2f, costs %.2f, net %.2f\n",
 		100*o.NetReturnPct, o.GrossPL, o.Costs, o.NetPL)
+	// Explain a zero-trade result before the caveats: "the rule found nothing"
+	// and "the replay never scored a bar" look identical in the table.
+	d := rep.Diag
+	fmt.Printf("diagnostics: scored=%d entries=%d | below floor=%d, trend gate=%d, momentum gate=%d, scorer errors=%d\n",
+		d.BarsScored, d.Entries, d.BelowMinScore, d.TrendGate, d.MomentumGate, d.ScoreErrors)
+	if d.BarsScored == 0 {
+		fmt.Println("  WARNING: no bar was ever scored — a data or warm-up problem, not a verdict on the rule")
+	}
+	if d.Entries == 0 && d.BarsScored > 0 {
+		fmt.Println("  reading: the rule is too selective to fire on this universe/period; that is a result, not a bug")
+	}
 	for _, n := range rep.Notes {
 		fmt.Println("  note:", n)
 	}

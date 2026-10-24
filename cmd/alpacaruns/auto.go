@@ -1742,6 +1742,11 @@ func (l *autoLoop) recordReferenceData(reg *picker.Registry) {
 	snap := refdata.Build(reg.Instruments(), time.Now())
 	snap.Version = prev.Version + 1
 	changes := refdata.Diff(prev, snap)
+	if prev.Version == 0 {
+		// First snapshot is a baseline, not a list of new listings.
+		changes = nil
+		log.Printf("[refdata] baseline recorded: %d symbols", len(snap.Assets))
+	}
 	for _, c := range changes {
 		log.Printf("[refdata] %s %s: %s", c.Kind, c.Symbol, c.Detail)
 		_ = l.journal.Append(pnl.Record{

@@ -346,12 +346,22 @@ func (b *Bar) UnmarshalJSON(data []byte) error {
 		var s string
 		if err := json.Unmarshal(a.T, &s); err == nil {
 			if ts, err := time.Parse(time.RFC3339Nano, s); err == nil {
-				b.Time = ts.UnixNano()
+				// SECONDS, always. This used to store UnixNano, so every
+				// consumer that did time.Unix(b.Time, 0) read a timestamp in
+				// the year 57 billion: freshness checks saw a negative age and
+				// never fired, and a replay filtered every bar out of its
+				// window. One unit, normalised here at the boundary.
+				b.Time = ts.Unix()
 			}
 		}
 	} else if len(a.T) > 0 {
 		var n int64
 		if err := json.Unmarshal(a.T, &n); err == nil {
+			// Numeric stamps arrive in seconds or nanoseconds depending on the
+			// feed. Anything past ~1973 in nanoseconds is unmistakable.
+			if n > 1e15 {
+				n /= 1e9
+			}
 			b.Time = n
 		}
 	}
@@ -364,6 +374,10 @@ func (b *Bar) UnmarshalJSON(data []byte) error {
 	}
 	return nil
 }
+
+// At returns the bar's timestamp. Bar.Time is Unix SECONDS by contract (see
+// UnmarshalJSON); this helper exists so callers do not have to remember that.
+func (b Bar) At() time.Time { return time.Unix(b.Time, 0).UTC() }
 
 type barsResponse struct {
 	Bars map[string][]Bar `json:"bars"`

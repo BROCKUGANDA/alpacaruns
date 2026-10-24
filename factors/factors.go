@@ -217,13 +217,16 @@ func ScoreBars(symbol string, daily []tools.Bar, weights map[string]float64, opt
 func barFreshnessWindow(timeframe string) time.Duration {
 	switch strings.ToLower(strings.TrimSpace(timeframe)) {
 	case "", "1day", "1d", "day":
-		return 96 * time.Hour
+		// Five days: a long weekend plus a holiday closure can leave the last
+		// bar ~120h old without anything being wrong. The defect this guards
+		// against was a three-week-old close, not a four-day break.
+		return 120 * time.Hour
 	case "1hour", "60min", "1h":
 		return 6 * time.Hour
 	case "15min", "5min", "1min":
 		return 2 * time.Hour
 	}
-	return 96 * time.Hour
+	return 120 * time.Hour
 }
 
 // checkBarFreshness refuses a series whose newest bar is too old to trade
@@ -236,7 +239,7 @@ func checkBarFreshness(symbol string, bars []tools.Bar, timeframe string) error 
 	if stamp <= 0 {
 		return fmt.Errorf("factor scoring %s: newest bar has no timestamp", symbol)
 	}
-	newest := time.Unix(stamp, 0).UTC()
+	newest := time.Unix(stamp, 0).UTC() // Bar.Time is Unix seconds (tools.Bar.At)
 	if age := time.Since(newest); age > barFreshnessWindow(timeframe) {
 		return fmt.Errorf("factor scoring %s: newest %s bar is %s old (limit %s); refusing to score stale data",
 			symbol, orNone(timeframe), age.Round(time.Minute), barFreshnessWindow(timeframe))

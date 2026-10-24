@@ -368,7 +368,7 @@ func (e *Engine) PlanEntryFromReference(ctx context.Context, d Decision, portfol
 	if stamp <= 0 {
 		return EntryPlan{}, fmt.Errorf("reference price %s: last daily bar has no timestamp", d.Symbol)
 	}
-	if age := time.Since(time.Unix(stamp, 0)); age > 7*24*time.Hour {
+	if age := time.Since(bs[len(bs)-1].At()); age > 7*24*time.Hour {
 		return EntryPlan{}, fmt.Errorf("reference price %s: last daily bar is %s old; refusing to anchor a pre-order on it",
 			d.Symbol, age.Round(time.Hour))
 	}
