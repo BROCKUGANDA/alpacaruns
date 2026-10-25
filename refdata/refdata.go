@@ -58,13 +58,31 @@ const (
 	Disappeared  ChangeKind = "disappeared"
 	Tradability  ChangeKind = "tradability"
 	ClassChanged ChangeKind = "class_changed"
+	// Renamed means the broker kept the same asset identity under a new
+	// ticker. It is the one corporate-action change that can be established
+	// from broker data alone, because AssetID is stable across the rename.
+	Renamed ChangeKind = "renamed"
 )
 
 // Change is one difference, with enough detail to act on.
 type Change struct {
 	Kind   ChangeKind `json:"kind"`
 	Symbol string     `json:"symbol"`
-	Detail string     `json:"detail"`
+	// NewSymbol is set for a rename: the ticker the same asset now trades
+	// under.
+	NewSymbol string `json:"new_symbol,omitempty"`
+	Detail    string `json:"detail"`
+}
+
+// renames maps asset id to symbol for entries that carry an id.
+func renames(s Snapshot) map[string]string {
+	out := map[string]string{}
+	for sym, e := range s.Assets {
+		if e.AssetID != "" {
+			out[e.AssetID] = sym
+		}
+	}
+	return out
 }
 
 // Build observations the snapshot from the classified universe.
@@ -72,6 +90,7 @@ func Build(insts []picker.Instrument, now time.Time) Snapshot {
 	assets := make(map[string]Entry, len(insts))
 	for _, i := range insts {
 		assets[i.Symbol] = Entry{
+			AssetID:    i.AssetID,
 			Name:       i.Name,
 			Class:      string(i.Class),
 			Exchange:   i.Exchange,
@@ -84,8 +103,37 @@ func Build(insts []picker.Instrument, now time.Time) Snapshot {
 }
 
 // Diff reports what changed between two snapshots, in a stable order.
+//
+// Renames are detected first: an asset id present in both snapshots under
+// different tickers is the same instrument renamed, which is broker fact
+// rather than an inference. The moved symbol is then excluded from the
+// appeared/disappeared lists, because "OLD vanished and NEW showed up" and
+// "OLD is now NEW" are different facts and only the second one lets a
+// position's protection follow the instrument.
 func Diff(prev, next Snapshot) []Change {
 	var out []Change
+	renamedFrom := map[string]bool{}
+	prevIDs, nextIDs := renames(prev), renames(next)
+	ids := make([]string, 0, len(prevIDs))
+	for id := range prevIDs {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		oldSym, ok := prevIDs[id]
+		if !ok {
+			continue
+		}
+		newSym, still := nextIDs[id]
+		if !still || newSym == oldSym {
+			continue
+		}
+		renamedFrom[oldSym] = true
+		out = append(out, Change{Kind: Renamed, Symbol: oldSym, NewSymbol: newSym,
+			Detail: fmt.Sprintf("same asset id %s now trades as %s; levels and protection should follow", id, newSym)})
+		// The new ticker is not "new": it is the same instrument.
+		prev.Assets[newSym] = prev.Assets[oldSym]
+	}
 	syms := make([]string, 0, len(prev.Assets)+len(next.Assets))
 	seen := map[string]bool{}
 	for s := range prev.Assets {
@@ -105,6 +153,10 @@ func Diff(prev, next Snapshot) []Change {
 		before, had := prev.Assets[s]
 		after, has := next.Assets[s]
 		switch {
+		case had && !has && renamedFrom[s]:
+			// The old ticker of a rename: reported as Renamed above, not as
+			// a disappearance.
+			continue
 		case had && !has:
 			out = append(out, Change{Kind: Disappeared, Symbol: s,
 				Detail: "no longer present in the broker's catalogue (delisted, renamed, or removed); any stored levels for it are orphaned"})

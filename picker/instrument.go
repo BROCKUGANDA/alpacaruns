@@ -61,6 +61,10 @@ type Instrument struct {
 	// Symbol is the venue symbol: "AAPL", "SPY", "BTC/USD" or an OCC
 	// contract symbol such as "AAPL260116C00150000".
 	Symbol string `json:"symbol"`
+	// AssetID is the broker's stable identifier for the instrument. It
+	// survives a ticker change, which is what makes a rename detectable
+	// from broker data instead of guessed from a name similarity.
+	AssetID string `json:"asset_id,omitempty"`
 	// Class is the asset class.
 	Class Class `json:"class"`
 	// Family is the market-data endpoint family.
@@ -288,6 +292,7 @@ func BuildWithCatalogue(catalogue map[string]tools.Asset, spec Spec) *Registry {
 			inst.Family = FamilyStocks
 		}
 		if a, ok := catalogue[strings.ToUpper(sym)]; ok {
+			inst.AssetID = a.ID
 			inst.Exchange = a.Exchange
 			inst.Name = a.Name
 			inst.Tradable = a.Tradable

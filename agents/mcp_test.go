@@ -96,3 +96,28 @@ func TestIsPaperVenue(t *testing.T) {
 		t.Fatal("live base URL must not map to the paper venue")
 	}
 }
+
+// A model cannot self-certify a trade. Claiming perfect confidence caps at
+// the deterministic score; with no score at all, the order is refused.
+func TestReconcileConfidenceCapsAndRefuses(t *testing.T) {
+	f := func(v float64) *float64 { return &v }
+
+	conf, capped, refused := reconcileConfidence(f(1.0), f(0.42))
+	if refused || !capped || conf == nil || *conf != 0.42 {
+		t.Fatalf("a 1.0 claim was not capped at the deterministic 0.42: conf=%v capped=%v refused=%v", conf, capped, refused)
+	}
+	// Lowering its own confidence is the model's business.
+	conf, capped, refused = reconcileConfidence(f(0.3), f(0.42))
+	if refused || capped || conf == nil || *conf != 0.3 {
+		t.Fatalf("a lower self-assessment should stand: conf=%v capped=%v refused=%v", conf, capped, refused)
+	}
+	// No claim: the deterministic score stands in.
+	conf, capped, refused = reconcileConfidence(nil, f(0.55))
+	if refused || capped || conf == nil || *conf != 0.55 {
+		t.Fatalf("missing claim should inherit the score: conf=%v", conf)
+	}
+	// No corroboration: refuse, whatever the model claims.
+	if _, _, refused = reconcileConfidence(f(0.99), nil); !refused {
+		t.Fatal("an order with no deterministic score was allowed through")
+	}
+}

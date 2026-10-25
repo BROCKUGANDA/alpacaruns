@@ -112,6 +112,18 @@ func (s *Server) actorFor(r *http.Request) string {
 	if !ok {
 		return ""
 	}
+	// A provider-issued JWT is tried first when OIDC is configured. The
+	// static tokens below are then only reachable by a token that is not
+	// JWT-shaped — a deliberate downgrade path for bootstrapping, not a
+	// fallback that makes OIDC bypassable by a malformed JWT.
+	if s.oidc != nil && strings.Count(got, ".") == 2 {
+		if who, err := s.oidc.Verify(r.Context(), got); err == nil {
+			return "oidc:" + who
+		} else {
+			log.Printf("[api] OIDC token rejected: %v", err)
+			return ""
+		}
+	}
 	if want := strings.TrimSpace(s.settings.AuthToken); want != "" &&
 		subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1 {
 		return "operator"

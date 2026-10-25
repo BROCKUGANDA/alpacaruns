@@ -917,27 +917,49 @@ A cut-over that moved the live monitor onto a schema change in one commit
 would have put position protection on the critical path of a migration; this
 does not.
 
+### Identity, renames, and what a model is allowed to do
+
+**Operators can authenticate with an identity provider.** With
+`OIDC_ISSUER`, `OIDC_AUDIENCE` and `OIDC_JWKS_URL` set, the control endpoints
+accept an RS256 JWT and record its `email` as the actor. The verifier allows
+exactly one algorithm ("none" and HMAC are refused by name — the alg-confusion
+attack in one check), verifies the signature against the provider's published
+keys (cached, refreshed once on an unknown `kid`), and enforces issuer,
+audience and expiry. `DASHBOARD_TOKENS` remains for bootstrap; a token that
+looks like a JWT never falls through to a static comparison. What this does
+NOT do is authorisation: holding a valid token is the whole check, and mapping
+provider groups to roles is an operator decision.
+
+**Renames are broker fact, not a guess.** The asset catalogue carries a stable
+`asset_id` that survives a ticker change, so the reference-data snapshot can
+say "asset X was `FB` and is now `META`" — and the bot moves the stored TP/SL
+levels to the new ticker before anything else runs, instead of silently
+leaving the stop attached to a symbol the broker no longer knows. A true
+disappearance (delisting, merger out) is still only reported: mapping it to a
+successor needs an external source, and inventing the link would move
+protection to the wrong instrument.
+
+**A model cannot self-certify a trade.** The MCP guard caps a proposal's
+claimed confidence at the deterministic factor composite — the model may be
+more cautious than the evidence, never more confident — and refuses an order
+outright when no deterministic score is available to corroborate it. Prompt
+injection is still possible; a persuaded model can pick the wrong instrument
+among eligible ones. It cannot manufacture eligibility, exceed the caps, or
+place anything the gate did not approve.
+
 ### What is still open
 
-- **Replace / cancel-replace chains — measured as unavailable.** `PATCH
-  /v2/orders/{id}` returns `422 "cannot replace order in accepted status"` on
-  this venue for our resting orders, which stay in `accepted`. The bot
-  continues to cancel-and-place, which is the only path the broker allows;
-  the replacement lineage fields Alpaca returns are mirrored when present.
-- **Renames and mergers.** Tradability flips and disappearances are now
-  recorded in versioned snapshots (`data/refdata.json`) and journaled as
-  `refdata:*` events, but mapping an old ticker to a new one needs an
-  external source. Guessing would move protection to the wrong instrument.
-- **Per-actor identity is named, not federated.** `DASHBOARD_TOKENS=alice:…`
-  gives attribution and per-name revocation; there is no SSO and one
-  credential per operator is still a static secret.
-- **Prompt injection is bounded, not solved** — untrusted text is enveloped,
-  length-capped and flagged (`agents.WrapUntrusted`), and the deterministic
-  path never consumes prose. A model can still be persuaded by well-formed
-  data; the mitigation is that no agent output can place an order.
-- **No out-of-sample evidence yet.** The harness exists; running it on the
-  shipped thresholds and reporting the result honestly is the next step, and
-  a losing result is a valid outcome.
+- **Mergers and delistings by succession.** A merge that retires one asset id
+  in favour of another cannot be derived from the catalogue; it is reported
+  and left to an operator.
+- **Authorisation, not just authentication.** Roles and per-action scopes are
+  not modelled; a valid operator token can use every control endpoint.
+- **Intraday evidence.** The harness runs on daily bars. Everything it cannot
+  see — intraday path, borrow, partial fills, market impact — is stated in the
+  report rather than modelled.
+- **Parameter search.** The registry flags repeated parameter sets but nothing
+  stops an operator from searching; a deflated-Sharpe style correction is not
+  implemented.
 
 ---
 

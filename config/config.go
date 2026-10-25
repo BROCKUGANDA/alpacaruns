@@ -49,6 +49,13 @@ type Config struct {
 	// named tokens give attribution in the journal and per-name revocation.
 	// DASHBOARD_TOKEN remains supported as the unnamed fallback.
 	DashboardTokens map[string]string
+	// OIDC lets operators present a token from an identity provider instead
+	// of a static secret. All three are required together: an issuer with no
+	// audience cannot be verified, and a key URL with no issuer would accept
+	// tokens minted for someone else.
+	OIDCIssuer   string
+	OIDCAudience string
+	OIDCJWKSURL  string
 	// MirrorEnabled keeps a verified SQLite mirror of the journal and state
 	// next to them. The files remain the write path; see package store.
 	MirrorEnabled        bool
@@ -214,6 +221,18 @@ func Load(envFile string) (*Config, error) {
 		return nil, err
 	}
 	c.DashboardTokens = tokens
+	c.OIDCIssuer = strings.TrimSpace(getEnv("OIDC_ISSUER", ""))
+	c.OIDCAudience = strings.TrimSpace(getEnv("OIDC_AUDIENCE", ""))
+	c.OIDCJWKSURL = strings.TrimSpace(getEnv("OIDC_JWKS_URL", ""))
+	set := 0
+	for _, v := range []string{c.OIDCIssuer, c.OIDCAudience, c.OIDCJWKSURL} {
+		if v != "" {
+			set++
+		}
+	}
+	if set != 0 && set != 3 {
+		return nil, fmt.Errorf("OIDC_ISSUER, OIDC_AUDIENCE and OIDC_JWKS_URL must be set together (got %d of 3)", set)
+	}
 
 	// SQLITE_MIRROR keeps a verified SQLite mirror of the journal and state
 	// (default on). It is a queryable view, not the write path; set it to

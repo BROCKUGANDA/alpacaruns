@@ -99,3 +99,51 @@ func TestCorruptSnapshotIsAnError(t *testing.T) {
 		t.Fatal("a corrupt snapshot loaded as valid")
 	}
 }
+
+// A ticker change is detectable from broker data because the asset id is
+// stable. It must be reported as a rename — not as one delisting plus one
+// new listing, which would lose the link to the position's protection.
+func TestDiffDetectsRenameByAssetID(t *testing.T) {
+	prev := Build([]picker.Instrument{
+		{Symbol: "FB", Class: "equity", AssetID: "asset-1", Tradable: true},
+		{Symbol: "AAPL", Class: "equity", AssetID: "asset-2", Tradable: true},
+	}, time.Now().Add(-time.Hour))
+	next := Build([]picker.Instrument{
+		{Symbol: "META", Class: "equity", AssetID: "asset-1", Tradable: true},
+		{Symbol: "AAPL", Class: "equity", AssetID: "asset-2", Tradable: true},
+	}, time.Now())
+
+	changes := Diff(prev, next)
+	var renamed *Change
+	for i := range changes {
+		switch changes[i].Kind {
+		case Renamed:
+			renamed = &changes[i]
+		case Disappeared:
+			t.Fatalf("a rename was also reported as a delisting: %s", changes[i].Symbol)
+		case Appeared:
+			t.Fatalf("a rename was also reported as a new listing: %s", changes[i].Symbol)
+		}
+	}
+	if renamed == nil {
+		t.Fatalf("rename not detected: %+v", changes)
+	}
+	if renamed.Symbol != "FB" || renamed.NewSymbol != "META" {
+		t.Fatalf("wrong rename: %+v", renamed)
+	}
+	if renamed.Detail == "" {
+		t.Fatal("rename carried no explanation")
+	}
+}
+
+// Without an asset id the two events are genuinely indistinguishable, and the
+// honest answer is still "disappeared + appeared" rather than a guessed pair.
+func TestNoRenameWithoutAssetID(t *testing.T) {
+	prev := Build([]picker.Instrument{{Symbol: "OLD", Class: "equity"}}, time.Now().Add(-time.Hour))
+	next := Build([]picker.Instrument{{Symbol: "NEW", Class: "equity"}}, time.Now())
+	for _, c := range Diff(prev, next) {
+		if c.Kind == Renamed {
+			t.Fatalf("invented a rename with no stable id: %+v", c)
+		}
+	}
+}

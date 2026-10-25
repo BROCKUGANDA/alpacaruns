@@ -41,11 +41,11 @@ type Server struct {
 	limiter *RateLimiter
 
 	// Shared atomic counters (cross-request, no lock needed).
-	startTime   time.Time
-	lastPollTS  atomic.Int64 // unix nanos of the most recent bot tick stamp (best-effort)
-	tickNumber  atomic.Int64 // monotonically increasing tick observed by this server
-	pauseFlag   atomic.Bool  // mirror of data/paused (we also re-read on every request)
-	lastError   atomic.Value // string
+	startTime  time.Time
+	lastPollTS atomic.Int64 // unix nanos of the most recent bot tick stamp (best-effort)
+	tickNumber atomic.Int64 // monotonically increasing tick observed by this server
+	pauseFlag  atomic.Bool  // mirror of data/paused (we also re-read on every request)
+	lastError  atomic.Value // string
 
 	// Coordination.
 	wg sync.WaitGroup
@@ -63,6 +63,9 @@ type Server struct {
 
 	// catalogue is the broker's cached asset catalogue (guarded by
 	// cfgMu) and catalogueAt is when it was fetched.
+	// oidc verifies provider-issued bearer tokens. nil when not configured.
+	oidc *oidcVerifier
+
 	catalogue   map[string]tools.Asset
 	catalogueAt time.Time
 }
@@ -170,6 +173,13 @@ func New(cfg *config.Config, client *tools.Client, set ServerSettings, strat *st
 		limiter:   NewRateLimiter(60, 60*time.Second),
 		startTime: time.Now(),
 	}
+	if cfg != nil {
+		oc := OIDCConfig{Issuer: cfg.OIDCIssuer, Audience: cfg.OIDCAudience, JWKSURL: cfg.OIDCJWKSURL}
+		if oc.Enabled() {
+			s.oidc = newOIDCVerifier(oc)
+			log.Printf("[api] OIDC enabled: issuer=%s audience=%s", oc.Issuer, oc.Audience)
+		}
+	}
 	s.a2aCfg = a2aConfig(cfg)
 	s.bridge = a2a.NewBridge(s.a2aCfg, a2a.NewStore(set.TradeLog))
 	s.refreshPauseFlag()
@@ -213,13 +223,13 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/favicon.ico", brandingAlias("favicon.ico"))
 	mux.HandleFunc("/apple-touch-icon.png", brandingAlias("favicon.png"))
 	mux.HandleFunc("/api/health", s.handleHealth)
-		mux.HandleFunc("/api/status", s.handleStatus)
-		mux.HandleFunc("/api/account", s.handleAccount)
-		mux.HandleFunc("/api/pnl", s.handlePnL)
-		mux.HandleFunc("/api/trades", s.handleTrades)
-		mux.HandleFunc("/api/decisions", s.handleDecisions)
-		mux.HandleFunc("/api/positions", s.handlePositions)
-		mux.HandleFunc("/api/config", s.handleConfigRouter)
+	mux.HandleFunc("/api/status", s.handleStatus)
+	mux.HandleFunc("/api/account", s.handleAccount)
+	mux.HandleFunc("/api/pnl", s.handlePnL)
+	mux.HandleFunc("/api/trades", s.handleTrades)
+	mux.HandleFunc("/api/decisions", s.handleDecisions)
+	mux.HandleFunc("/api/positions", s.handlePositions)
+	mux.HandleFunc("/api/config", s.handleConfigRouter)
 	mux.HandleFunc("/api/instruments", s.handleInstruments)
 	mux.HandleFunc("/api/signals", s.handleSignals)
 	mux.HandleFunc("/api/learning", s.handleLearning)
@@ -228,11 +238,11 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/api/a2a/signals", s.handleA2ASignal)
 	mux.HandleFunc("/api/a2a/agents", s.handleA2AAgents)
 	mux.HandleFunc("/api/a2a/agents/{id}/ramp", s.withControlGuard(s.handleA2ARamp))
-		mux.HandleFunc("/api/trade/simulate", s.withControlGuard(s.handleTradeSimulate))
-		mux.HandleFunc("/api/trade/execute", s.withControlGuard(s.handleTradeExecute))
-		mux.HandleFunc("/api/control/pause", s.withControlGuard(s.handleControlPause))
-		mux.HandleFunc("/api/control/resume", s.withControlGuard(s.handleControlResume))
-		mux.HandleFunc("/api/control/step", s.withControlGuard(s.handleControlStep))
+	mux.HandleFunc("/api/trade/simulate", s.withControlGuard(s.handleTradeSimulate))
+	mux.HandleFunc("/api/trade/execute", s.withControlGuard(s.handleTradeExecute))
+	mux.HandleFunc("/api/control/pause", s.withControlGuard(s.handleControlPause))
+	mux.HandleFunc("/api/control/resume", s.withControlGuard(s.handleControlResume))
+	mux.HandleFunc("/api/control/step", s.withControlGuard(s.handleControlStep))
 	// Mount the dashboard last so /api/* wins.
 	ui, err := uiHandler()
 	if err == nil {

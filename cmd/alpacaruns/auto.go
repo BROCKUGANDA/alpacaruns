@@ -1742,6 +1742,16 @@ func (l *autoLoop) recordReferenceData(reg *picker.Registry) {
 	snap := refdata.Build(reg.Instruments(), time.Now())
 	snap.Version = prev.Version + 1
 	changes := refdata.Diff(prev, snap)
+	// A rename is the one corporate action the broker can tell us about:
+	// the same asset id moved to a new ticker. Move the stored levels with
+	// it BEFORE they are reported, so a position's protection follows the
+	// instrument instead of being orphaned under a ticker that no longer
+	// exists.
+	for _, c := range changes {
+		if c.Kind == refdata.Renamed {
+			l.migrateLevels(c.Symbol, c.NewSymbol)
+		}
+	}
 	if prev.Version == 0 {
 		// First snapshot is a baseline, not a list of new listings.
 		changes = nil
@@ -1757,4 +1767,49 @@ func (l *autoLoop) recordReferenceData(reg *picker.Registry) {
 	if _, err := refdata.Save(path, snap); err != nil {
 		log.Printf("[refdata] snapshot not saved: %v", err)
 	}
+}
+
+// migrateLevels moves every stored level from one ticker to another after a
+// broker-confirmed rename, and journals the move.
+//
+// The alternative is worse than it looks: the old level is keyed to a symbol
+// the broker no longer knows, so the monitor silently stops enforcing the
+// stop, and the reconcile pass re-derives a level on the new ticker from the
+// position — losing the operator's intended levels in the process.
+func (l *autoLoop) migrateLevels(oldSym, newSym string) {
+	if l.exec == nil || l.exec.State == nil {
+		return
+	}
+	st, err := l.exec.State.Load()
+	if err != nil {
+		log.Printf("[refdata] %s -> %s: levels unreadable (%v); leaving them", oldSym, newSym, err)
+		return
+	}
+	moved := 0
+	for _, lv := range st.Levels {
+		if lv == nil || !tools.SameSymbol(lv.Symbol, oldSym) {
+			continue
+		}
+		movedTo := *lv
+		movedTo.Symbol = newSym
+		if err := l.exec.State.SetLevel(movedTo); err != nil {
+			log.Printf("[refdata] %s -> %s: could not write the new level (%v)", oldSym, newSym, err)
+			return
+		}
+		if err := l.exec.State.ClearLevelTrack(oldSym, lv.Track); err != nil {
+			log.Printf("[refdata] %s -> %s: old level not cleared (%v)", oldSym, newSym, err)
+		}
+		moved++
+		_ = l.journal.Append(pnl.Record{
+			Kind: pnl.KindDecision, Source: "refdata:renamed", Risk: "HEAL_REQUIRED",
+			Symbol: newSym,
+			Detail: fmt.Sprintf("moved level from %s to %s after a broker-confirmed rename (tp=%.4f sl=%.4f)",
+				oldSym, newSym, lv.TakeProfit, lv.StopLoss),
+		})
+	}
+	if moved == 0 {
+		log.Printf("[refdata] %s is now %s (no stored levels to move)", oldSym, newSym)
+		return
+	}
+	log.Printf("[refdata] %s is now %s: moved %d stored level(s)", oldSym, newSym, moved)
 }

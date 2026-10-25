@@ -236,9 +236,27 @@ func (r *riskGuardedToolset) Tools(ctx agent.ReadonlyContext) ([]tool.Tool, erro
 				inner: tt,
 				run: func(tctx agent.ToolContext, args any) (map[string]any, error) {
 					p := proposalFromArgs(tt.Name(), args)
-					if p.Confidence == nil {
-						p.Confidence = r.deriveConfidence(p.Symbol)
+					// The model's own confidence may LOWER the bar it has to
+					// clear, never raise it. A prompt-injected or simply
+					// overconfident model that claims 1.0 is capped at the
+					// deterministic composite — otherwise persuasion alone
+					// buys the confidence the gate is checking for. With no
+					// deterministic source at all there is nothing to
+					// corroborate the proposal, so it is refused.
+					derived := r.deriveConfidence(p.Symbol)
+					conf, capped, refused := reconcileConfidence(p.Confidence, derived)
+					if refused {
+						r.logf("[risk-gate] %s refused: no deterministic score to corroborate the proposal", p.Symbol)
+						return map[string]any{
+							"blocked": true,
+							"reason":  "refused: no deterministic factor score is available to corroborate this order; the risk gate will not accept a self-reported confidence on its own",
+						}, nil
 					}
+					if capped {
+						r.logf("[risk-gate] %s claimed confidence %.2f capped to the deterministic score %.2f",
+							p.Symbol, *p.Confidence, *conf)
+					}
+					p.Confidence = conf
 					verdict := r.val.Validate(p)
 					r.logf("[risk-gate] %s %v -> %s", tt.Name(), args, verdict.String())
 					if !verdict.Approved {
@@ -466,4 +484,24 @@ func orNoneToolset(s string) string {
 		return "(none)"
 	}
 	return s
+}
+
+// reconcileConfidence decides what the risk gate is allowed to see.
+//
+// The model may be less confident than its deterministic corroboration, never
+// more: a prompt-injected or merely overconfident proposal that claims 1.0 is
+// capped at the composite, so persuasion cannot buy the confidence the gate is
+// checking for. With no deterministic score at all there is nothing to
+// corroborate the order, and it is refused rather than trusted.
+func reconcileConfidence(claimed, derived *float64) (conf *float64, capped, refused bool) {
+	if derived == nil {
+		return nil, false, true
+	}
+	if claimed == nil {
+		return derived, false, false
+	}
+	if *claimed > *derived {
+		return derived, true, false
+	}
+	return claimed, false, false
 }
