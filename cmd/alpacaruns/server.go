@@ -247,6 +247,13 @@ func cmdTrade(args []string) int {
 		Confidence:  &conf,
 		OrderType:   orderType,
 		TimeInForce: tif,
+		// The operator's --extended-hours flag has to reach the gate. Left
+		// out, the gate approved an order shape the broker refuses (a
+		// bracket-class or market-type extended order is a 403/422), so the
+		// approval on screen and the rejection at the wire disagreed by
+		// construction.
+		ExtendedHours: p.extHours,
+		OrderClass:    "simple",
 	})
 	fmt.Printf("risk gate: %s\n", verdict.String())
 	if !verdict.Approved {

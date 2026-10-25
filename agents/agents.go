@@ -118,7 +118,7 @@ func Build(ctx context.Context, cfg *config.Config, log *slog.Logger) (*Graph, e
 	val := &risk.Validator{
 		Cfg:   cfg,
 		Kill:  g.KillSwitch,
-		Clock: marketClock{cfg: cfg},
+		Clock: marketClock(cfg),
 		Portfolio: func() (risk.Portfolio, error) {
 			return accountSnapshot(cfg)
 		},

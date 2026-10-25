@@ -253,6 +253,72 @@ from the audit trail.
 `TPSL_PROTECT_ALL=false` narrows adoption to the configured universe, for
 an operator who wants the bot to leave its own hand trades alone.
 
+### Rest-of-hours trading
+
+`EXTENDED_HOURS=false` by default. The pre-market (04:00–09:30 ET) and
+after-hours (16:00–20:00 ET) sessions are a different market from the one
+the strategy is calibrated in, and the broker lets much less of the bot's
+toolkit into them. Every rule below is a **measured Alpaca refusal**
+(paper API, 2026-10-25), not a house preference:
+
+| Order shape in the extended session | Broker answer |
+|---|---|
+| `limit` + `day`/`gtc` + `extended_hours=true` | accepted, echoes `extended_hours: true` |
+| `order_class=bracket` | **403** `bracket orders do not support extended hours trading` |
+| `order_class=oco` | **403** `oco orders do not support extended hours trading` |
+| `type=market` | **422** `extended hours order must be DAY or GTC limit orders` |
+| `type=stop_limit` | **422** `stop_limit orders are not eligible for extended hours trading` |
+| `time_in_force=ioc` | **422** `ioc orders are only accepted during market hours` |
+| any option with `extended_hours` | refused; options have no extended session |
+
+The bracket refusal is the one with consequences, so it shapes the whole
+feature: **a position opened in the extended session has no broker-side
+stop while it sits there.** Three things follow.
+
+- **Entry is a marketable limit.** It crosses the ask by a 5bps buffer, is
+  re-sized against the price actually paid so the approved dollar budget is
+  the budget spent, and is refused if the live mark has moved more than 1%
+  from the price the plan was sized at. No bracket envelope is sent, so the
+  order is never a 403 waiting to happen.
+- **Protection arrives with the next regular session.** The entry records
+  the strategy's TP/SL in state, and the monitor's protect pass — which
+  already adopts positions the bot did not open — rests the `oco` pair for
+  the open. Measured: protective pairs placed while the market is closed sit
+  in `accepted` and hold the position's shares (`insufficient qty available`
+  on any competing exit), so the pair is in place before the bell.
+- **Exits in that session cross the bid themselves.** A stop breach
+  after-hours is a limit/`day` with `extended_hours=true`, because market
+  and stop orders are refused. The shape is resolved *before* the resting
+  protection is cancelled: an exit that cannot be priced leaves the position
+  exactly as it was, floor intact, rather than stripping its protection to
+  buy a close that never happens.
+
+Between sessions (20:00–04:00, weekends, holidays) nothing acts. The bot
+does not rest a market order for the next open, because the exit path
+cancels protection first — a resting sell would face the opening print with
+no floor. The breach re-triggers inside a session that can execute.
+
+**Freshness is a trade condition, not a nicety.** A snapshot keeps serving
+its last print after the session ends; measured on a Sunday, AAPL's quote
+was Friday 20:00:03Z and 10% wide. So `EXTENDED_HOURS_MAX_QUOTE_AGE_SECONDS`
+bounds the age of the print an entry or exit is priced from, a future-dated
+stamp is refused (negative age would otherwise read as infinitely new), and
+one-sided or crossed touches are refused. `EXTENDED_HOURS_WINDOWS` narrows
+entries away from the first and last minutes of the session, and
+`EXTENDED_HOURS_MAX_SPREAD_BPS` is the session's own liquidity bar —
+config refuses to enable the session with no cap in either key.
+
+**Sessions come from the broker's calendar, not the wall clock.** `/v2/calendar`
+publishes `session_open`/`session_close` per trading day and omits holidays
+entirely, so a market holiday at 05:00 Tuesday is *closed*, where the previous
+weekday guess said *extended*. An unreadable calendar blocks the entry with
+the reason instead of guessing a session, and the risk gate's clock adapter
+now fails closed on an outage — the agent path used to assume "market open".
+
+Crypto is untouched (24/7, no extended session) and the options overlay is
+skipped in this session: an option order placed now can only fill by resting
+until the bell, at a price and time the signal never described.
+
 ---
 
 ## 5. The agent-to-agent bridge
@@ -592,7 +658,10 @@ Every knob lives in `.env`; `.env.example` is the canonical list.
 | `TP_PCT` / `SL_PCT` | `0.08` / `0.04` | Bracket levels |
 | `BRACKET_MODE` | `pct` | `pct` or `atr` |
 | `PRE_ORDERS` | `false` | Queue resting limit/GTC brackets while the market is closed |
-| `EXTENDED_HOURS` | `false` | Allow limit/day|gtc equity orders in the extended session |
+| `EXTENDED_HOURS` | `false` | Trade the pre-market and after-hours sessions (see [Rest-of-hours trading](#rest-of-hours-trading)) |
+| `EXTENDED_HOURS_WINDOWS` | `04:30-09:25,16:05-19:55` | When entries may open in that session (US/Eastern) |
+| `EXTENDED_HOURS_MAX_SPREAD_BPS` | `0` (uses `MAX_SPREAD_BPS`) | Liquidity bar for extended-session entries |
+| `EXTENDED_HOURS_MAX_QUOTE_AGE_SECONDS` | `300` | Older print than this is not a market; entries and exits refuse it |
 
 ### Agent bridge
 
@@ -626,6 +695,11 @@ go run ./cmd/alpacaruns research --symbols SPY,QQQ --from 2024-01-01 --to 2025-0
 
 # mirror: build/verify the SQLite view of the journal + state. Exit 1 if they differ.
 go run ./cmd/alpacaruns mirror
+
+# sessions: what the broker's calendar says the market is doing, and what each
+# symbol's entry route decides. Read-only; the extended-session quote age and
+# spread are printed so a refusal is explainable before the session, not after.
+go run ./cmd/alpacaruns sessions --symbols AAPL,BTC/USD
 ```
 
 `auto` is the recommended entry point. `monitor` (the LLM-gated path),
@@ -985,8 +1059,38 @@ injection is still possible; a persuaded model can pick the wrong instrument
 among eligible ones. It cannot manufacture eligibility, exceed the caps, or
 place anything the gate did not approve.
 
+### Rest-of-hours, measured rather than assumed
+
+Extended-session trading existed as a config key and a client-side check, but
+the shipped path could not reach it: `handleBuy` asked one boolean — open or
+closed — and everything not-open went to a skip or a pre-order. It is now a
+route with four answers (live / extended / pre-order / blocked-with-a-reason),
+resolved from `/v2/calendar` so holidays and half days are what the exchange
+says they are.
+
+Three defects surfaced while building it, each now pinned by a test:
+
+- **The gate never saw the session it was approving.** The dashboard and CLI
+  paths passed `extended_hours` to the broker but not to the proposal they
+  validated, so the approval described a different order than the one sent.
+  The agent path went further and *stamped* `extended_hours=true` onto any
+  limit/day order — including one carrying a bracket, which the broker refuses
+  with a 403 on every attempt.
+- **A future-dated print was read as maximally fresh.** Age was
+  `time.Since(stamp)` compared to a limit, so a stamp ahead of the host clock
+  went negative and passed. Now refused past 15s of skew.
+- **The exit path cancelled protection before it knew it could exit.** An
+  extended exit needs a live quote to price itself, and the old order of
+  operations would clear the position's floor and then fail to place anything.
+  The shape is resolved first now; an unpriceable exit leaves the pair intact.
+
 ### What is still open
 
+- **The gap between an extended fill and its protective pair.** The pair is
+  placed by the next monitor pass and only guards the regular session; a
+  breach outside a session cannot be executed by anyone, so an after-hours
+  position that gaps overnight is met at the open by the stop, at whatever
+  price the open prints.
 - **Mergers and delistings by succession.** A merge that retires one asset id
   in favour of another cannot be derived from the catalogue; it is reported
   and left to an operator.

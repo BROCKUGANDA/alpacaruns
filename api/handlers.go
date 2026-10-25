@@ -1496,44 +1496,20 @@ func (p apiPriceSource) Price(ctx context.Context, symbol string, isOption bool)
 // when the dashboard runs without a broker client.
 const nominalColdStartPrice = 100.0
 
-// marketClock adapts Alpaca's /v2/clock to the risk gate's
-// MarketClock interface. Without it the manual-order path had NO
-// market-hours check at all — a dashboard order could be submitted at
-// 3am and only the broker would refuse it. An unreadable clock fails
-// closed (market considered closed).
+// marketClock returns the gate's market-hours view for the dashboard path.
+// Without it the manual-order path had NO market-hours check at all — a
+// dashboard order could be submitted at 3am and only the broker would refuse
+// it. The session answer comes from /v2/calendar, so holidays and half days
+// are answered the way the venue trades them rather than guessed from the
+// weekday, and an unreadable calendar fails closed.
 func (s *Server) marketClock() risk.MarketClock {
 	if s.client == nil {
 		return nil
 	}
-	return apiClock{client: s.client}
-}
-
-// apiClock reads the Alpaca market clock for the risk gate.
-type apiClock struct{ client *tools.Client }
-
-func (c apiClock) MarketOpen() bool {
-	cl, err := c.client.GetClock(context.Background())
-	if err != nil || cl == nil {
-		return false
-	}
-	return cl.IsOpen
-}
-
-func (c apiClock) SessionOpen(p risk.Proposal) bool {
-	cl, err := c.client.GetClock(context.Background())
-	if err != nil || cl == nil {
-		return false
-	}
-	ts, err := time.Parse(time.RFC3339, cl.Timestamp)
-	if err != nil {
-		return false
-	}
-	return risk.InExtendedSession(ts.Weekday(), ts.Hour(), ts.Minute())
-}
-
-func (c apiClock) SessionKnown() bool {
-	cl, err := c.client.GetClock(context.Background())
-	return err == nil && cl != nil
+	// One calendar cache per server: a manual order asks the gate twice
+	// (regular session, then extended session), and each answer used to cost
+	// its own clock round trip.
+	return risk.SessionClock(s.sessions)
 }
 
 // serverHaltSource is a one-method adapter so the live pause flag

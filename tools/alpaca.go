@@ -634,8 +634,17 @@ type Quote struct {
 	// an RFC3339 string while the crypto feeds return numeric epochs, so
 	// it is decoded through a permissive unmarshaller instead of a plain
 	// int64 field (which failed to decode on every equities response).
+	// Unix SECONDS by contract, normalised in UnmarshalJSON — see Bar.Time
+	// for the failure this prevents.
 	Timestamp int64 `json:"-"`
+	// Tape reports which market state the quote was printed in ("C" =
+	// consolidated). Callers use it to tell a live extended-session quote
+	// from a close-of-session print that is hours old.
+	Tape string `json:"-"`
 }
+
+// At returns the quote timestamp as a time.Time.
+func (q Quote) At() time.Time { return time.Unix(q.Timestamp, 0).UTC() }
 
 // UnmarshalJSON accepts both the RFC3339 string and the numeric epoch
 // forms Alpaca uses for quote timestamps.
@@ -646,6 +655,7 @@ func (q *Quote) UnmarshalJSON(data []byte) error {
 		BidSize  int             `json:"bs"`
 		AskSize  int             `json:"as"`
 		TS       json.RawMessage `json:"t"`
+		Z        string          `json:"z"`
 	}
 	var a alias
 	if err := json.Unmarshal(data, &a); err != nil {
@@ -653,11 +663,16 @@ func (q *Quote) UnmarshalJSON(data []byte) error {
 	}
 	q.BidPrice, q.AskPrice, q.BidSize, q.AskSize = a.BidPrice, a.AskPrice, a.BidSize, a.AskSize
 	q.Timestamp = parseFlexibleTimestamp(a.TS)
+	q.Tape = a.Z
 	return nil
 }
 
 // parseFlexibleTimestamp decodes an Alpaca timestamp that may be an
-// RFC3339 string or a numeric epoch (seconds or nanoseconds).
+// RFC3339 string or a numeric epoch (seconds or nanoseconds). The returned
+// value is always Unix SECONDS: a string stamp used to come back as
+// nanoseconds while a numeric one came back as-is, so any caller doing
+// time.Unix(ts, 0) read the year 57 billion and treated a fresh quote as
+// impossibly old — or a stale one as fresh, depending on the comparison.
 func parseFlexibleTimestamp(raw json.RawMessage) int64 {
 	if len(raw) == 0 {
 		return 0
@@ -668,13 +683,16 @@ func parseFlexibleTimestamp(raw json.RawMessage) int64 {
 			return 0
 		}
 		if ts, err := time.Parse(time.RFC3339Nano, s); err == nil {
-			return ts.UnixNano()
+			return ts.Unix()
 		}
 		return 0
 	}
 	var n int64
 	if err := json.Unmarshal(raw, &n); err != nil {
 		return 0
+	}
+	if n > 1e15 {
+		n /= 1e9
 	}
 	return n
 }
@@ -700,17 +718,51 @@ type Snapshot struct {
 	LatestTradePrice float64 `json:"-"`
 	LatestQuoteBid   float64 `json:"-"`
 	LatestQuoteAsk   float64 `json:"-"`
-	DailyBar         Bar     `json:"dailyBar"`
-	PrevDailyBar     Bar     `json:"prevDailyBar"`
+	// QuoteTS and TradeTS are the print times of those two fields, Unix
+	// seconds. They exist because a snapshot keeps serving its last quote
+	// after the session ends: measured on a Sunday, AAPL's snapshot carried
+	// Friday 20:00:03Z with a 332.01 x 366.97 touch — a 10% "spread". An
+	// age-blind read of that number is either a phantom liquidity wall or,
+	// on a quiet weekday evening, a phantom tight market. Extended-hours
+	// entries and exits must be judged against a stamp, not a price alone.
+	QuoteTS      int64 `json:"-"`
+	TradeTS      int64 `json:"-"`
+	DailyBar     Bar   `json:"dailyBar"`
+	PrevDailyBar Bar   `json:"prevDailyBar"`
+}
+
+// QuoteAge returns how old the snapshot's quote print is. A snapshot with no
+// decodable stamp reports MaxInt so callers that require freshness fail
+// closed instead of reading "0 seconds old".
+func (s Snapshot) QuoteAge(now time.Time) time.Duration {
+	if s.QuoteTS <= 0 {
+		return time.Duration(math.MaxInt64)
+	}
+	return now.Sub(time.Unix(s.QuoteTS, 0).UTC())
+}
+
+// SpreadBps returns the spread at the touch in basis points, or false when
+// the legs are missing or crossed.
+func (s Snapshot) SpreadBps() (float64, bool) {
+	if s.LatestQuoteBid <= 0 || s.LatestQuoteAsk <= 0 || s.LatestQuoteAsk < s.LatestQuoteBid {
+		return 0, false
+	}
+	mid := (s.LatestQuoteBid + s.LatestQuoteAsk) / 2
+	if mid <= 0 {
+		return 0, false
+	}
+	return (s.LatestQuoteAsk - s.LatestQuoteBid) / mid * 10000, true
 }
 
 type rawSnapshotStock struct {
 	LatestTrade struct {
-		P float64 `json:"p"`
+		P  float64         `json:"p"`
+		TS json.RawMessage `json:"t"`
 	} `json:"latestTrade"`
 	LatestQuote struct {
-		BP float64 `json:"bp"`
-		AP float64 `json:"ap"`
+		BP float64         `json:"bp"`
+		AP float64         `json:"ap"`
+		TS json.RawMessage `json:"t"`
 	} `json:"latestQuote"`
 	DailyBar     Bar `json:"dailyBar"`
 	PrevDailyBar Bar `json:"prevDailyBar"`
@@ -722,8 +774,10 @@ func (s *Snapshot) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	s.LatestTradePrice = raw.LatestTrade.P
+	s.TradeTS = parseFlexibleTimestamp(raw.LatestTrade.TS)
 	s.LatestQuoteBid = raw.LatestQuote.BP
 	s.LatestQuoteAsk = raw.LatestQuote.AP
+	s.QuoteTS = parseFlexibleTimestamp(raw.LatestQuote.TS)
 	s.DailyBar = raw.DailyBar
 	s.PrevDailyBar = raw.PrevDailyBar
 	return nil
@@ -836,6 +890,13 @@ type Order struct {
 	// opens exposure it never intended.
 	PositionIntent string    `json:"position_intent"`
 	SubmittedAt    time.Time `json:"submitted_at"`
+	// ExtendedHours is the broker's own answer on whether this order may
+	// execute outside the regular session. The monitor needs it: an
+	// extended-hours entry has no broker-side stop (Alpaca refuses
+	// extended_hours on bracket and OCO orders — measured 403 40310000), so
+	// a position whose only resting orders carry this flag is protected by
+	// the bot, not the exchange.
+	ExtendedHours bool `json:"extended_hours"`
 }
 
 // PlaceOrder submits an order, defaulting time_in_force to gtc when unset.

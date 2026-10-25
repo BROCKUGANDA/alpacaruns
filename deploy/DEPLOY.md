@@ -265,7 +265,10 @@ fills are backfilled into the trade log on the next `pl`/boot.
 |---|---|---|
 | `TRADE_LOG` | `data/trades.jsonl` | JSONL trade log path |
 | `PL_SINCE` | _(all time)_ | default window for `pl` |
-| `EXTENDED_HOURS` | `false` | allow limit/day\|gtc orders during US extended sessions (04:00–20:00 ET weekdays) when market closed |
+| `EXTENDED_HOURS` | `false` | trade the US pre-market and after-hours sessions. Enabling it requires a spread cap (`MAX_SPREAD_BPS` or `EXTENDED_HOURS_MAX_SPREAD_BPS`) or config refuses to load. Positions opened here carry **no broker stop** until the next regular session — Alpaca refuses `extended_hours` on bracket and OCO orders (measured 403) |
+| `EXTENDED_HOURS_WINDOWS` | `04:30-09:25,16:05-19:55` | when entries may open in that session (US/Eastern); narrower than the venue's 04:00–09:30 / 16:00–20:00 on purpose |
+| `EXTENDED_HOURS_MAX_SPREAD_BPS` | `0` (uses `MAX_SPREAD_BPS`) | extended-session liquidity bar; the session is thinner than the one the strategy is calibrated in |
+| `EXTENDED_HOURS_MAX_QUOTE_AGE_SECONDS` | `300` | a snapshot keeps serving its last print after the session ends (measured: a Sunday quote from Friday 20:00:03Z, 10% wide); older than this, entries and exits are refused |
 | `PRE_ORDERS` | `false` | while market closed, queue equity BUYs as resting limit/GTC brackets at the last daily close (one per symbol, deduped against open orders) |
 | `MIN_CONFIDENCE` | `0.7` | validator floor for autonomous entries — must be ≤ the strategy's typical verdict confidence or every entry bounces (ensemble ceiling ≈0.60) |
 | `STREAM_FEED` | `iex` | market-data websocket feed: `iex` (free) or `sip` (paid subscription) |

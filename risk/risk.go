@@ -77,6 +77,14 @@ type Proposal struct {
 	OrderType     string // market | limit | stop | ...
 	TimeInForce   string // day | gtc | ioc | fop | ...
 	ExtendedHours bool   // caller explicitly requested extended hours
+	// OrderClass is the broker class the caller intends to submit: empty or
+	// "simple" for a plain order, "bracket", "oco", or "trail". It exists
+	// because Alpaca refuses extended_hours on bracket and OCO orders at any
+	// hour of any day (measured 403 40310000), so an order that needs
+	// broker-side protection cannot trade the rest-of-hours session — a fact
+	// the executor has to know before it builds the request body, not after
+	// the broker rejects it.
+	OrderClass string
 	// Reducing asserts that this order closes or shrinks exposure the
 	// account already holds rather than creating new exposure. It is not a
 	// permission slip: when set, the validator PROVES it against a live
@@ -261,6 +269,7 @@ func (v *Validator) Validate(p Proposal) Verdict {
 		return Verdict{Approved: false, Reasons: []string{"validator is not configured"}}
 	}
 	isOption := tools.IsOCCSymbol(p.Symbol)
+	isCrypto := tools.IsCryptoSymbol(p.Symbol)
 
 	// 0. Options-specific hard rules, mirroring Alpaca's server-side
 	// validations client-side: no notional sizing, extended_hours must be
@@ -277,6 +286,18 @@ func (v *Validator) Validate(p Proposal) Verdict {
 		}
 	}
 
+	// 0b. An explicitly extended-hours order is checked against the broker's
+	// shape rules whenever the caller asks for the extended session, not only
+	// when the regular market happens to be closed: bracket, OCO, market and
+	// stop orders are refused with extended_hours set at any time of day.
+	// Catching it here is what keeps a doomed order from being retried on
+	// every tick.
+	if p.ExtendedHours && !isOption && !isCrypto {
+		if why := extendedHoursShape(p); why != "" {
+			reasons = append(reasons, why)
+		}
+	}
+
 	// 1. Kill switch: nothing trades while halted — except an order that
 	// reduces risk, which the halt must never block (see Proposal.Reducing).
 	if !p.Reducing && v.Kill != nil && v.Kill.Halted() {
@@ -285,30 +306,27 @@ func (v *Validator) Validate(p Proposal) Verdict {
 
 	// 2. Market hours: refuse orders outside trading sessions. With
 	// EXTENDED_HOURS enabled, limit/day|gtc equity orders are allowed during
-	// the US extended sessions (weekdays 04:00-20:00 ET); options never
-	// trade extended hours. Anything outside that window (weekends) and any
-	isCrypto := tools.IsCryptoSymbol(p.Symbol)
+	// the US extended sessions; options never trade extended hours. Anything
+	// outside that window (weekends, holidays, the gap between the extended
+	// close and the next extended open) fails closed. Options and market-type
+	// orders still fail closed.
 	if v.Clock != nil && !isCrypto && !v.Clock.MarketOpen() {
 		// Crypto trades 24/7 on Alpaca; skip the equity market clock
 		// check entirely for BASE/QUOTE symbols.
-		// weekend; they only execute when the market reopens. Options and
-		// market-type orders still fail closed.
 		if v.Cfg.PreOrders && !isOption && strings.EqualFold(strings.TrimSpace(p.OrderType), "limit") {
 			tif := strings.ToLower(strings.TrimSpace(p.TimeInForce))
 			if tif != "day" && tif != "gtc" {
 				reasons = append(reasons, fmt.Sprintf("pre-orders require time_in_force=day|gtc, got %q", p.TimeInForce))
 			}
 		} else if !isOption && v.Cfg.ExtendedHours && v.Clock.SessionOpen(p) {
-			// Extended session: acceptable for limit day/gtc only.
-			t := strings.ToLower(strings.TrimSpace(p.OrderType))
-			tif := strings.ToLower(strings.TrimSpace(p.TimeInForce))
-			if t != "limit" || (tif != "day" && tif != "gtc") {
-				reasons = append(reasons, fmt.Sprintf(
-					"extended-hours orders must be type=limit with time_in_force=day|gtc, got type=%q tif=%q",
-					p.OrderType, p.TimeInForce))
+			// Extended session: acceptable for limit day/gtc only, and only
+			// for an order that carries no broker-side protection leg — see
+			// extendedHoursShape.
+			if why := extendedHoursShape(p); why != "" {
+				reasons = append(reasons, why)
 			}
 		} else if !isOption && v.Cfg.ExtendedHours && v.Clock.SessionKnown() {
-			reasons = append(reasons, "outside extended-hours window (weekend or closed day)")
+			reasons = append(reasons, "outside extended-hours window (weekend, holiday or closed day)")
 		} else {
 			reasons = append(reasons, "market closed")
 		}
@@ -535,6 +553,11 @@ func parsePositive(s string) float64 {
 // clock timestamp's weekday and wall-clock hour: weekdays 04:00-20:00 ET.
 // Weekends are never open. Used by clock adapters implementing
 // MarketClock.SessionOpen so the window math lives beside the gate.
+//
+// This is an approximation on purpose: it is the fallback for callers that
+// only have the clock. tools.Sessions resolves the same question from the
+// broker's calendar and is correct on holidays and half days; a caller that
+// can reach it should.
 func InExtendedSession(weekday time.Weekday, hour, minute int) bool {
 	switch weekday {
 	case time.Saturday, time.Sunday:
@@ -542,4 +565,59 @@ func InExtendedSession(weekday time.Weekday, hour, minute int) bool {
 	}
 	mins := hour*60 + minute
 	return mins >= 4*60 && mins < 20*60
+}
+
+// SessionClock adapts a calendar-backed session source to MarketClock, so a
+// gate that can reach /v2/calendar stops guessing extended hours from the
+// weekday. Every method fails closed: an unreadable calendar reports a closed
+// market and an unknown session, which is the only safe reading of "we do not
+// know what state the exchange is in".
+func SessionClock(s *tools.Sessions) MarketClock { return sessionClock{sessions: s} }
+
+type sessionClock struct{ sessions *tools.Sessions }
+
+func (c sessionClock) MarketOpen() bool {
+	sess, _, err := c.sessions.Current(context.Background())
+	return err == nil && sess == tools.SessionRegular
+}
+
+func (c sessionClock) SessionOpen(p Proposal) bool {
+	sess, _, err := c.sessions.Current(context.Background())
+	return err == nil && sess.Extended()
+}
+
+func (c sessionClock) SessionKnown() bool {
+	_, _, err := c.sessions.Current(context.Background())
+	return err == nil
+}
+
+// extendedHoursShape returns why an order cannot act in the extended session,
+// or "" when it can. Every clause is a measured broker refusal against the
+// paper API (2026-10-25), not a house style:
+//
+//	order_class=bracket  -> HTTP 403 40310000 "bracket orders do not support extended hours trading"
+//	order_class=oco      -> HTTP 403 40310000 "oco orders do not support extended hours trading"
+//	type=market          -> HTTP 422 42210000 "extended hours order must be DAY or GTC limit orders"
+//	type=stop_limit      -> HTTP 422 42210000 "stop_limit orders are not eligible for extended hours trading"
+//	time_in_force=ioc    -> HTTP 422 42210000 "ioc orders are only accepted during market hours"
+//	type=limit + day|gtc -> accepted, and the response echoes extended_hours=true
+//
+// The bracket and OCO refusals are the ones with consequences: a position
+// entered in the extended session has NO broker-side stop while it is there,
+// because the protection legs themselves cannot be extended-hours orders.
+func extendedHoursShape(p Proposal) string {
+	t := strings.ToLower(strings.TrimSpace(p.OrderType))
+	tif := strings.ToLower(strings.TrimSpace(p.TimeInForce))
+	class := strings.ToLower(strings.TrimSpace(p.OrderClass))
+	if t != "limit" {
+		return fmt.Sprintf("extended-hours orders must be type=limit, got type=%q (the broker refuses every other type outside the regular session)", p.OrderType)
+	}
+	if tif != "day" && tif != "gtc" {
+		return fmt.Sprintf("extended-hours orders require time_in_force=day|gtc, got %q", p.TimeInForce)
+	}
+	switch class {
+	case "bracket", "oco":
+		return fmt.Sprintf("extended-hours orders cannot use order_class=%s: protection legs are refused outside the regular session, so this order would rest with no stop behind it", class)
+	}
+	return ""
 }

@@ -35,6 +35,14 @@ type exitBroker struct {
 	posted      int              // number of POSTs received
 	bodies      []map[string]any // POST bodies, for the status=all listing
 	onPost      func()           // observed at the moment the POST arrives
+	// calendar and snap back the rest-of-hours paths: the session answer
+	// comes from /calendar and an extended order's price from the data
+	// snapshot. Left nil, both endpoints 404, which is the fail-closed case.
+	calendar []map[string]any
+	snap     map[string]any
+	// account overrides the funded-paper account the entry paths check
+	// against; nil means the default above.
+	account map[string]any
 }
 
 func (b *exitBroker) handler(w http.ResponseWriter, r *http.Request) {
@@ -67,6 +75,30 @@ func (b *exitBroker) handler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		_ = json.NewEncoder(w).Encode([]map[string]any{})
+	case r.Method == http.MethodGet && r.URL.Path == "/calendar":
+		if b.calendar == nil {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		b.events = append(b.events, "GET /calendar")
+		_ = json.NewEncoder(w).Encode(b.calendar)
+	case r.Method == http.MethodGet && r.URL.Path == "/account":
+		b.events = append(b.events, "GET /account")
+		if b.account != nil {
+			_ = json.NewEncoder(w).Encode(b.account)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": "paper", "equity": "100000", "portfolio_value": "100000",
+			"buying_power": "100000", "cash": "50000", "status": "ACTIVE",
+		})
+	case r.Method == http.MethodGet && r.URL.Path == "/stocks/snapshots":
+		if b.snap == nil {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		b.events = append(b.events, "GET /stocks/snapshots")
+		_ = json.NewEncoder(w).Encode(map[string]any{stringOr(r.URL.Query().Get("symbols")): b.snap})
 	case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/orders/"):
 		b.events = append(b.events, "DELETE "+strings.TrimPrefix(r.URL.Path, "/orders/"))
 		w.WriteHeader(http.StatusAccepted)

@@ -56,6 +56,16 @@ const usage = `usage: alpacaruns <command> [flags]
            print the option chain with quotes, greeks and implied vol
   factors  [explain SYMBOL] [--env .env]
            list factor weights, or explain one symbol's multi-factor score
+  caps     [--symbols AAPL,...] [--refresh] [--env .env]
+           build data/market-caps.json from SEC EDGAR shares x broker close
+  research [--folds N] [--env .env]
+           walk-forward replay of the rule, with costs; appends the registry
+  mirror   [--verify] [--env .env]
+           refresh the SQLite view of the journal + state, exit 1 on drift
+  sessions [--symbols AAPL,...] [--env .env]
+           report the market session from the broker's calendar and what each
+           symbol's entry route decides (live / extended / pre-order / blocked),
+           with the quote age and spread the extended path would trade against
 `
 
 // run parses the global shape `alpacaruns <subcommand> [flags]` and
@@ -94,6 +104,10 @@ func run(argv []string) int {
 		// `mirror` builds/refreshes the SQLite view and verifies it against
 		// the journal + state. Exit 1 when they disagree.
 		return cmdMirror(rest)
+	case "sessions":
+		// `sessions` reports the session the broker's calendar describes and
+		// what each symbol's entry route decides. Read-only.
+		return cmdSessions(rest)
 	case "serve":
 		// `serve` is the dashboard HTTP API. Reads the same data/
 		// directory the bot writes; never places orders. Documented

@@ -40,10 +40,20 @@ import (
 
 // autoLoop bundles everything one tick needs; explicit for testability.
 type autoLoop struct {
-	cfg        *config.Config
-	set        strategy.Settings
-	engine     *strategy.Engine
-	windows    *strategy.TradingWindows
+	cfg     *config.Config
+	set     strategy.Settings
+	engine  *strategy.Engine
+	windows *strategy.TradingWindows
+	// extWin is the execution window for the pre-market and after-hours
+	// sessions (EXTENDED_HOURS_WINDOWS), kept separate from `windows`
+	// because TRADING_WINDOWS describes when the regular session's liquidity
+	// is good enough — a different question from when the extended session is
+	// tradable at all.
+	extWin *strategy.TradingWindows
+	// sessions resolves the market session from Alpaca's calendar. It is the
+	// one place that answers "what session is it", so an entry, an exit and
+	// the risk gate cannot disagree about the answer.
+	sessions   *tools.Sessions
 	exec       *strategy.Executor
 	monitor    *strategy.PositionMonitor
 	optPlanner *strategy.OptionPlanner
@@ -420,8 +430,33 @@ func buildAutoLoop(ctx context.Context, cfg *config.Config, set strategy.Setting
 		return nil, 1
 	}
 
+	// One calendar-backed session source for the whole loop. The entry route,
+	// the exit shape and the risk gate each asking the broker separately is
+	// three calls and three chances to get different answers across a session
+	// boundary — a boundary is exactly where an order's shape has to change.
+	sessions := &tools.Sessions{Client: client}
+	var extWin *strategy.TradingWindows
+	var extendedExits *strategy.ExtendedExit
+	if cfg.ExtendedHours {
+		ew, werr := newExtendedWindows(cfg)
+		if werr != nil {
+			// config.Load already validated the spec, so reaching here means
+			// the dashboard's overrides file carried something else. Turn the
+			// session off rather than trade it with no window at all.
+			log.Printf("EXTENDED_HOURS_WINDOWS rejected (%v); rest-of-hours trading DISABLED", werr)
+			cfg.ExtendedHours = false
+		} else {
+			extWin = ew
+			extendedExits = &strategy.ExtendedExit{Sessions: sessions, MaxQuoteAge: cfg.MaxQuoteAge()}
+			log.Printf("[rest-of-hours] entries %s (US/Eastern), spread cap %.1fbps, quote age limit %s; "+
+				"positions entered here carry NO broker stop until the next regular open",
+				cfg.ExtendedHoursWindows, cfg.ExtendedSpreadCapBps(), cfg.MaxQuoteAge())
+		}
+	}
+
 	exec := &strategy.Executor{
 		Client: client, Validator: val, Kill: kill, State: state, Journal: j,
+		ExtendedExits: extendedExits,
 	}
 
 	var planner *strategy.OptionPlanner
@@ -445,7 +480,9 @@ func buildAutoLoop(ctx context.Context, cfg *config.Config, set strategy.Setting
 
 	loop := &autoLoop{
 		cfg: cfg, set: set, engine: engine, windows: windows, exec: exec,
-		monitor: monitor, optPlanner: planner, journal: j, client: client,
+		extWin:   extWin,
+		sessions: sessions,
+		monitor:  monitor, optPlanner: planner, journal: j, client: client,
 		// book backs the gate's live view of the account; every mutation
 		// this loop makes invalidates it so the next cap check is honest.
 		book: book,
@@ -1286,29 +1323,34 @@ func (l *autoLoop) handleBuy(ctx context.Context, dec strategy.Decision, pfv, co
 		log.Printf("[auto] %s BUY skipped: kill switch halted (entries closed, monitoring live)", dec.Symbol)
 		return
 	}
-	// Market state decides the ENTRY MODE: with PRE_ORDERS enabled an
-	// equity entry while the market is closed is queued as a resting
-	// limit/GTC bracket at the last close; otherwise a closed market
-	// means no entry at all. Crypto trades 24/7, so the equity clock
-	// does not gate it.
-	if !strategy.IsCrypto(dec.Symbol) {
-		open := l.equityMarketOpen(ctx)
-		if !open {
-			if l.cfg.PreOrders {
-				l.preOrder(ctx, dec, pfv, conf)
-				return
-			}
-			log.Printf("[auto] %s BUY skipped: market closed", dec.Symbol)
+	// Market state decides the ENTRY MODE. In the regular session a BUY is a
+	// live order; in the pre-market or after-hours session it is an
+	// extended-hours limit, but only if the operator opted into that session
+	// and the symbol is an equity that can trade there; with the market fully
+	// closed, PRE_ORDERS queues a resting limit at the last close and anything
+	// else is skipped. Crypto trades 24/7 and never consults the equity clock.
+	route := l.routeEntry(ctx, dec.Symbol)
+	switch route.kind {
+	case routeBlocked:
+		log.Printf("[auto] %s BUY skipped: %s", dec.Symbol, route.why)
+		return
+	case routePreOrder:
+		l.preOrder(ctx, dec, pfv, conf)
+		return
+	case routeLive:
+		// Execution window: entries fire ONLY inside the configured window
+		// for the asset class (equities/options -> TRADING_WINDOWS, crypto ->
+		// CRYPTO_WINDOWS). The risk gate only knows "market open", so without
+		// this check the bot traded at any hour the market was open.
+		if l.windows != nil && !l.windows.CanTrade(dec.Symbol) {
+			log.Printf("[auto] %s BUY skipped: outside trading window", dec.Symbol)
 			return
 		}
-	}
-	// Execution window: entries fire ONLY inside the configured window
-	// for the asset class (equities/options -> TRADING_WINDOWS, crypto ->
-	// CRYPTO_WINDOWS). The risk gate only knows "market open", so
-	// without this check the bot traded at any hour the market was open.
-	if l.windows != nil && !l.windows.CanTrade(dec.Symbol) {
-		log.Printf("[auto] %s BUY skipped: outside trading window", dec.Symbol)
-		return
+	case routeExtended:
+		// Its own window (EXTENDED_HOURS_WINDOWS) was already applied by
+		// routeEntry, along with the session spread cap and the quote-age
+		// bound — all three measured against the one quote this entry is
+		// priced from.
 	}
 	// Learning gate: after enough closed trades the learner may quarantine
 	// a symbol or raise the score bar above the configured floor. Both are
@@ -1371,7 +1413,10 @@ func (l *autoLoop) handleBuy(ctx context.Context, dec strategy.Decision, pfv, co
 	}
 	// Liquidity: refuse to pay a spread the edge cannot plausibly cover.
 	// Fails closed — an unreadable quote is not evidence of a tight market.
-	if l.cfg.MaxSpreadBps > 0 {
+	// An extended-hours entry is skipped here because routeEntry already
+	// measured the spread against the session cap on the very quote the order
+	// will be priced from; a second read would gate on a different market.
+	if l.cfg.MaxSpreadBps > 0 && route.kind != routeExtended {
 		bps, ok := l.quotedSpreadBps(ctx, dec.Symbol)
 		switch {
 		case !ok:
@@ -1422,8 +1467,11 @@ func (l *autoLoop) handleBuy(ctx context.Context, dec strategy.Decision, pfv, co
 		autoJournal(l.journal, whyPlan, dec.Symbol, "buy", dec.Composite)
 	}
 	// Options overlay: prefer a deep-ITM call substitute when data allows;
-	// otherwise fall through to the equity entry.
-	if l.optPlanner != nil && !plan.Crypto {
+	// otherwise fall through to the equity entry. Skipped in the extended
+	// session: Alpaca refuses extended_hours on options (measured 422), so the
+	// only way an option order placed now gets filled is by resting until the
+	// next bell — a fill at a price and time the signal never described.
+	if l.optPlanner != nil && !plan.Crypto && route.kind != routeExtended {
 		leg, why := l.optPlanner.Plan(ctx, dec.Symbol, pfv)
 		if leg != nil {
 			leg.Score = dec.Composite
@@ -1460,8 +1508,21 @@ func (l *autoLoop) handleBuy(ctx context.Context, dec strategy.Decision, pfv, co
 		plan.Symbol, plan.Qty, plan.Price, plan.Brackets.TakeProfit, plan.Brackets.StopLoss, plan.Crypto),
 		plan.Symbol, "buy", conf)
 	if l.dryRun {
+		if route.kind == routeExtended {
+			log.Printf("[auto] DRY-RUN EXTENDED BUY %s qty=%d @bid=%.4f/@ask=%.4f (spread %.1fbps, quote %s old) tp=%.4f sl=%.4f",
+				plan.Symbol, plan.Qty, route.quote.Bid, route.quote.Ask, route.quote.SpreadBps(),
+				time.Since(route.quote.At).Round(time.Second),
+				plan.Brackets.TakeProfit, plan.Brackets.StopLoss)
+			return
+		}
 		log.Printf("[auto] DRY-RUN BUY %s qty=%d @~%.4f tp=%.4f sl=%.4f",
 			plan.Symbol, plan.Qty, plan.Price, plan.Brackets.TakeProfit, plan.Brackets.StopLoss)
+		return
+	}
+	if route.kind == routeExtended {
+		if err := l.submitExtendedEntry(ctx, plan, route.quote, conf); err != nil {
+			log.Printf("[auto] %s extended entry rejected/failed: %v", plan.Symbol, err)
+		}
 		return
 	}
 	if err := l.submitEntry(ctx, plan, conf); err != nil {

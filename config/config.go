@@ -8,6 +8,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Mode controls whether trades require human approval.
@@ -97,6 +98,30 @@ type Config struct {
 	PreOrders     bool   // queue resting limit/GTC bracket pre-orders while market closed
 	StreamFeed    string // market-data stream feed: iex | sip
 	TradeLog      string // path to the JSONL trade log
+
+	// Rest-of-hours trading. EXTENDED_HOURS is the switch; the keys below
+	// shape it, because the extended session is a different market from the
+	// one the strategy was calibrated in: thinner book, wider spread, and no
+	// broker-side stop (Alpaca refuses extended_hours on bracket and OCO
+	// orders), so the bot's own monitoring is the only protection.
+	//
+	// ExtendedHoursWindows is the HH:MM-HH:MM spec, US/Eastern, inside which
+	// entries may open in the extended session. It is deliberately narrower
+	// than the venue's 04:00-09:30 / 16:00-20:00: the first and last minutes
+	// of a session are where the quote is thinnest and where an order placed
+	// against a stale print is most likely to be filled at the stale price.
+	ExtendedHoursWindows string
+	// ExtendedHoursMaxSpreadBps is the liquidity bar for extended-session
+	// entries. 0 means "use MAX_SPREAD_BPS". Set it higher and the extended
+	// session trades the same book as the regular one, which is the claim
+	// the measurement contradicts.
+	ExtendedHoursMaxSpreadBps float64
+	// ExtendedHoursMaxQuoteAgeSeconds refuses an extended-session entry or
+	// exit whose quote print is older than this. Outside the regular session
+	// a snapshot keeps serving its last print — measured on a Sunday, AAPL's
+	// quote was Friday 20:00:03Z with a 10% spread — so price and freshness
+	// must be checked as one condition, not separately.
+	ExtendedHoursMaxQuoteAgeSeconds int
 
 	// Local LLM (llama.cpp llama-server). When LLMBaseURL is set it takes
 	// precedence over Gemini.
@@ -231,6 +256,24 @@ func Load(envFile string) (*Config, error) {
 		return nil, err
 	} else {
 		c.ExtendedHours = eh
+	}
+	c.ExtendedHoursWindows = strings.TrimSpace(getEnv("EXTENDED_HOURS_WINDOWS", "04:30-09:25,16:05-19:55"))
+	if err := validateWindowSpec("EXTENDED_HOURS_WINDOWS", c.ExtendedHoursWindows); err != nil {
+		return nil, err
+	}
+	if f, err := getFloat("EXTENDED_HOURS_MAX_SPREAD_BPS", 0); err != nil {
+		return nil, err
+	} else if f < 0 {
+		return nil, fmt.Errorf("EXTENDED_HOURS_MAX_SPREAD_BPS must be >= 0, got %g", f)
+	} else {
+		c.ExtendedHoursMaxSpreadBps = f
+	}
+	if n, err := getInt("EXTENDED_HOURS_MAX_QUOTE_AGE_SECONDS", 300); err != nil {
+		return nil, err
+	} else if n <= 0 {
+		return nil, fmt.Errorf("EXTENDED_HOURS_MAX_QUOTE_AGE_SECONDS must be > 0, got %d", n)
+	} else {
+		c.ExtendedHoursMaxQuoteAgeSeconds = n
 	}
 	// PRE_ORDERS queues equity entries as resting limit/GTC brackets while
 	// the market is closed (overnight, weekend): sized at the last daily
@@ -501,6 +544,21 @@ func Load(envFile string) (*Config, error) {
 			"refusing live trading: ALPACA_BASE_URL=%s is not paper; set I_ALPACA_LIVE=YES to acknowledge live mode",
 			c.AlpacaBaseURL)
 	}
+	// Cross-key rules run last, once every value is parsed: MAX_SPREAD_BPS is
+	// read further down this function than the extended-hours keys, and a
+	// pairing check inlined with either key would be reading a zero that has
+	// not been filled in yet — which is how a config validation starts
+	// rejecting the very setting it exists to protect.
+	//
+	// Extended trading without a liquidity bar is extended trading on a quote
+	// nobody is refreshing: the session is thinner than the one the strategy
+	// was calibrated in, and an unbounded spread turns a signal into a payment
+	// to whoever is showing the only quote. Refuse the combination at load.
+	if c.ExtendedHours && c.MaxSpreadBps <= 0 && c.ExtendedHoursMaxSpreadBps <= 0 {
+		return nil, fmt.Errorf("EXTENDED_HOURS needs MAX_SPREAD_BPS or EXTENDED_HOURS_MAX_SPREAD_BPS: " +
+			"the extended session is thinner than the one the strategy was calibrated in, and an " +
+			"unbounded spread turns a signal into a payment to whoever is showing the only quote")
+	}
 	return c, nil
 }
 
@@ -696,4 +754,86 @@ func (c *Config) FactorMinScoreFor(class string) float64 {
 		return f
 	}
 	return c.FactorMinScore
+}
+
+// ExtendedSpreadCapBps is the liquidity bar an extended-session entry has to
+// clear. The session-specific cap wins when set; otherwise the general
+// MAX_SPREAD_BPS applies, so an operator who configured one bar gets it in
+// both sessions without having to remember to set the second.
+func (c *Config) ExtendedSpreadCapBps() float64 {
+	if c == nil {
+		return 0
+	}
+	if c.ExtendedHoursMaxSpreadBps > 0 {
+		return c.ExtendedHoursMaxSpreadBps
+	}
+	return c.MaxSpreadBps
+}
+
+// MaxQuoteAge is the staleness bound on an extended-session quote. It is a
+// duration so callers compare it against Snapshot.QuoteAge directly instead
+// of re-deriving units at each site.
+func (c *Config) MaxQuoteAge() time.Duration {
+	if c == nil || c.ExtendedHoursMaxQuoteAgeSeconds <= 0 {
+		return 5 * time.Minute
+	}
+	return time.Duration(c.ExtendedHoursMaxQuoteAgeSeconds) * time.Second
+}
+
+// validateWindowSpec checks a "HH:MM-HH:MM,HH:MM-HH:MM" spec locally so a
+// typo fails at startup. strategy.ParseWindows does the real parse, but
+// config cannot import strategy (strategy imports config), and letting a
+// malformed spec surface only when the trading loop builds means a bad
+// EXTENDED_HOURS_WINDOWS looks like a bot that stopped trading.
+func validateWindowSpec(envName, spec string) error {
+	if strings.TrimSpace(spec) == "" {
+		return fmt.Errorf("%s: empty window spec", envName)
+	}
+	seen := false
+	for _, part := range strings.Split(spec, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		seen = true
+		startS, endS, ok := strings.Cut(part, "-")
+		if !ok {
+			return fmt.Errorf("%s: window %q: want HH:MM-HH:MM", envName, part)
+		}
+		sm, err := parseWallClock(startS)
+		if err != nil {
+			return fmt.Errorf("%s: window %q start: %w", envName, part, err)
+		}
+		em, err := parseWallClock(endS)
+		if err != nil {
+			return fmt.Errorf("%s: window %q end: %w", envName, part, err)
+		}
+		if sm >= em {
+			return fmt.Errorf("%s: window %q: start must be before end", envName, part)
+		}
+	}
+	if !seen {
+		return fmt.Errorf("%s: empty window spec", envName)
+	}
+	return nil
+}
+
+func parseWallClock(s string) (int, error) {
+	hh, mm, ok := strings.Cut(strings.TrimSpace(s), ":")
+	if !ok {
+		return 0, fmt.Errorf("want HH:MM, got %q", s)
+	}
+	h, err := strconv.Atoi(hh)
+	if err != nil || h < 0 || h > 24 {
+		return 0, fmt.Errorf("bad hour in %q", s)
+	}
+	m, err := strconv.Atoi(mm)
+	if err != nil || m < 0 || m > 59 {
+		return 0, fmt.Errorf("bad minute in %q", s)
+	}
+	total := h*60 + m
+	if total > 24*60 {
+		return 0, fmt.Errorf("time %q exceeds 24:00", s)
+	}
+	return total, nil
 }

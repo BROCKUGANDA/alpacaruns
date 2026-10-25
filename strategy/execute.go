@@ -28,6 +28,11 @@ type Executor struct {
 	State     *StateStore
 	Journal   *pnl.Journal
 	Log       *log.Logger
+	// ExtendedExits lets a protective exit act in the pre-market and
+	// after-hours sessions as a marketable limit. Nil keeps every exit a
+	// market order, which is the regular-session behavior and the one that
+	// has always been tested here.
+	ExtendedExits *ExtendedExit
 }
 
 // RiskGate is the slice of *risk.Validator the executor consumes;
@@ -366,6 +371,17 @@ func (x *Executor) ExecuteReduce(ctx context.Context, symbol, reason string) (bo
 	qty := math.Abs(held)
 	qtyStr := strconv.FormatFloat(qty, 'f', -1, 64)
 
+	// Order shape is settled BEFORE protection is cancelled. In the extended
+	// session an exit needs a live quote to price itself against, and a quote
+	// that cannot be read must leave the position exactly as it was — with its
+	// protective pair resting. Cancelling first and failing second would strip
+	// the only floor the position has to buy an exit that never happens.
+	req, extended, err := x.exitShape(ctx, symbol, side, qtyStr)
+	if err != nil {
+		return false, fmt.Errorf("%s exit refused before touching protection: %w", symbol, err)
+	}
+	req.ClientOrderID = exitIntentID(symbol, side, qtyStr, time.Now().UTC().Format("20060102"))
+
 	// Protection first. A failure here is logged and carried on past: the
 	// exit is the risk-reducing action, and the reconcile pass re-places
 	// protection for any position left exposed by a failed close.
@@ -379,18 +395,13 @@ func (x *Executor) ExecuteReduce(ctx context.Context, symbol, reason string) (bo
 			"cancelled %d resting protective order(s) before close (%s)", n, reason))
 	}
 
-	tif := "gtc"
-	if tools.IsOCCSymbol(symbol) {
-		tif = "day" // options reject other values
-	}
-	req := tools.OrderRequest{
-		Symbol: symbol, Side: side, Type: "market", TimeInForce: tif, Qty: qtyStr,
-		ClientOrderID: exitIntentID(symbol, side, qtyStr, time.Now().UTC().Format("20060102")),
-	}
 	verdict := x.Validator.Validate(risk.Proposal{
 		Symbol: symbol, Side: side, Qty: qtyStr,
-		OrderType: req.Type, TimeInForce: req.TimeInForce,
-		Reducing: true, // proven, not asserted: see risk.Validator.Holdings
+		OrderType:     req.Type,
+		TimeInForce:   req.TimeInForce,
+		ExtendedHours: extended,
+		OrderClass:    "simple",
+		Reducing:      true, // proven, not asserted: see risk.Validator.Holdings
 	})
 	if !verdict.Approved {
 		return false, fmt.Errorf("risk gate refused the %s exit: %s", symbol, strings.Join(verdict.Reasons, "; "))
@@ -412,9 +423,13 @@ func (x *Executor) ExecuteReduce(ctx context.Context, symbol, reason string) (bo
 		}
 		return false, fmt.Errorf("place %s exit: %w", symbol, err)
 	}
-	x.log().Printf("[exit] %s %s qty=%s order=%s (%s)", symbol, side, qtyStr, o.ID, reason)
+	shape := "market"
+	if extended {
+		shape = "extended limit " + req.LimitPrice
+	}
+	x.log().Printf("[exit] %s %s qty=%s order=%s (%s) shape=%s", symbol, side, qtyStr, o.ID, reason, shape)
 	_ = x.journalAudit("exit:approved", symbol, side, fmt.Sprintf(
-		"%s qty=%s order=%s reason=%q", symbol, qtyStr, o.ID, reason))
+		"%s qty=%s order=%s shape=%s reason=%q", symbol, qtyStr, o.ID, shape, reason))
 	if x.State != nil {
 		_ = x.State.ClearLevel(symbol)
 	}

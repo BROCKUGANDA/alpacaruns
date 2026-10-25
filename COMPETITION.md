@@ -94,7 +94,7 @@ order from any path:
 - position notional cap (`MAX_POSITION_USD`) and portfolio-percentage cap (`MAX_PORTFOLIO_PCT`)
 - confidence ≥ `MIN_CONFIDENCE` plus the multi-factor gate (composite ≥ `FACTOR_MIN_SCORE`)
 - kill switch consulted before anything proceeds
-- market-hours/session rules via `MarketClock` (regular session, extended-session window weekdays 04:00–20:00 ET when `EXTENDED_HOURS` allows)
+- market-hours/session rules via `MarketClock`, resolved from `/v2/calendar` (regular session, extended session between the venue's own `session_open`/`session_close`, holidays and weekends closed, an unreadable calendar fails closed). Extended-session orders are limited to the shapes Alpaca accepts: `limit` + `day|gtc`, never `bracket`, `oco`, `market`, `stop`/`stop_limit` or `ioc` (each refusal measured against the paper API)
 - options constraints: whole contracts only, no notional sizing, tif day|gtc only, no extended hours, exposure = premium outlay = qty × 100 × mark (quote mid / last trade; a price-fetch failure rejects the order)
 
 Fail-closed semantics: any error fetching live state, prices, or factor scores is

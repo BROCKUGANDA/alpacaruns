@@ -33,6 +33,7 @@ import (
 type Server struct {
 	cfg      *config.Config
 	client   *tools.Client
+	sessions *tools.Sessions
 	strat    *strategy.Settings
 	settings ServerSettings
 
@@ -168,6 +169,7 @@ func New(cfg *config.Config, client *tools.Client, set ServerSettings, strat *st
 	s := &Server{
 		cfg:       cfg,
 		client:    client,
+		sessions:  &tools.Sessions{Client: client},
 		strat:     strat,
 		settings:  set,
 		limiter:   NewRateLimiter(60, 60*time.Second),

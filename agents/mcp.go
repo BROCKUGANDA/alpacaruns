@@ -7,7 +7,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
-	"time"
+	"sync"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"google.golang.org/adk/agent"
@@ -309,7 +309,7 @@ func NewValidator(kill risk.HaltSource, cfg *config.Config) *risk.Validator {
 	return &risk.Validator{
 		Cfg:   cfg,
 		Kill:  kill,
-		Clock: marketClock{cfg: cfg},
+		Clock: marketClock(cfg),
 		Portfolio: func() (risk.Portfolio, error) {
 			return accountSnapshot(cfg)
 		},
@@ -331,48 +331,54 @@ func NewValidatorWithScorer(kill risk.HaltSource, cfg *config.Config, scorer ris
 	return &risk.Validator{
 		Cfg:       cfg,
 		Kill:      kill,
-		Clock:     marketClock{cfg: cfg},
+		Clock:     marketClock(cfg),
 		Portfolio: func() (risk.Portfolio, error) { return accountSnapshot(cfg) },
 		Factors:   scorer,
 	}
 }
 
-// marketClock adapts the Alpaca /v2/clock endpoint to the risk.MarketClock
-// interface. It fails open for reads (returns open=true on error) because
-// a transient data outage should not permanently block trading; the risk
-// validator still enforces all position caps independently.
-type marketClock struct {
-	cfg *config.Config
+// marketClock returns the gate's view of the market for this config. It is
+// backed by Alpaca's /v2/calendar, not a weekday guess, so a market holiday
+// or an early close is answered the way the venue actually trades it.
+//
+// This replaces an adapter that failed OPEN on a clock outage ("assuming
+// market open"), which is the wrong direction for a risk gate: an unreadable
+// market state is not evidence that trading is allowed, and orders placed on
+// that assumption queue at the broker until the next session and fill
+// whoever was least able to explain them. Everything here now fails closed —
+// and the three call sites share the one calendar-backed source, so the
+// agent path, the dashboard path and the bot path cannot disagree about what
+// session it is.
+func marketClock(cfg *config.Config) risk.MarketClock {
+	return risk.SessionClock(agentSessions(cfg))
 }
 
-func (m marketClock) MarketOpen() bool {
-	cl := m.fetchClock()
-	if cl == nil {
-		log.Printf("[risk-gate] clock check failed; assuming market open")
-		return true
-	}
-	return cl.IsOpen
+// agentSessions keeps one calendar cache per trading venue. Sessions holds a
+// day's worth of calendar rows; sharing it means a tick that asks the gate
+// five questions makes one HTTP call, and two validators built in the same
+// process see the same session answer rather than racing two fetches.
+var agentSessionsCache struct {
+	mu     sync.Mutex
+	byHost map[string]*tools.Sessions
 }
 
-// SessionOpen approximates the US extended session window from the clock
-// timestamp: weekdays 04:00-20:00 ET. The /v2/clock timestamp is already
-// ET-formatted, so we compare wall-clock fields directly.
-func (m marketClock) SessionOpen(p risk.Proposal) bool {
-	cl := m.fetchClock()
-	if cl == nil {
-		return false
+func agentSessions(cfg *config.Config) *tools.Sessions {
+	key := ""
+	if cfg != nil {
+		key = cfg.AlpacaBaseURL
 	}
-	ts, err := time.Parse(time.RFC3339, cl.Timestamp)
-	if err != nil {
-		return false
+	agentSessionsCache.mu.Lock()
+	defer agentSessionsCache.mu.Unlock()
+	if agentSessionsCache.byHost == nil {
+		agentSessionsCache.byHost = map[string]*tools.Sessions{}
 	}
-	return risk.InExtendedSession(ts.Weekday(), ts.Hour(), ts.Minute())
-}
-
-// SessionKnown reports whether a clock fetch produced usable state;
-// unknown state fails closed in the extended-hours gate.
-func (m marketClock) SessionKnown() bool {
-	return m.fetchClock() != nil
+	if s, ok := agentSessionsCache.byHost[key]; ok {
+		return s
+	}
+	c := tools.NewClient(cfg.AlpacaKeyID, cfg.AlpacaSecret, cfg.AlpacaBaseURL, cfg.AlpacaDataURL)
+	s := &tools.Sessions{Client: c}
+	agentSessionsCache.byHost[key] = s
+	return s
 }
 
 // proposalFromArgs extracts a risk.Proposal from the raw tool-call args
@@ -418,17 +424,6 @@ func proposalFromArgs(name string, args any) risk.Proposal {
 	return p
 }
 
-// fetchClock returns the current clock or nil on any error.
-func (m marketClock) fetchClock() *tools.Clock {
-	c := tools.NewClient(m.cfg.AlpacaKeyID, m.cfg.AlpacaSecret, m.cfg.AlpacaBaseURL, m.cfg.AlpacaDataURL)
-	cl, err := c.GetClock(context.Background())
-	if err != nil {
-		log.Printf("[risk-gate] clock read failed: %v", err)
-		return nil
-	}
-	return cl
-}
-
 // applyExtendedHoursDefault stamps extended_hours=true onto order args
 // when EXTENDED_HOURS is enabled in config and the proposal satisfies the
 // Alpaca constraint (type=limit, time_in_force day|gtc) and the caller
@@ -445,6 +440,18 @@ func applyExtendedHoursDefault(cfg *config.Config, p risk.Proposal, args any) an
 	tif := strings.ToLower(strings.TrimSpace(p.TimeInForce))
 	if t != "limit" || (tif != "day" && tif != "gtc") {
 		return args
+	}
+	// The class lives only in the raw args — the proposal carries what the
+	// tool adapter could name — and it is the one field that turns an
+	// otherwise-valid extended-hours limit into a broker refusal
+	// (measured 403: "bracket orders do not support extended hours trading",
+	// and the same for oco). Stamping without this check would convert an
+	// agent's ordinary bracket request into a guaranteed rejection.
+	if cls, ok := m["order_class"].(string); ok {
+		switch strings.ToLower(strings.TrimSpace(cls)) {
+		case "bracket", "oco", "trail", "trailing_stop":
+			return args
+		}
 	}
 	cp := make(map[string]any, len(m)+1)
 	for k, v := range m {
