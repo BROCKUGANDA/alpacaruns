@@ -18,9 +18,10 @@ type OptionSource interface {
 	GetSnapshots(ctx context.Context, symbols []string) (map[string]options.Snapshot, error)
 }
 
-// OptionPlanner picks a deep-ITM options substitute for an equity entry:
-// calls for BUY signals (puts would apply to short entries this engine
-// never opens), expiring 30-45 days out, |delta| inside the configured
+// OptionPlanner picks a deep-ITM options substitute for a directional view:
+// calls for BUY signals, puts for BEARISH signals on a name the bot does not
+// hold (defined-risk downside; the engine never shorts), expiring 30-45 days
+// out, |delta| inside the configured
 // band, contracts sized so total premium stays within the position
 // budget. Any data gap returns nil + reason — the equity leg is the
 // fallback, never an error.
@@ -54,13 +55,32 @@ func NewOptionPlanner(o OptionSource, s Settings, sizing Sizing) (*OptionPlanner
 // Plan returns an option leg for an equity BUY on underlying at spot, or
 // nil with a human-readable skip reason when nothing qualifies.
 func (p *OptionPlanner) Plan(ctx context.Context, underlying string, portfolioValue float64) (*OptionLeg, string) {
-	now := p.now().UTC()
+	return p.PlanDirection(ctx, underlying, portfolioValue, "call")
+}
+
+// PlanDirection buys a call or a put for an underlying.
+//
+// Calls express a bullish entry; puts express a bearish view with defined
+// risk, which is the only way this engine takes downside exposure — it never
+// sells short. Both are selected the same way (|delta| inside the band, DTE
+// inside the window), because the contract's delta is what determines how
+// much underlying the premium controls, whichever way it points.
+func (p *OptionPlanner) PlanDirection(ctx context.Context, underlying string, portfolioValue float64, kind string) (*OptionLeg, string) {
+	kind = strings.ToLower(strings.TrimSpace(kind))
+	if kind != "call" && kind != "put" {
+		return nil, fmt.Sprintf("option kind must be call or put, got %q", kind)
+	}
+	clock := p.now
+	if clock == nil {
+		clock = time.Now // planner literals in tests may leave it unset
+	}
+	now := clock().UTC()
 	gte := now.AddDate(0, 0, p.MinDTE).Format("2006-01-02")
 	lte := now.AddDate(0, 0, p.MaxDTE).Format("2006-01-02")
 
 	contracts, _, err := p.Opts.GetContracts(ctx, options.ContractsQuery{
 		UnderlyingSymbols: []string{underlying},
-		Type:              "call",
+		Type:              kind,
 		Status:            "active",
 		ExpirationDateGTE: gte,
 		ExpirationDateLTE: lte,
@@ -85,7 +105,7 @@ func (p *OptionPlanner) Plan(ctx context.Context, underlying string, portfolioVa
 		// Compare like-for-like: uppercasing the field but not the
 		// literal rejected EVERY candidate ("CALL" != "call"), so the
 		// overlay silently never traded in production.
-		if !c.Tradable || strings.ToUpper(c.Type) != "CALL" {
+		if !c.Tradable || strings.ToUpper(c.Type) != strings.ToUpper(kind) {
 			continue
 		}
 		snaps, err := p.Opts.GetSnapshots(ctx, []string{c.Symbol})
@@ -108,7 +128,7 @@ func (p *OptionPlanner) Plan(ctx context.Context, underlying string, portfolioVa
 		cands = append(cands, cand{c: c, delta: delta, mid: premium, dist: d})
 	}
 	if len(cands) == 0 {
-		return nil, fmt.Sprintf("no tradable call in DTE %d-%d with delta %.2f-%.2f", p.MinDTE, p.MaxDTE, p.DeltaMin, p.DeltaMax)
+		return nil, fmt.Sprintf("no tradable %s in DTE %d-%d with delta %.2f-%.2f", kind, p.MinDTE, p.MaxDTE, p.DeltaMin, p.DeltaMax)
 	}
 	sort.Slice(cands, func(i, j int) bool { return cands[i].dist < cands[j].dist })
 
@@ -125,7 +145,7 @@ func (p *OptionPlanner) Plan(ctx context.Context, underlying string, portfolioVa
 	p.Log.Printf("[strategy] option overlay %s: %d x %s delta=%.2f premium=%.2f/contract (%.2f total)",
 		underlying, qr.Qty, best.c.Symbol, best.delta, perContract, perContract*float64(qr.Qty))
 	return &OptionLeg{
-		OCC: best.c.Symbol, Type: "call", Delta: best.delta,
+		OCC: best.c.Symbol, Type: kind, Delta: best.delta,
 		Premium: perContract, Contracts: qr.Qty, Expiry: best.c.ExpirationDate,
 	}, ""
 }

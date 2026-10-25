@@ -840,7 +840,14 @@ func (l *autoLoop) tick(ctx context.Context) error {
 		case strategy.SignalBuy:
 			l.handleBuy(ctx, dec, pfv, conf)
 		case strategy.SignalSell:
-			l.handleSell(ctx, dec)
+			// A bearish signal on a name we do NOT hold is a view, not an
+			// exit. The engine never shorts, so the only defined-risk way to
+			// take it is a long put. Held names take the ordinary exit path.
+			if l.positionUsd(ctx, dec.Symbol) == 0 {
+				l.putEntry(ctx, dec, pfv)
+			} else {
+				l.handleSell(ctx, dec)
+			}
 		default:
 			log.Printf("[auto] HOLD %s: %s", dec.Symbol, dec.Reason)
 		}
@@ -1901,4 +1908,57 @@ func (l *autoLoop) migrateLevels(oldSym, newSym string) {
 		return
 	}
 	log.Printf("[refdata] %s is now %s: moved %d stored level(s)", oldSym, newSym, moved)
+}
+
+// putEntry expresses a bearish signal as a long put on a name the bot does not
+// hold. It is an ENTRY (risk-increasing), so it passes every entry gate the
+// long side does: market open, trading window, learning gate, per-position
+// cap, and the same risk validator through ExecuteOptionEntry.
+func (l *autoLoop) putEntry(ctx context.Context, dec strategy.Decision, pfv float64) {
+	if l.optPlanner == nil || l.cfg == nil || !l.cfg.OptionPuts {
+		return
+	}
+	if strategy.IsCrypto(dec.Symbol) || tools.IsOCCSymbol(dec.Symbol) {
+		return // Alpaca options are listed on US equities/ETFs
+	}
+	if l.exec != nil && l.exec.Kill != nil && l.exec.Kill.Halted() {
+		return
+	}
+	if !l.equityMarketOpen(ctx) {
+		log.Printf("[auto] %s PUT skipped: market closed", dec.Symbol)
+		return
+	}
+	if l.windows != nil && !l.windows.CanTrade(dec.Symbol) {
+		log.Printf("[auto] %s PUT skipped: outside trading window", dec.Symbol)
+		return
+	}
+	if ok, why := l.learningGate(dec.Symbol, dec.Composite); !ok {
+		log.Printf("[auto] %s PUT skipped: %s", dec.Symbol, why)
+		return
+	}
+	leg, why := l.optPlanner.PlanDirection(ctx, dec.Symbol, pfv, "put")
+	if leg == nil {
+		log.Printf("[auto] %s put overlay skipped: %s", dec.Symbol, why)
+		return
+	}
+	leg.Score = dec.Composite
+	if m := l.learningSizeMult("option"); m < 1 {
+		n := int(float64(leg.Contracts) * m)
+		if n < 1 {
+			log.Printf("[auto] %s PUT skipped: learning shrank %d contracts to nothing (x%.2f)", dec.Symbol, leg.Contracts, m)
+			return
+		}
+		leg.Contracts = n
+	}
+	autoJournal(l.journal, fmt.Sprintf("buy-put %s %s contracts=%d delta=%.2f premium=%.2f",
+		dec.Symbol, leg.OCC, leg.Contracts, leg.Delta, leg.Premium), dec.Symbol, "buy", dec.Composite)
+	if l.dryRun {
+		log.Printf("[auto] DRY-RUN PUT %s x%d (%s)", leg.OCC, leg.Contracts, dec.Symbol)
+		return
+	}
+	if err := l.submitOptionEntry(ctx, leg, 1.0); err != nil {
+		log.Printf("[auto] put entry %s failed: %v", leg.OCC, err)
+		return
+	}
+	log.Printf("[auto] PUT ENTRY %s x%d for bearish %s signal", leg.OCC, leg.Contracts, dec.Symbol)
 }

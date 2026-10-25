@@ -151,14 +151,12 @@ func cmdTrade(args []string) int {
 	}
 	isOption := tools.IsOCCSymbol(symbol)
 	side := strings.ToLower(strings.TrimSpace(p.side))
-	orderType := "market"
 	limit := strings.TrimSpace(p.limit)
-	if limit != "" {
-		orderType = "limit"
-		if f, err := strconv.ParseFloat(limit, 64); err != nil || f <= 0 {
-			fmt.Fprintf(os.Stderr, "trade: invalid --limit %q\n", limit)
-			return 2
-		}
+	stopPrice := strings.TrimSpace(p.stop)
+	orderType, typeErr := resolveOrderType(p.orderType, limit, stopPrice, isOption)
+	if typeErr != nil {
+		fmt.Fprintf(os.Stderr, "trade: %v\n", typeErr)
+		return 2
 	}
 	tif := strings.ToLower(strings.TrimSpace(p.tif))
 	if tif == "" {
@@ -261,6 +259,7 @@ func cmdTrade(args []string) int {
 		Type:          orderType,
 		TimeInForce:   tif,
 		LimitPrice:    limit,
+		StopPrice:     stopPrice,
 		ExtendedHours: p.extHours,
 	}
 	if q != "" {
@@ -299,15 +298,17 @@ func cmdTrade(args []string) int {
 
 // tradeArgs is the parsed flag set of the `trade` subcommand.
 type tradeArgs struct {
-	envFile  string
-	symbol   string
-	occ      string
-	side     string
-	qty      string
-	limit    string
-	tif      string
-	notional string
-	extHours bool
+	envFile   string
+	symbol    string
+	occ       string
+	side      string
+	qty       string
+	limit     string
+	stop      string
+	orderType string
+	tif       string
+	notional  string
+	extHours  bool
 }
 
 // parseTradeArgs parses trade subcommand flags without touching config,
@@ -323,6 +324,8 @@ func parseTradeArgs(args []string) (tradeArgs, int) {
 	fs.StringVar(&p.side, "side", "", "buy | sell (required)")
 	fs.StringVar(&p.qty, "qty", "", "share quantity (or --notional); contracts for options")
 	fs.StringVar(&p.limit, "limit", "", "limit price (implies type=limit)")
+	fs.StringVar(&p.orderType, "type", "", "order type: market | limit | stop | stop_limit (default: market, or limit when --limit is set)")
+	fs.StringVar(&p.stop, "stop-price", "", "stop trigger price (required for stop and stop_limit)")
 	fs.StringVar(&p.tif, "tif", "", "time in force: gtc | day | ioc | fop (default: gtc; options: day|gtc only)")
 	fs.BoolVar(&p.extHours, "extended-hours", false, "request extended-hours execution (equities only; limit + day/gtc)")
 	fs.StringVar(&p.notional, "notional", "", "notional USD value (alternative to --qty; equities only)")
@@ -334,6 +337,78 @@ func parseTradeArgs(args []string) (tradeArgs, int) {
 		return p, 2
 	}
 	return p, 0
+}
+
+// resolveOrderType validates an order-type/price combination and returns the
+// type the broker will see.
+//
+// The combinations are not stylistic: Alpaca rejects a limit order with no
+// price, a stop with no trigger, and any stop order on an option. Validating
+// here means a bad flag is a usage error with a sentence, not a 422 from the
+// broker after the risk gate has already approved it.
+func resolveOrderType(kind, limit, stopPrice string, isOption bool) (string, error) {
+	kind = strings.ToLower(strings.TrimSpace(kind))
+	hasLimit := strings.TrimSpace(limit) != ""
+	hasStop := strings.TrimSpace(stopPrice) != ""
+	price := func(name, v string) error {
+		f, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if err != nil || f <= 0 {
+			return fmt.Errorf("invalid --%s %q", name, v)
+		}
+		return nil
+	}
+	if kind == "" {
+		switch {
+		case hasStop:
+			return "", fmt.Errorf("--stop-price requires --type stop or --type stop_limit")
+		case hasLimit:
+			kind = "limit"
+		default:
+			kind = "market"
+		}
+	}
+	if isOption && kind != "market" && kind != "limit" {
+		return "", fmt.Errorf("options support only market and limit orders, got %q", kind)
+	}
+	switch kind {
+	case "market":
+		if hasLimit || hasStop {
+			return "", fmt.Errorf("a market order carries no price (drop --limit/--stop-price)")
+		}
+	case "limit":
+		if !hasLimit {
+			return "", fmt.Errorf("--type limit requires --limit")
+		}
+		if hasStop {
+			return "", fmt.Errorf("a limit order carries no stop (use --type stop_limit)")
+		}
+		if err := price("limit", limit); err != nil {
+			return "", err
+		}
+	case "stop":
+		if !hasStop {
+			return "", fmt.Errorf("--type stop requires --stop-price")
+		}
+		if hasLimit {
+			return "", fmt.Errorf("a stop order carries no limit (use --type stop_limit)")
+		}
+		if err := price("stop-price", stopPrice); err != nil {
+			return "", err
+		}
+	case "stop_limit":
+		if !hasStop || !hasLimit {
+			return "", fmt.Errorf("--type stop_limit requires both --stop-price and --limit")
+		}
+		if err := price("stop-price", stopPrice); err != nil {
+			return "", err
+		}
+		if err := price("limit", limit); err != nil {
+			return "", err
+		}
+	default:
+		return "", fmt.Errorf("invalid --type %q (want market|limit|stop|stop_limit)", kind)
+	}
+	return kind, nil
 }
 
 // reqDisplayQty renders the qty part of the trade audit line.

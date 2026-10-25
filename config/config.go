@@ -56,6 +56,10 @@ type Config struct {
 	OIDCIssuer   string
 	OIDCAudience string
 	OIDCJWKSURL  string
+	// OptionPuts allows a BEARISH signal on a name the bot does not hold to
+	// be expressed as a long put (defined risk). The engine never shorts, so
+	// without this a bearish view is simply inaction.
+	OptionPuts bool
 	// Universe screening and live cost/margin limits.
 	//
 	// MinMarketCapUSD turns on the market-cap screen for single-name
@@ -256,6 +260,11 @@ func Load(envFile string) (*Config, error) {
 		return nil, fmt.Errorf("OIDC_ISSUER, OIDC_AUDIENCE and OIDC_JWKS_URL must be set together (got %d of 3)", set)
 	}
 
+	if put, err := getBool("OPTIONS_PUTS", true); err != nil {
+		return nil, err
+	} else {
+		c.OptionPuts = put
+	}
 	if f, err := getFloat("MIN_MARKET_CAP_USD", 0); err != nil {
 		return nil, err
 	} else if f < 0 {
