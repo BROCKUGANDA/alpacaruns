@@ -64,6 +64,11 @@ func (c CostModel) CostFraction() float64 {
 
 // Config is one experiment.
 type Config struct {
+	// Symbols identifies the universe under test. It is part of the
+	// experiment's identity: the same rule on crypto and on equities are two
+	// experiments, and hashing them the same made the registry's repetition
+	// count meaningless (three class runs appeared as one re-run).
+	Symbols  []string
 	From, To time.Time
 	Folds    int
 	// NotionalPerTrade is the fixed stake used to turn percentages into
@@ -144,9 +149,11 @@ type Report struct {
 
 // ConfigHash identifies the experiment's parameters, for the registry.
 func (c Config) Hash() string {
-	payload := fmt.Sprintf("%s|%s|%d|%.2f|%+v|%+v|%+v",
+	syms := append([]string(nil), c.Symbols...)
+	sort.Strings(syms)
+	payload := fmt.Sprintf("%s|%s|%d|%.2f|%+v|%+v|%+v|%s",
 		c.From.UTC().Format("2006-01-02"), c.To.UTC().Format("2006-01-02"), c.Folds,
-		c.NotionalPerTrade, c.Strategy, c.Weights, c.Costs)
+		c.NotionalPerTrade, c.Strategy, c.Weights, c.Costs, strings.Join(syms, ","))
 	return shortHash(payload)
 }
 

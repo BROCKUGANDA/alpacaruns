@@ -312,3 +312,17 @@ func TestEntryFillsAtTheNextOpenNotTheSignalClose(t *testing.T) {
 			first.Entry, gapOpen, signalClose)
 	}
 }
+
+// The universe is part of the experiment's identity. Without it, three class
+// runs share one fingerprint and the repetition count is fiction.
+func TestConfigHashIncludesSymbols(t *testing.T) {
+	a := Config{Symbols: []string{"AAPL", "MSFT"}, NotionalPerTrade: 1}
+	b := Config{Symbols: []string{"BTC/USD"}, NotionalPerTrade: 1}
+	c := Config{Symbols: []string{"MSFT", "AAPL"}, NotionalPerTrade: 1}
+	if a.Hash() == b.Hash() {
+		t.Fatal("different universes produced the same config hash")
+	}
+	if a.Hash() != c.Hash() {
+		t.Fatal("symbol order changed the hash")
+	}
+}

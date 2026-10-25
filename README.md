@@ -885,6 +885,44 @@ orders ungated") are not listed, because they were already true.
 | Non-tradable symbols | The picker recorded `tradable` but the trading universe ignored it, so delisted/halted/renamed tickers were scored and rejected once per poll | The loop scores `TradableSymbols()` and logs what it excluded |
 | Unpinned MCP server | `uvx alpaca-mcp-server` floated to whatever build PyPI served; the guard classifies tool names, so an unannounced upgrade changes the surface it was written against | Pinned to `alpaca-mcp-server==2.4.0` (override with `ALPACA_MCP_SPEC`), and the spec is logged at launch |
 
+### Screening, costs and per-class gates
+
+**Market cap is screened with real numbers, not estimates.** `alpacaruns caps
+--refresh` builds `data/market-caps.json` from SEC EDGAR's reported shares
+outstanding times the broker's latest close, stamped with its observation time
+and source. With `MIN_MARKET_CAP_USD` set, a single-name equity whose cap is
+unknown, older than `MARKET_CAP_MAX_AGE_DAYS`, or below the floor is **not
+scored** — fail closed — and the log names every symbol it dropped and why.
+ETFs, index trackers and crypto are exempt by class: a fund has AUM rather than
+a market cap, and a pair has no share count. Live table at the time of
+writing: AAPL $5.07T, MSFT $3.89T, NVDA $5.08T (EDGAR, 2026-10-25).
+
+**Costs and margin are live, not just modelled in the replay.**
+`MAX_SPREAD_BPS` refuses an entry whose quoted spread is wider than the limit
+(fails closed when the quote is unreadable), and `MAX_GROSS_EXPOSURE_PCT` caps
+the book's total market value against equity — per-name caps alone let N names
+each under the cap add up to a leveraged book. 1.0 means no leverage.
+
+**Class floors are separate because the score distributions are.**
+`FACTOR_MIN_SCORE_EQUITY`, `_ETF`, `_INDEX`, `_CRYPTO`, `_OPTION` override the
+global floor per class. One floor calibrated on equities is not a neutral
+default for crypto; applied unchanged it silently means "never trade that
+class". Classes without an override fall through to the global floor.
+
+Measured per class (2024-01 → 2025-10, 4 walk-forward folds, 2bps spread +
+3bps slippage per side, next-open execution, stop wins ambiguous bars):
+
+| Class | Trades | Win rate | Expectancy/trade | Net (on $10k stakes) | Max DD |
+|---|---|---|---|---|---|
+| Equities (AAPL, MSFT, NVDA) | 72 | 41.7% | +1.03% | +$7,407 | 57.8% |
+| ETFs (SPY, QQQ, IWM) | 34 | 44.1% | +1.21% | +$4,124 | 20.9% |
+| Crypto (BTC/USD, ETH/USD) | 117 | 40.2% | +0.78% | +$9,143 | 45.5% |
+
+All three are positive in this window and none of them is a promise: the drawdowns
+are large, the window is one regime, and the same rule has now been evaluated
+repeatedly on the same data — which is what the registry's repetition flag
+exists to say out loud.
+
 ### The research harness, and what it is for
 
 `research/` replays the **same** scoring code the bot runs

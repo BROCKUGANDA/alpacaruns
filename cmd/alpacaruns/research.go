@@ -69,7 +69,8 @@ func cmdResearch(args []string) int {
 		return 1
 	}
 	rc := research.Config{
-		From: fromT, To: toT, Folds: *folds,
+		Symbols: syms,
+		From:    fromT, To: toT, Folds: *folds,
 		NotionalPerTrade: *notional,
 		Costs: research.CostModel{
 			SpreadBps: *spread, SlippageBps: *slippage, CommissionPerSide: *commission,
