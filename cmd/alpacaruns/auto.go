@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -34,6 +35,7 @@ import (
 	"github.com/BROCKUGANDA/alpacaruns/strategy"
 	"github.com/BROCKUGANDA/alpacaruns/strategy/ensemble"
 	"github.com/BROCKUGANDA/alpacaruns/tools"
+	"github.com/BROCKUGANDA/alpacaruns/universe"
 )
 
 // autoLoop bundles everything one tick needs; explicit for testability.
@@ -72,6 +74,9 @@ type autoLoop struct {
 	// mirror is the SQLite view of the journal and state, opened lazily and
 	// verified on a cadence. nil when SQLITE_MIRROR=false.
 	mirror *store.DB
+	// caps is the market-cap table the universe screen reads, refreshed with
+	// the registry. Empty when no table has been built.
+	caps universe.Caps
 	// ensemble is non-nil only when ENSEMBLE_ENABLED=true; nil keeps the
 	// original single-expert tick path bit-for-bit.
 	ensemble *ensemble.Runner
@@ -151,7 +156,46 @@ func (l *autoLoop) universe(ctx context.Context) []string {
 		out = append(out, l.set.CryptoSymbols...)
 		return out
 	}
-	return reg.TradableSymbols()
+	insts := reg.Instruments()
+	tradable := make([]picker.Instrument, 0, len(insts))
+	for _, i := range insts {
+		if i.Tradable {
+			tradable = append(tradable, i)
+		}
+	}
+	kept, excluded := universe.Screen(tradable, l.caps,
+		l.cfg.MinMarketCapUSD, l.cfg.MaxMarketCapUSD,
+		time.Duration(l.cfg.MarketCapMaxAgeDays)*24*time.Hour, time.Now())
+	if len(excluded) > 0 {
+		parts := make([]string, 0, len(excluded))
+		for _, e := range excluded {
+			parts = append(parts, e.Symbol+" ("+e.Reason+")")
+		}
+		log.Printf("[universe] market-cap screen excluded %d symbol(s): %s",
+			len(excluded), strings.Join(parts, "; "))
+	}
+	out := make([]string, 0, len(kept))
+	for _, i := range kept {
+		out = append(out, i.Symbol)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// loadMarketCaps refreshes the cap table the screen reads.
+func (l *autoLoop) loadMarketCaps() {
+	if l.journal == nil {
+		return
+	}
+	caps, err := universe.LoadCaps(universe.Path(l.journal.Path()))
+	if err != nil {
+		log.Printf("[universe] market-cap table unreadable: %v", err)
+		return
+	}
+	l.caps = caps
+	if l.cfg.MinMarketCapUSD > 0 && len(caps.Caps) == 0 {
+		log.Printf("[universe] market-cap screen is ON but no cap table exists: single-name equities will be excluded (run `alpacaruns caps --refresh`)")
+	}
 }
 
 // refreshRegistry returns the classified universe, rebuilding it when
@@ -180,6 +224,7 @@ func (l *autoLoop) refreshRegistry(ctx context.Context) (*picker.Registry, error
 	// a reported event rather than an absence of signals. This is the only
 	// record of what the broker said yesterday.
 	l.recordReferenceData(reg)
+	l.loadMarketCaps()
 	if bad := reg.Untradable(); len(bad) > 0 {
 		names := make([]string, 0, len(bad))
 		for _, i := range bad {
@@ -1307,10 +1352,54 @@ func (l *autoLoop) handleBuy(ctx context.Context, dec strategy.Decision, pfv, co
 		log.Printf("[auto] %s BUY skipped: already holding $%.2f >= cap $%.2f", dec.Symbol, curUSD, maxPerSym)
 		return
 	}
+	// Per-class score floor. One global floor calibrated on equities is not a
+	// neutral default for another class: crypto composites sit on a different
+	// distribution, and judging them by the equity bar means never trading
+	// them. Classes without an override fall through to the global floor.
+	if class := l.classOf(dec.Symbol); dec.Composite > 0 {
+		if floor := l.cfg.FactorMinScoreFor(class); dec.Composite < floor {
+			log.Printf("[auto] %s BUY skipped: composite %.3f below the %s floor %.2f", dec.Symbol, dec.Composite, class, floor)
+			return
+		}
+	}
+	// Liquidity: refuse to pay a spread the edge cannot plausibly cover.
+	// Fails closed — an unreadable quote is not evidence of a tight market.
+	if l.cfg.MaxSpreadBps > 0 {
+		bps, ok := l.quotedSpreadBps(ctx, dec.Symbol)
+		switch {
+		case !ok:
+			log.Printf("[auto] %s BUY skipped: quoted spread unavailable and MAX_SPREAD_BPS is set", dec.Symbol)
+			return
+		case bps > l.cfg.MaxSpreadBps:
+			log.Printf("[auto] %s BUY skipped: spread %.1fbps exceeds the %.1fbps limit", dec.Symbol, bps, l.cfg.MaxSpreadBps)
+			autoJournal(l.journal, fmt.Sprintf("liquidity-blocked buy %s: spread %.1fbps > %.1fbps",
+				dec.Symbol, bps, l.cfg.MaxSpreadBps), dec.Symbol, "buy", dec.Composite)
+			return
+		}
+	}
 	plan, err := l.engine.PlanEntry(ctx, dec, pfv)
 	if err != nil {
 		log.Printf("[auto] %s plan skipped: %v", dec.Symbol, err)
 		return
+	}
+	// Gross exposure (the margin ceiling): the book's total market value may
+	// not exceed MAX_GROSS_EXPOSURE_PCT of equity. Per-name caps alone let N
+	// names each under the cap add up to a leveraged book.
+	if l.cfg.MaxGrossExposurePct > 0 && pfv > 0 {
+		gross, gerr := l.book.grossUSD(ctx)
+		if gerr != nil {
+			log.Printf("[auto] %s BUY skipped: gross exposure unreadable (%v)", dec.Symbol, gerr)
+			return
+		}
+		add := plan.Budget
+		if plan.Notional > 0 {
+			add = plan.Notional
+		}
+		if (gross+add)/pfv > l.cfg.MaxGrossExposurePct {
+			log.Printf("[auto] %s BUY skipped: gross exposure $%.0f + $%.0f would be %.0f%% of equity (limit %.0f%%)",
+				dec.Symbol, gross, add, 100*(gross+add)/pfv, 100*l.cfg.MaxGrossExposurePct)
+			return
+		}
 	}
 	// Learned sizing and stop tightening for this asset class. Shrink and
 	// tighten only: a class that has been losing trades smaller and with a

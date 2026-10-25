@@ -56,6 +56,28 @@ type Config struct {
 	OIDCIssuer   string
 	OIDCAudience string
 	OIDCJWKSURL  string
+	// Universe screening and live cost/margin limits.
+	//
+	// MinMarketCapUSD turns on the market-cap screen for single-name
+	// equities (0 = off). ETFs, index trackers and crypto are exempt by
+	// class: a fund has AUM rather than a market cap and a crypto pair has
+	// no share count.
+	MinMarketCapUSD float64
+	MaxMarketCapUSD float64
+	// MarketCapMaxAgeDays refuses to screen on a stale cap table.
+	MarketCapMaxAgeDays int
+	// MaxSpreadBps skips an entry whose quoted spread is wider than this
+	// (0 = off). It is a liquidity filter, not a cost model.
+	MaxSpreadBps float64
+	// MaxGrossExposurePct caps the book's gross market value as a share of
+	// equity. 1.0 means no leverage; 2.0 would allow a 2x book in margin.
+	MaxGrossExposurePct float64
+	// FactorMinScoreByClass overrides the composite floor per asset class
+	// (equity, etf, index, crypto, option). A class absent here uses
+	// FactorMinScore. Crypto and equities do not share a score
+	// distribution, so one floor calibated on equities silently excludes
+	// the other class.
+	FactorMinScoreByClass map[string]float64
 	// MirrorEnabled keeps a verified SQLite mirror of the journal and state
 	// next to them. The files remain the write path; see package store.
 	MirrorEnabled        bool
@@ -232,6 +254,49 @@ func Load(envFile string) (*Config, error) {
 	}
 	if set != 0 && set != 3 {
 		return nil, fmt.Errorf("OIDC_ISSUER, OIDC_AUDIENCE and OIDC_JWKS_URL must be set together (got %d of 3)", set)
+	}
+
+	if f, err := getFloat("MIN_MARKET_CAP_USD", 0); err != nil {
+		return nil, err
+	} else if f < 0 {
+		return nil, fmt.Errorf("MIN_MARKET_CAP_USD must be >= 0, got %g", f)
+	} else {
+		c.MinMarketCapUSD = f
+	}
+	if f, err := getFloat("MAX_MARKET_CAP_USD", 0); err != nil {
+		return nil, err
+	} else {
+		c.MaxMarketCapUSD = f
+	}
+	if n, err := getInt("MARKET_CAP_MAX_AGE_DAYS", 7); err != nil {
+		return nil, err
+	} else if n < 1 {
+		return nil, fmt.Errorf("MARKET_CAP_MAX_AGE_DAYS must be >= 1, got %d", n)
+	} else {
+		c.MarketCapMaxAgeDays = n
+	}
+	if f, err := getFloat("MAX_SPREAD_BPS", 0); err != nil {
+		return nil, err
+	} else if f < 0 {
+		return nil, fmt.Errorf("MAX_SPREAD_BPS must be >= 0, got %g", f)
+	} else {
+		c.MaxSpreadBps = f
+	}
+	if f, err := getFloat("MAX_GROSS_EXPOSURE_PCT", 1.0); err != nil {
+		return nil, err
+	} else if f <= 0 {
+		return nil, fmt.Errorf("MAX_GROSS_EXPOSURE_PCT must be > 0, got %g", f)
+	} else {
+		c.MaxGrossExposurePct = f
+	}
+	c.FactorMinScoreByClass = map[string]float64{}
+	for _, cls := range []string{"equity", "etf", "index", "crypto", "option"} {
+		key := "FACTOR_MIN_SCORE_" + strings.ToUpper(cls)
+		if f, err := getFloat(key, 0); err != nil {
+			return nil, err
+		} else if f > 0 {
+			c.FactorMinScoreByClass[cls] = f
+		}
 	}
 
 	// SQLITE_MIRROR keeps a verified SQLite mirror of the journal and state
@@ -610,4 +675,16 @@ func getFactorWeights(k string, def map[string]float64) (map[string]float64, err
 		return nil, fmt.Errorf("%s: weights sum to %.4f, must be within %.2f of 1", k, sum, factorWeightTolerance)
 	}
 	return out, nil
+}
+
+// FactorMinScoreFor returns the composite floor for one asset class, falling
+// back to the global floor. The class string is the picker's class name.
+func (c *Config) FactorMinScoreFor(class string) float64 {
+	if c == nil {
+		return 0
+	}
+	if f, ok := c.FactorMinScoreByClass[strings.ToLower(strings.TrimSpace(class))]; ok && f > 0 {
+		return f
+	}
+	return c.FactorMinScore
 }

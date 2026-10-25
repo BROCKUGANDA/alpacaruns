@@ -102,9 +102,40 @@ func cmdResearch(args []string) int {
 	client.Log = func(string, ...any) {}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
-	bars, err := client.GetBars(ctx, syms, "1Day",
-		fromT.AddDate(0, 0, -120).Format("2006-01-02"), // warm-up for SMA50
-		toT.Format("2006-01-02"), 10000)
+	// Split the universe by venue: crypto pairs come from the crypto bars
+	// endpoint, everything else from stocks. Researching only equities is how
+	// a class gets judged without ever being measured.
+	start := fromT.AddDate(0, 0, -120).Format("2006-01-02") // warm-up for SMA50
+	end := toT.Format("2006-01-02")
+	var stocks, pairs []string
+	for _, s := range syms {
+		if strings.Contains(s, "/") {
+			pairs = append(pairs, s)
+		} else {
+			stocks = append(stocks, s)
+		}
+	}
+	bars := map[string][]tools.Bar{}
+	if len(stocks) > 0 {
+		got, err := client.GetBars(ctx, stocks, "1Day", start, end, 10000)
+		if err != nil {
+			log.Printf("research: fetch stock bars: %v", err)
+			return 1
+		}
+		for k, v := range got {
+			bars[k] = v
+		}
+	}
+	if len(pairs) > 0 {
+		got, err := client.GetCryptoBars(ctx, pairs, "1Day", start, end, 10000)
+		if err != nil {
+			log.Printf("research: fetch crypto bars: %v", err)
+			return 1
+		}
+		for k, v := range got {
+			bars[k] = v
+		}
+	}
 	if err != nil {
 		log.Printf("research: fetch bars: %v", err)
 		return 1

@@ -83,6 +83,9 @@ func run(argv []string) int {
 		// `auto` is fully deterministic: no LLM, no MCP server. It loads
 		// its own config and strategy settings.
 		return cmdAuto(rest)
+	case "caps":
+		// `caps` builds the market-cap table the universe screen reads.
+		return cmdCaps(rest)
 	case "research":
 		// `research` replays the rule over history and writes a report. It
 		// never trades and never touches strategy state.

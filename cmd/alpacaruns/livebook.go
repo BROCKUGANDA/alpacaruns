@@ -157,3 +157,65 @@ func (b *liveBook) signedQty(ctx context.Context, symbol string) (float64, error
 	}
 	return 0, nil
 }
+
+// grossUSD returns the book's total absolute market value, the number a margin
+// ceiling applies to. Longs and shorts are added by absolute value: a long and
+// a short of the same size still use buying power twice.
+func (b *liveBook) grossUSD(ctx context.Context) (float64, error) {
+	pos, err := b.snapshot(ctx)
+	if err != nil {
+		return 0, err
+	}
+	var sum float64
+	for _, p := range pos {
+		q, err := strconv.ParseFloat(strings.TrimSpace(p.Qty), 64)
+		if err != nil {
+			continue
+		}
+		px, err := strconv.ParseFloat(strings.TrimSpace(p.CurrentPrice), 64)
+		if err != nil || px <= 0 {
+			continue
+		}
+		sum += math.Abs(q * px)
+	}
+	return sum, nil
+}
+
+// quotedSpreadBps returns the spread at the touch, in basis points. It is a
+// liquidity measurement from the live quote, not a cost model: the caller
+// uses it to refuse entries it cannot plausibly pay for.
+func (l *autoLoop) quotedSpreadBps(ctx context.Context, symbol string) (float64, bool) {
+	if l == nil || l.client == nil {
+		return 0, false
+	}
+	if strategy.IsCrypto(symbol) {
+		m, err := l.client.GetCryptoSnapshots(ctx, []string{tools.CryptoDataSymbol(symbol)})
+		if err != nil || len(m) == 0 {
+			return 0, false
+		}
+		for _, snap := range m { // the response is keyed by the requested form
+			return spreadBps(snap.BidPrice, snap.AskPrice)
+		}
+		return 0, false
+	}
+	m, err := l.client.GetSnapshots(ctx, []string{symbol})
+	if err != nil {
+		return 0, false
+	}
+	snap, ok := m[symbol]
+	if !ok {
+		return 0, false
+	}
+	return spreadBps(snap.LatestQuoteBid, snap.LatestQuoteAsk)
+}
+
+func spreadBps(bid, ask float64) (float64, bool) {
+	if bid <= 0 || ask <= 0 || ask < bid {
+		return 0, false
+	}
+	mid := (bid + ask) / 2
+	if mid <= 0 {
+		return 0, false
+	}
+	return (ask - bid) / mid * 10000, true
+}
