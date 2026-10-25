@@ -1141,3 +1141,50 @@ func orDefault(i int, def int) int {
 	}
 	return i
 }
+
+// VenueBars routes a bar request to the stocks or crypto endpoint by symbol
+// shape and merges the results.
+//
+// Every bar consumer (the factor engine, the pre-order reference price) takes
+// one bar source for the whole universe. A stocks-only source silently fails
+// closed for crypto: the caller sees "invalid symbol: BTC/USD" from
+// /v2/stocks/bars, which reads like bad data rather than a wrong endpoint.
+// That made `alpacaruns trade --symbol BTC/USD` and the bare agent validator
+// unable to trade crypto at all.
+type VenueBars struct {
+	C *Client
+}
+
+func (v VenueBars) GetBars(ctx context.Context, symbols []string, timeframe, start, end string, limit int) (map[string][]Bar, error) {
+	if v.C == nil {
+		return nil, fmt.Errorf("venue bars: no client")
+	}
+	var stocks, pairs []string
+	for _, s := range symbols {
+		if IsCryptoSymbol(s) {
+			pairs = append(pairs, s)
+		} else {
+			stocks = append(stocks, s)
+		}
+	}
+	out := map[string][]Bar{}
+	if len(stocks) > 0 {
+		got, err := v.C.GetBars(ctx, stocks, timeframe, start, end, limit)
+		if err != nil {
+			return nil, err
+		}
+		for k, b := range got {
+			out[k] = b
+		}
+	}
+	if len(pairs) > 0 {
+		got, err := v.C.GetCryptoBars(ctx, pairs, timeframe, start, end, limit)
+		if err != nil {
+			return nil, err
+		}
+		for k, b := range got {
+			out[k] = b
+		}
+	}
+	return out, nil
+}

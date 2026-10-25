@@ -313,17 +313,20 @@ func NewValidator(kill risk.HaltSource, cfg *config.Config) *risk.Validator {
 		Portfolio: func() (risk.Portfolio, error) {
 			return accountSnapshot(cfg)
 		},
+		// Venue-aware bars: a stocks-only source makes every crypto symbol
+		// fail the factor gate, which silently removed an entire asset class
+		// from the manual and agent paths.
 		Factors: factors.NewEngine(cfg,
-			tools.NewClient(cfg.AlpacaKeyID, cfg.AlpacaSecret, cfg.AlpacaBaseURL, cfg.AlpacaDataURL),
+			tools.VenueBars{C: tools.NewClient(cfg.AlpacaKeyID, cfg.AlpacaSecret, cfg.AlpacaBaseURL, cfg.AlpacaDataURL)},
 			nil, factors.Options{}),
 	}
 }
 
 // NewValidatorWithScorer builds the validator with a caller-supplied
 // FactorScorer. This is how the auto loop wires the MultiVenueBars-aware
-// scorer so crypto symbols can pass the risk gate's factor check; the
-// bare NewValidator above still uses tools.Client directly and fails
-// closed for crypto (acceptable for the manual `trade` path).
+// scorer so crypto symbols can pass the risk gate's factor check. The bare
+// NewValidator routes bars by venue itself (tools.VenueBars), so the manual
+// `trade` path and the agent path can both trade crypto.
 func NewValidatorWithScorer(kill risk.HaltSource, cfg *config.Config, scorer risk.FactorScorer) *risk.Validator {
 	return &risk.Validator{
 		Cfg:       cfg,

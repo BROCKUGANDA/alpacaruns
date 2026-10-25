@@ -211,7 +211,20 @@ func (a alpacaPrices) Price(ctx context.Context, symbol string, isOption bool) (
 		if err != nil {
 			return 0, err
 		}
-		s, ok := snaps[tools.CryptoOrderSymbol(symbol)]
+		// The snapshot map is keyed by the form the caller ASKED for
+		// ("BTC/USD"); the broker's order symbol ("BTCUSD") is a different
+		// string. Looking up only the order form missed every entry and
+		// reported "no crypto snapshot", which rejected every crypto order
+		// that needed a price.
+		s, ok := snaps[symbol]
+		if !ok {
+			s, ok = snaps[tools.CryptoOrderSymbol(symbol)]
+		}
+		if !ok && len(snaps) == 1 {
+			for _, v := range snaps {
+				s, ok = v, true
+			}
+		}
 		if !ok {
 			return 0, fmt.Errorf("no crypto snapshot for %s", symbol)
 		}
