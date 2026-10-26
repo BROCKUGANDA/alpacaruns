@@ -6,15 +6,16 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "typecheck": "tsc --noEmit",
+    "lint": "tsc --noEmit"
   },
   "dependencies": {
     "clsx": "2.1.1",
-    "framer-motion": "11.11.17",
-    "next": "^14.2.35",
+    "framer-motion": "11.18.2",
+    "next": "^16.4.3",
     "react": "18.3.1",
     "react-dom": "18.3.1",
-    "recharts": "2.13.3",
+    "recharts": "2.15.4",
     "swr": "2.2.5",
     "tailwind-merge": "2.5.4"
   },
@@ -23,8 +24,12 @@
     "@types/react": "18.3.12",
     "@types/react-dom": "18.3.1",
     "autoprefixer": "10.4.20",
-    "postcss": "8.4.49",
+    "postcss": "8.5.31",
     "tailwindcss": "3.4.15",
     "typescript": "5.6.3"
+  },
+  "overrides": {
+    "postcss-selector-parser": "7.1.6",
+    "source-map-js": "1.2.2"
   }
 }

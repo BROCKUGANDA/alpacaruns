@@ -1,10 +1,17 @@
 # Alpacaruns Demo Dashboard
 
 The multi-page demo app for the Alpacaruns autonomous paper-trading
-bot. Built with **Next.js 14 (App Router) + TypeScript + Tailwind +
+bot. Built with **Next.js 16 (App Router) + TypeScript + Tailwind +
 Framer Motion + SWR + Recharts**, statically exported and embedded
 into the Go binary (`alpacaruns serve`) at `api/ui/`. Single
 binary, single port, no Node process to run in production.
+
+`next` is pinned at 16.4.3 or newer: every Next advisory on 14.x has
+its first patched release in the 15.5.10–15.5.28 line, and the current
+advisory set extends to 16.3.x, so a minor bump inside 14 was never an
+option. React stays on 18 because 16's peer range (^18.2.0 || ^19.0.0)
+supports it and nothing here uses a React 19 API; the build and a
+headless render of every route were verified on that pairing.
 
 ## Pages
 
